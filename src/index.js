@@ -3,8 +3,6 @@ import fs from "fs"
 import path from "path"
 import * as core from "@actions/core"
 import * as github from "@actions/github"
-import { Octokit } from "@octokit/rest"
-const { createActionAuth } = require("@octokit/auth-action");
 
 import { execShellCommand } from "./helpers"
 
@@ -76,7 +74,6 @@ export async function run() {
     const uptermServer = core.getInput("upterm-server")
     const waitTimeoutMinutes = core.getInput("wait-timeout-minutes")
     core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`)
-    core.info(`tmux new -d -s upterm-wrapper -x 132 -y 43 \"upterm host --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x 132 -y 43\"`)
     await execShellCommand(`tmux new -d -s upterm-wrapper -x 132 -y 43 \"upterm host --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x 132 -y 43\"`)
     // resize terminal for largest client by default
     await execShellCommand("tmux set -t upterm-wrapper window-size largest; tmux set -t upterm window-size largest")

@@ -4,8 +4,10 @@ author: 'Lari Hotari'
 branding:
   icon: 'terminal'
 runs:
-  using: 'node16'
+  using: 'node20'
   main: 'lib/index.js'
+  post: 'lib/index.js'
+  post-if: '!cancelled()'
 inputs:
   GITHUB_TOKEN:
     description: Github Token
