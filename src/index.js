@@ -67,33 +67,10 @@ export async function run() {
       allowedUsers.push(github.context.actor)
     }
     const uniqueAllowedUsers = [...new Set(allowedUsers)]
-    if (uniqueAllowedUsers.length > 0) {
-      core.info(`Fetching SSH keys registered with GitHub profiles: ${uniqueAllowedUsers.join(', ')}`)
-      const octokit = new Octokit({
-        authStrategy: createActionAuth
-      })
-      let allowedKeys = []
-      for (const allowedUser of uniqueAllowedUsers) {
-        if (allowedUser) {
-          try {
-            let keys = await octokit.users.listPublicKeysForUser({
-              username: allowedUser
-            })
-            for (const item of keys.data) {
-              allowedKeys.push(item.key)
-            }
-          } catch (error) {
-            core.info(`Error fetching keys for ${allowedUser}. Error: ${error.message}`)
-          }
-        }
+    for (const allowedUser of uniqueAllowedUsers) {
+      if (allowedUser) {
+        authorizedKeysParameter += `--github-user "${allowedUser}"`
       }
-      if (allowedKeys.length === 0) {
-        throw new Error(`No public SSH keys registered with GitHub profiles: ${uniqueAllowedUsers.join(', ')}`)
-      }
-      core.info(`Fetched ${allowedKeys.length} ssh public keys`)
-      const authorizedKeysPath = path.join(sshPath, "authorized_keys")
-      fs.appendFileSync(authorizedKeysPath, allowedKeys.join('\n'))
-      authorizedKeysParameter = `-a "${authorizedKeysPath}"`
     }
 
     const uptermServer = core.getInput("upterm-server")
