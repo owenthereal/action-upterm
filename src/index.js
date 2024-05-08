@@ -1,7 +1,7 @@
 import os from "os"
 import fs from "fs"
 import path from "path"
-const { globSync } = require("glob");
+import { globSync } from "glob"
 import * as core from "@actions/core"
 import * as github from "@actions/github"
 
