@@ -1,23 +1,21 @@
-# Debug your [GitHub Actions](https://github.com/features/actions) by using ssh
+# Debug your [GitHub Actions](https://github.com/features/actions) Using SSH
 
-This GitHub Action offers you a direct way to interact with the host system on which the actual scripts (Actions) will run.
-This action started as a fork of [mxschmitt/action-tmate](https://github.com/mxschmitt/action-tmate).
-Instead of tmate, this action uses [upterm](https://upterm.dev/) and [tmux](https://github.com/tmux/tmux/wiki).
+This GitHub Action enables direct interaction with the host system running your GitHub Actions via SSH, utilizing [upterm](https://upterm.dev/) and [tmux](https://github.com/tmux/tmux/wiki). This setup facilitates real-time GitHub Actions debugging and allows seamless workflow continuation.
 
 ## Features
 
-- Debug your GitHub Actions by using SSH
-- Continue your Workflows afterwards
+- **Interactive Debugging**: Gain SSH access to the GitHub Actions runner to diagnose and resolve real-time issues.
+- **Workflow Control**: Resume workflows post-debugging without complete restarts, saving time and preserving state.
 
 ## Supported Operating Systems
 
-- `Linux`
-- `macOS`
-- (`Windows` is **not** supported. It will be skipped so that the Pipeline does not fail)
+- **Linux**
+- **macOS**
+- **Windows**: Unsupported (actions will skip to avoid pipeline failures).
 
 ## Getting Started
 
-By using this minimal example a [upterm](https://upterm.dev/) session will be created.
+To set up an `upterm` session within your GitHub Actions workflow, use this example:
 
 ```yaml
 name: CI
@@ -31,11 +29,11 @@ jobs:
       uses: owenthereal/action-upterm@main
 ```
 
-To get the ssh connection string, just open the `Checks` tab in your Pull Request and scroll to the bottom.
+Access the SSH connection string in the `Checks` tab of your Pull Request.
 
-## Use registered public SSH key(s)
+## Use Registered Public SSH Keys
 
-By default anybody can connect to the upterm session. You can opt-in to install the public SSH keys [that you have registered with your GitHub profile](https://docs.github.com/en/github/authenticating-to-github/adding-a-new-ssh-key-to-your-github-account).
+To enhance security, you can restrict access to the `upterm` session to specific authorized GitHub profiles. First, ensure you have [added an SSH key to your GitHub profile](https://docs.github.com/en/github/authenticating-to-github/adding-a-new-ssh-key-to-your-github-account).
 
 ```yaml
 name: CI
@@ -48,20 +46,16 @@ jobs:
     - name: Setup upterm session
       uses: owenthereal/action-upterm@main
       with:
-        ## limits ssh access and adds the ssh public key for the user which triggered the workflow
-        limit-access-to-actor: true
-        ## limits ssh access and adds the ssh public keys of the listed GitHub users
-        limit-access-to-users: githubuser1,githubuser2
+        limit-access-to-actor: true # Restrict to the user who triggered the workflow
+        limit-access-to-users: githubuser1,githubuser2 # Specific authorized users only
 ```
 
-If the registered public SSH key is not your default private SSH key, you will need to specify the path manually, like so: `ssh -i <path-to-key> <upterm-connection-string>`.
+If your registered public SSH key differs from your default private SSH key, specify the path manually: `ssh -i <path-to-private-key> <upterm-connection-string>`.
 
+## Use Custom Upterm Server
 
-## Use custom upterm server
-
-Follow instructions to [deploy Upterm server to Heroku](https://github.com/owenthereal/upterm#heroku). There are also [other deployment options available](https://github.com/owenthereal/upterm#deploy-uptermd).
-
-You can configure the Upterm server with the `upterm-server` input parameter, for example:
+To host your own Upterm server, follow the instructions for [deployment across various cloud providers](https://github.com/owenthereal/upterm?tab=readme-ov-file#hammer_and_wrench-deployment).
+Configure the Upterm server with the `upterm-server` input parameter:
 
 ```yaml
 name: CI
@@ -74,19 +68,13 @@ jobs:
     - name: Setup upterm session
       uses: owenthereal/action-upterm@main
       with:
-        ## limits ssh access and adds the ssh public key for the user which triggered the workflow
-        limit-access-to-actor: true
-        ## Use the Heroku deployed Uptermd server via Websocket
+        ## Use the deployed Upterm server via Websocket or SSH
         upterm-server: wss://YOUR_HEROKU_APP_URL
 ```
 
-## Shut down server if user doesn't connect
+## Shut Down the Server if No User Connects
 
-If you'd like to shut down the server after a certain number of minutes if no
-user connects, use the `wait-timeout-minutes` input parameter. This can be
-useful for using `action-upterm` to get a debug shell if your job fails, but
-not have the debug shell keep your pipeline running for too long if no one is
-interested in debugging it.
+If no user connects, the server automatically shuts down after a specified time. This feature is handy for deploying `action-upterm` to provide a debug shell on job failure without unnecessarily prolonging pipeline operation.
 
 ```yaml
 name: CI
@@ -100,23 +88,29 @@ jobs:
       uses: owenthereal/action-upterm@main
       if: ${{ failure() }}
       with:
-        ## If no one connects after 5 minutes, shut down server.
+        ## Shut down the server if unconnected after 5 minutes.
         wait-timeout-minutes: 5
 ```
 
-## Continue a workflow
+## Continue a Workflow
 
-If you want to continue a workflow and you are inside a upterm session, just create a empty file with the name `continue` either in the root directory or in the workspace directory by running `touch continue` or `sudo touch /continue`.
-Closing the terminal will also continue the workflow. However you won't be able to reconnect in that case. 
-It's possible to detach from the terminal and not continue by first pressing `C-b` and then `d` (tmux detach command keys).
+To resume your workflow within an `upterm` session, create an empty file named `continue`:
 
-## Usage tips
+```bash
+touch continue
+# or
+sudo touch /continue
+```
 
-### Resizing tmux window (requires ubuntu-latest)
+Press `C-b` followed by `d` (tmux detach command keys) to detach from the terminal without resuming the workflow.
 
-After connecting with ssh:
-* Hit `control-b`, then type `:resize-window -A` + `<enter>`
+## Usage Tips
+
+### Resizing the tmux Window
+
+After connecting via SSH:
+
+- Press `control-b`, then type `:resize-window -A` and press `<enter>`
 
 This will resize the console to the full width and height of the connected terminal.
-([More information](https://unix.stackexchange.com/a/570015))
-
+([Learn more](https://unix.stackexchange.com/a/570015))
