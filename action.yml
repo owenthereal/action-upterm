@@ -1,33 +1,29 @@
-name: 'Debugging with ssh'
-description: 'Debug your GitHub Actions Environment interactively by using SSH'
-author: 'Lari Hotari'
+name: "Debugging with ssh"
+description: "Debug your GitHub Actions Environment interactively by using SSH"
+author: "Lari Hotari"
 branding:
-  icon: 'terminal'
+  icon: "terminal"
 runs:
-  using: 'node20'
-  main: 'lib/index.js'
+  using: "node20"
+  main: "lib/index.js"
 inputs:
-  GITHUB_TOKEN:
-    description: Github Token
-    default: ${{ github.token }}
-    required: false
   limit-access-to-actor:
-    description: 'If only the public SSH keys of the user triggering the workflow should be authorized'
+    description: "If only the public SSH keys of the user triggering the workflow should be authorized"
     required: false
-    default: 'false'
+    default: "false"
   limit-access-to-users:
-    description: 'If only the public SSH keys of the listed GitHub users should be authorized'
+    description: "If only the public SSH keys of the listed GitHub users should be authorized"
     required: false
-    default: ''
+    default: ""
   upterm-server:
-    description: 'upterm server address (required), supported protocols are ssh, ws, or wss.'
+    description: "upterm server address (required), supported protocols are ssh, ws, or wss."
     required: true
-    default: 'ssh://uptermd.upterm.dev:22'
+    default: "ssh://uptermd.upterm.dev:22"
   ssh-known-hosts:
-    description: 'Content for ~/.ssh/known_hosts file on the server'
+    description: "Content for ~/.ssh/known_hosts file on the server"
     required: false
-    default: ''
+    default: ""
   wait-timeout-minutes:
-    description: 'Integer number of minutes to wait for user to connect before shutting down server. Once a user connects, the server will stay up.'
+    description: "Integer number of minutes to wait for user to connect before shutting down server. Once a user connects, the server will stay up."
     required: false
-    default: ''
+    default: ""
