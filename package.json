@@ -17,7 +17,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lhotari/action-upterm.git"
+    "url": "git+https://github.com/owenthereal/action-upterm.git"
   },
   "keywords": [
     "actions",

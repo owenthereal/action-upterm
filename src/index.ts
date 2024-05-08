@@ -100,6 +100,9 @@ export async function run() {
       core.info(`wait-timeout-minutes set - will wait for ${waitTimeoutMinutes} minutes for someone to connect, otherwise shut down`);
     }
 
+    core.debug('Fetching connection strings');
+    await sleep(1000);
+
     console.debug('Entering main loop');
     /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
     while (true) {
