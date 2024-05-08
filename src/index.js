@@ -1,6 +1,7 @@
 import os from "os"
 import fs from "fs"
 import path from "path"
+const { globSync } = require("glob");
 import * as core from "@actions/core"
 import * as github from "@actions/github"
 
@@ -20,8 +21,7 @@ export async function run() {
       await execShellCommand(`curl -sL https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz | tar zxvf - -C /tmp upterm && sudo install /tmp/upterm /usr/local/bin/`)
       await execShellCommand("if ! command -v tmux &>/dev/null; then sudo apt-get -y install tmux; fi")
     } else {
-      await execShellCommand("brew install owenthereal/upterm/upterm")
-      await execShellCommand("brew install tmux")
+      await execShellCommand("brew install owenthereal/upterm/upterm tmux")
     }
     core.debug("Installed dependencies successfully")
 
@@ -31,7 +31,7 @@ export async function run() {
       fs.mkdirSync(sshPath, { recursive: true })
       try {
         await execShellCommand(`ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa; ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519`);
-      } catch { }    
+      } catch { }
       core.debug("Generated SSH keys successfully")
     } else {
       core.debug("SSH key already exists")
@@ -57,7 +57,6 @@ export async function run() {
       } catch { }
     }
 
-    let authorizedKeysParameter = ""
 
     let allowedUsers = core.getInput("limit-access-to-users").split(/[\s\n,]+/).filter(x => x !== "")
     if (core.getInput("limit-access-to-actor") === "true") {
@@ -65,6 +64,8 @@ export async function run() {
       allowedUsers.push(github.context.actor)
     }
     const uniqueAllowedUsers = [...new Set(allowedUsers)]
+
+    let authorizedKeysParameter = ""
     for (const allowedUser of uniqueAllowedUsers) {
       if (allowedUser) {
         authorizedKeysParameter += `--github-user "${allowedUser}"`
@@ -84,7 +85,7 @@ export async function run() {
         timeout = parseInt(waitTimeoutMinutes)
       } catch (error) {
         core.error(`wait-timeout-minutes must be set to an integer. Error: ${error}`)
-        throw(error)
+        throw (error)
       }
       await execShellCommand(`( sleep $(( ${timeout} * 60 )); if ! pgrep -f '^tmux attach ' &>/dev/null; then tmux kill-server; fi ) & disown`)
       core.info(`wait-timeout-minutes set - will wait for ${waitTimeoutMinutes} minutes for someone to connect, otherwise shut down`)
@@ -95,21 +96,35 @@ export async function run() {
 
     console.debug("Entering main loop")
     while (true) {
+      if (continueFileExists()) {
+        core.info("Exiting debugging session because '/continue' file was created")
+        break
+      }
+
+      if (didUptermQuit()) {
+        core.info("Exiting debugging session 'upterm' quit")
+        break
+      }
+
       try {
-        core.info(await execShellCommand('bash -c "upterm session current --admin-socket ~/.upterm/*.sock"'));
+        core.info(await execShellCommand("upterm session current --admin-socket ~/.upterm/*.sock"));
       } catch (error) {
         core.info(error.message);
         break
       }
 
-      const skip = fs.existsSync("/continue") || fs.existsSync(path.join(process.env.GITHUB_WORKSPACE, "continue"))
-      if (skip) {
-        core.info("Exiting debugging session because '/continue' file was created")
-        break
-      }
-      await sleep(30000)
+      await sleep(5000)
     }
   } catch (error) {
     core.setFailed(error.message);
   }
+}
+
+function didUptermQuit() {
+  return globSync(path.join(os.homedir(), ".upterm", "*.sock")).length === 0
+}
+
+function continueFileExists() {
+  const continuePath = process.platform === "win32" ? "C:/msys64/continue" : "/continue"
+  return fs.existsSync(continuePath) || fs.existsSync(path.join(process.env.GITHUB_WORKSPACE, "continue"))
 }
