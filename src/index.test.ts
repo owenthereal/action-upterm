@@ -7,6 +7,8 @@ jest.mock('fs', () => ({
   mkdirSync: () => true,
   existsSync: () => true,
   appendFileSync: () => true,
+  readdirSync: () => ['id_rsa', 'id_ed25519'],
+  readFileSync: () => '{}',
   promises: {
     access: jest.fn()
   }
