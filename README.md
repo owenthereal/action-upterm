@@ -1,4 +1,4 @@
-# Debug your [GitHub Actions](https://github.com/features/actions) With SSH
+# Debug [GitHub Actions](https://github.com/features/actions) With SSH
 
 This GitHub Action enables direct interaction with the host system running your GitHub Actions via SSH, utilizing [upterm](https://upterm.dev/) and [tmux](https://github.com/tmux/tmux/wiki). This setup facilitates real-time GitHub Actions debugging and allows seamless workflow continuation.
 
@@ -26,7 +26,7 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: Setup upterm session
-      uses: owenthereal/action-upterm@main
+      uses: owenthereal/action-upterm@v1
 ```
 
 Access the SSH connection string in the `Checks` tab of your Pull Request.
@@ -44,7 +44,7 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: Setup upterm session
-      uses: owenthereal/action-upterm@main
+      uses: owenthereal/action-upterm@v1
       with:
         limit-access-to-actor: true # Restrict to the user who triggered the workflow
         limit-access-to-users: githubuser1,githubuser2 # Specific authorized users only
@@ -66,7 +66,7 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: Setup upterm session
-      uses: owenthereal/action-upterm@main
+      uses: owenthereal/action-upterm@v1
       with:
         ## Use the deployed Upterm server via Websocket or SSH
         upterm-server: wss://YOUR_HEROKU_APP_URL
@@ -85,7 +85,7 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: Setup upterm session
-      uses: owenthereal/action-upterm@main
+      uses: owenthereal/action-upterm@v1
       if: ${{ failure() }}
       with:
         ## Shut down the server if unconnected after 5 minutes.
