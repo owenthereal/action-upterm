@@ -1,8 +1,9 @@
-name: "Debugging with ssh"
-description: "Debug your GitHub Actions Environment interactively by using SSH"
+name: "Debugging using ssh"
+description: "This GitHub Action enables direct interaction with the host system running your GitHub Actions via SSH"
 author: "Owen Ou"
 branding:
   icon: "terminal"
+  color: "purple"
 runs:
   using: "node20"
   main: "lib/index.js"
