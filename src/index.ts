@@ -50,7 +50,7 @@ export async function run() {
     } else {
       core.info('Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
       try {
-        await execShellCommand('ssh-keyscan uptermd.upterm.dev >> ~/.ssh/known_hosts');
+        await execShellCommand('ssh-keyscan uptermd.upterm.dev 2> /dev/null >> ~/.ssh/known_hosts');
       } catch (error) {
         core.error(`error running ssh-keyscan. Error: ${error}`);
         throw error;
@@ -100,8 +100,20 @@ export async function run() {
       core.info(`wait-timeout-minutes set - will wait for ${waitTimeoutMinutes} minutes for someone to connect, otherwise shut down`);
     }
 
-    core.debug('Fetching connection strings');
-    await sleep(1000);
+    let tries = 10;
+    while (true) {
+      if (tries <= 0) {
+        throw new Error('Failed to start upterm');
+      }
+
+      core.info('Waiting for upterm to be ready...');
+      if (uptermSocketExists()) {
+        break;
+      }
+
+      await sleep(1000);
+      tries--;
+    }
 
     console.debug('Entering main loop');
     /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
@@ -111,7 +123,7 @@ export async function run() {
         break;
       }
 
-      if (didUptermQuit()) {
+      if (!uptermSocketExists()) {
         core.info("Exiting debugging session 'upterm' quit");
         break;
       }
@@ -130,8 +142,8 @@ export async function run() {
   }
 }
 
-function didUptermQuit(): boolean {
-  return fs.readdirSync(path.join(os.homedir(), '.upterm')).filter(file => file.endsWith('.sock')).length === 0;
+function uptermSocketExists(): boolean {
+  return fs.readdirSync(path.join(os.homedir(), '.upterm')).filter(file => file.endsWith('.sock')).length > 0;
 }
 
 function continueFileExists(): boolean {

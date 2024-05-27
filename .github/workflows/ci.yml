@@ -14,10 +14,10 @@ jobs:
           node-version: 22.x
           cache: 'npm'
       - name: Install dependencies
-        run: npm install
+        run: yarn install
       - name: Run tests
-        run: npm run test
+        run: yarn run test
       - name: Run lint
-        run: npm run lint
+        run: yarn run lint
       - name: Build project
-        run: npm run build
+        run: yarn run build
