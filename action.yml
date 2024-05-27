@@ -1,4 +1,4 @@
-name: "Debugging using ssh"
+name: "Debug with ssh"
 description: "This GitHub Action enables direct interaction with the host system running your GitHub Actions via SSH"
 author: "Owen Ou"
 branding:
