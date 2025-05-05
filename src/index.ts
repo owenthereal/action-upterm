@@ -138,7 +138,13 @@ export async function run() {
       await sleep(5000);
     }
   } catch (error) {
-    core.setFailed(error.message);
+    const UPTERM_ERROR_IS_FAILURE = 'upterm-error-is-failure';
+
+    if (core.getBooleanInput(UPTERM_ERROR_IS_FAILURE) && core.getBooleanInput(UPTERM_ERROR_IS_FAILURE) === true) {
+      core.setFailed(error.message);
+    } else {
+      core.info(`Upterm session failed. Not setting as failed because ${UPTERM_ERROR_IS_FAILURE} was set`);
+    }
   }
 }
 

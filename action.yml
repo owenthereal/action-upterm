@@ -28,3 +28,8 @@ inputs:
     description: "Integer number of minutes to wait for user to connect before shutting down server. Once a user connects, the server will stay up."
     required: false
     default: ""
+  upterm-error-is-failure:
+    description: "When upterm fails to start and/or connect to the upterm server, fail the action."
+    type: boolean
+    required: true
+    default: true

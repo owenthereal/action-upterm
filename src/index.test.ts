@@ -99,4 +99,22 @@ describe('upterm GitHub integration', () => {
     expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready...');
     expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
   });
+
+  it('should set error when upterm-error-is-failure === true', async () => {
+    mockedExecShellCommand.mockReturnValue(Promise.reject('foobar'));
+    when(core.getBooleanInput).calledWith('upterm-error-is-failure').mockReturnValue(true);
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalled();
+  })
+
+  it('should not set error when upterm-error-is-failure === false', async () => {
+    mockedExecShellCommand.mockReturnValue(Promise.reject('foobar'));
+    when(core.getBooleanInput).calledWith('upterm-error-is-failure').mockReturnValue(false);
+
+    await run();
+
+    expect(core.setFailed).not.toHaveBeenCalled();
+  })
 });
