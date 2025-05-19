@@ -4,7 +4,7 @@ import path from 'path';
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 
-import {execShellCommand} from './helpers';
+import { execShellCommand } from './helpers';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -17,7 +17,21 @@ export async function run() {
 
     core.debug('Installing dependencies');
     if (process.platform == 'linux') {
-      await execShellCommand(`curl -sL https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz | tar zxvf - -C /tmp upterm && sudo install /tmp/upterm /usr/local/bin/`);
+      let arch = process.arch;
+      let uptermArch = 'amd64';
+      switch (arch) {
+        case 'x64':
+          uptermArch = 'amd64';
+          break;
+        case 'arm64':
+          uptermArch = 'arm64';
+          break;
+        default:
+          core.error(`Unsupported architecture: ${arch}`);
+          return;
+      }
+
+      await execShellCommand(`curl -sL https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_${uptermArch}.tar.gz | tar zxvf - -C /tmp upterm && sudo install /tmp/upterm /usr/local/bin/`);
       await execShellCommand('if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
     } else {
       await execShellCommand('brew install owenthereal/upterm/upterm tmux');
@@ -27,7 +41,7 @@ export async function run() {
     const sshPath = path.join(os.homedir(), '.ssh');
     if (!fs.existsSync(path.join(sshPath, 'id_rsa'))) {
       core.debug('Generating SSH keys');
-      fs.mkdirSync(sshPath, {recursive: true});
+      fs.mkdirSync(sshPath, { recursive: true });
       try {
         await execShellCommand(`ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa; ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519`);
       } catch (error) {
