@@ -1,4 +1,4 @@
-import { when } from 'jest-when';
+import {when} from 'jest-when';
 
 import * as core from '@actions/core';
 jest.mock('@actions/core');
@@ -14,11 +14,11 @@ jest.mock('fs', () => ({
   }
 }));
 
-import { execShellCommand } from './helpers';
+import {execShellCommand} from './helpers';
 jest.mock('./helpers');
 const mockedExecShellCommand = jest.mocked(execShellCommand);
 
-import { run } from '.';
+import {run} from '.';
 
 describe('upterm GitHub integration', () => {
   const originalPlatform = process.platform;
@@ -100,9 +100,8 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(core.error).toHaveBeenNthCalledWith(1, 'Unsupported architecture: unknown');
+    expect(core.error).toHaveBeenNthCalledWith(1, 'Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.');
   });
-
 
   it('should support custom known_hosts content', async () => {
     Object.defineProperty(process, 'platform', {
