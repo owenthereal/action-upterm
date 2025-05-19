@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import * as core from '@actions/core';
 import * as github from '@actions/github';
-import {execShellCommand} from './helpers';
+import { execShellCommand } from './helpers';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -41,7 +41,7 @@ export async function run() {
     const idRsaPath = path.join(sshPath, 'id_rsa');
     if (!fs.existsSync(idRsaPath)) {
       core.debug('Generating SSH keys');
-      fs.mkdirSync(sshPath, {recursive: true});
+      fs.mkdirSync(sshPath, { recursive: true });
       try {
         await execShellCommand(`ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa; ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519`);
       } catch (error) {
@@ -103,7 +103,7 @@ export async function run() {
 
     let authorizedKeysParameter = '';
     for (const allowedUser of uniqueAllowedUsers) {
-      authorizedKeysParameter += `--github-user "${allowedUser}" `;
+      authorizedKeysParameter += `--github-user "${allowedUser}"`;
     }
 
     // Upterm session
@@ -111,6 +111,9 @@ export async function run() {
     const waitTimeoutMinutes = core.getInput('wait-timeout-minutes');
     core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
     await execShellCommand(`tmux new -d -s upterm-wrapper -x 132 -y 43 "upterm host --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x 132 -y 43"`);
+
+    sleep(2000); // Give tmux some time to start
+
     // Resize terminal for largest client by default
     await execShellCommand('tmux set -t upterm-wrapper window-size largest; tmux set -t upterm window-size largest');
     core.debug('Created new session successfully');
