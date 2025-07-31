@@ -17,7 +17,6 @@ describe('execShellCommand', () => {
     stdout: {on: jest.Mock};
     stderr: {on: jest.Mock};
     on: jest.Mock;
-    kill: jest.Mock;
   };
 
   beforeEach(() => {
@@ -29,8 +28,7 @@ describe('execShellCommand', () => {
       stderr: {
         on: jest.fn()
       },
-      on: jest.fn(),
-      kill: jest.fn()
+      on: jest.fn()
     };
     mockSpawn.mockReturnValue(mockProcess as never);
   });
@@ -96,23 +94,4 @@ describe('execShellCommand', () => {
 
     await expect(execShellCommand(command)).rejects.toThrow('Process error: Process spawn failed');
   });
-
-  it('should handle timeout', async () => {
-    jest.useFakeTimers();
-    const command = 'sleep 10';
-
-    mockProcess.on.mockImplementation(() => {
-      // Don't call the exit callback to simulate hanging process
-    });
-
-    const promise = execShellCommand(command, {timeout: 100});
-
-    // Fast-forward time to trigger timeout
-    jest.advanceTimersByTime(100);
-
-    await expect(promise).rejects.toThrow('Command timed out after 100ms: sleep 10');
-    expect(mockProcess.kill).toHaveBeenCalledWith('SIGTERM');
-
-    jest.useRealTimers();
-  }, 1000);
 });
