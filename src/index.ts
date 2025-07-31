@@ -29,8 +29,11 @@ function getUptermArchitecture(nodeArch: string): UptermArchitecture | null {
 
 function validateInputs(): void {
   const waitTimeout = core.getInput('wait-timeout-minutes');
-  if (waitTimeout && (isNaN(parseInt(waitTimeout, 10)) || parseInt(waitTimeout, 10) < 0)) {
-    throw new Error('wait-timeout-minutes must be a non-negative integer');
+  if (waitTimeout) {
+    const parsedTimeout = parseInt(waitTimeout, 10);
+    if (isNaN(parsedTimeout) || parsedTimeout < 0) {
+      throw new Error('wait-timeout-minutes must be a non-negative integer');
+    }
   }
 
   const uptermServer = core.getInput('upterm-server');

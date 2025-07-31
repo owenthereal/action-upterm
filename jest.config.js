@@ -15,5 +15,5 @@ module.exports = {
   collectCoverageFrom: ['src/**/{!(main.ts),}.ts'],
   coveragePathIgnorePatterns: ['lib/', 'node_modules/', '__tests__/'],
   verbose: true,
-  setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.js']
 };
