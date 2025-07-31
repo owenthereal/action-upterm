@@ -7,6 +7,38 @@ import {execShellCommand} from './helpers';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Constants
+const UPTERM_SOCKET_POLL_INTERVAL = 1000;
+const UPTERM_READY_MAX_RETRIES = 10;
+const SESSION_STATUS_POLL_INTERVAL = 5000;
+const SUPPORTED_UPTERM_ARCHITECTURES = ['amd64', 'arm64'] as const;
+const TMUX_DIMENSIONS = {width: 132, height: 43};
+
+type UptermArchitecture = (typeof SUPPORTED_UPTERM_ARCHITECTURES)[number];
+
+function getUptermArchitecture(nodeArch: string): UptermArchitecture | null {
+  switch (nodeArch) {
+    case 'x64':
+      return 'amd64';
+    case 'arm64':
+      return 'arm64';
+    default:
+      return null;
+  }
+}
+
+function validateInputs(): void {
+  const waitTimeout = core.getInput('wait-timeout-minutes');
+  if (waitTimeout && (isNaN(parseInt(waitTimeout, 10)) || parseInt(waitTimeout, 10) < 0)) {
+    throw new Error('wait-timeout-minutes must be a non-negative integer');
+  }
+
+  const uptermServer = core.getInput('upterm-server');
+  if (!uptermServer) {
+    throw new Error('upterm-server is required');
+  }
+}
+
 export async function run() {
   try {
     if (process.platform === 'win32') {
@@ -14,48 +46,64 @@ export async function run() {
       return;
     }
 
-    core.debug('Installing dependencies');
-    if (process.platform === 'linux') {
-      let uptermArch: string;
-      switch (process.arch) {
-        case 'x64':
-          uptermArch = 'amd64';
-          break;
-        case 'arm64':
-          uptermArch = 'arm64';
-          break;
-        default:
-          core.error(`Unsupported architecture for upterm: ${process.arch}. Only x64 and arm64 are supported.`);
-          return;
-      }
+    validateInputs();
 
+    await installDependencies();
+    await setupSSH();
+    await startUptermSession();
+    await monitorSession();
+  } catch (error: unknown) {
+    if (error instanceof Error) {
+      core.setFailed(error.message);
+    } else {
+      core.setFailed(String(error));
+    }
+  }
+}
+
+async function installDependencies(): Promise<void> {
+  core.debug('Installing dependencies');
+  if (process.platform === 'linux') {
+    const uptermArch = getUptermArchitecture(process.arch);
+    if (!uptermArch) {
+      throw new Error(`Unsupported architecture for upterm: ${process.arch}. Only x64 and arm64 are supported.`);
+    }
+    try {
       await execShellCommand(`curl -sL https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_${uptermArch}.tar.gz | tar zxvf - -C /tmp upterm && sudo install /tmp/upterm /usr/local/bin/`);
       await execShellCommand('if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
-    } else {
+    } catch (error) {
+      throw new Error(`Failed to install dependencies on Linux: ${error}`);
+    }
+  } else {
+    try {
       await execShellCommand('brew install owenthereal/upterm/upterm tmux');
+    } catch (error) {
+      throw new Error(`Failed to install dependencies on macOS: ${error}`);
     }
-    core.debug('Installed dependencies successfully');
+  }
+  core.debug('Installed dependencies successfully');
+}
 
-    // SSH key setup
-    const sshPath = path.join(os.homedir(), '.ssh');
-    const idRsaPath = path.join(sshPath, 'id_rsa');
-    if (!fs.existsSync(idRsaPath)) {
-      core.debug('Generating SSH keys');
-      fs.mkdirSync(sshPath, {recursive: true});
-      try {
-        await execShellCommand(`ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa; ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519`);
-      } catch (error) {
-        core.error(`Error running ssh-keygen: ${error}`);
-        throw error;
-      }
-      core.debug('Generated SSH keys successfully');
-    } else {
-      core.debug('SSH key already exists');
+async function setupSSH(): Promise<void> {
+  // SSH key setup
+  const sshPath = path.join(os.homedir(), '.ssh');
+  const idRsaPath = path.join(sshPath, 'id_rsa');
+  if (!fs.existsSync(idRsaPath)) {
+    core.debug('Generating SSH keys');
+    fs.mkdirSync(sshPath, {recursive: true});
+    try {
+      await execShellCommand(`ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa; ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519`);
+    } catch (error) {
+      throw new Error(`Failed to generate SSH keys: ${error}`);
     }
+    core.debug('Generated SSH keys successfully');
+  } else {
+    core.debug('SSH key already exists');
+  }
 
-    // SSH config
-    core.debug('Configuring ssh client');
-    const sshConfig = `Host *
+  // SSH config
+  core.debug('Configuring ssh client');
+  const sshConfig = `Host *
   StrictHostKeyChecking no
   CheckHostIP no
   TCPKeepAlive yes
@@ -64,105 +112,105 @@ export async function run() {
   VerifyHostKeyDNS yes
   UpdateHostKeys yes
 `;
-    fs.appendFileSync(path.join(sshPath, 'config'), sshConfig);
+  fs.appendFileSync(path.join(sshPath, 'config'), sshConfig);
 
-    // known_hosts setup
-    const knownHostsPath = path.join(sshPath, 'known_hosts');
-    const sshKnownHosts = core.getInput('ssh-known-hosts');
-    if (sshKnownHosts && sshKnownHosts !== '') {
-      core.info('Appending ssh-known-hosts to ~/.ssh/known_hosts. Contents of ~/.ssh/known_hosts:');
-      fs.appendFileSync(knownHostsPath, sshKnownHosts);
-      core.info(await execShellCommand('cat ~/.ssh/known_hosts'));
-    } else {
-      core.info('Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
-      try {
-        await execShellCommand('ssh-keyscan uptermd.upterm.dev 2> /dev/null >> ~/.ssh/known_hosts');
-      } catch (error) {
-        core.error(`Error running ssh-keyscan: ${error}`);
-        throw error;
-      }
-      // Add @cert-authority entry
-      try {
-        await execShellCommand(`cat <(cat ~/.ssh/known_hosts | awk '{ print "@cert-authority * " $2 " " $3 }') >> ~/.ssh/known_hosts`);
-      } catch (error) {
-        core.error(`Error generating cert-authority entry: ${error}`);
-        throw error;
-      }
+  // known_hosts setup
+  const knownHostsPath = path.join(sshPath, 'known_hosts');
+  const sshKnownHosts = core.getInput('ssh-known-hosts');
+  if (sshKnownHosts && sshKnownHosts !== '') {
+    core.info('Appending ssh-known-hosts to ~/.ssh/known_hosts. Contents of ~/.ssh/known_hosts:');
+    fs.appendFileSync(knownHostsPath, sshKnownHosts);
+    core.info(await execShellCommand('cat ~/.ssh/known_hosts'));
+  } else {
+    core.info('Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
+    try {
+      await execShellCommand('ssh-keyscan uptermd.upterm.dev 2> /dev/null >> ~/.ssh/known_hosts');
+    } catch (error) {
+      throw new Error(`Failed to scan SSH keys: ${error}`);
     }
-
-    // Allowed users
-    const allowedUsers = core
-      .getInput('limit-access-to-users')
-      .split(/[\s\n,]+/)
-      .filter(Boolean);
-    if (core.getInput('limit-access-to-actor') === 'true') {
-      core.info(`Adding actor "${github.context.actor}" to allowed users.`);
-      allowedUsers.push(github.context.actor);
+    // Add @cert-authority entry
+    try {
+      await execShellCommand(`cat <(cat ~/.ssh/known_hosts | awk '{ print "@cert-authority * " $2 " " $3 }') >> ~/.ssh/known_hosts`);
+    } catch (error) {
+      throw new Error(`Failed to generate cert-authority entry: ${error}`);
     }
-    const uniqueAllowedUsers = [...new Set(allowedUsers)];
+  }
+}
 
-    let authorizedKeysParameter = '';
-    for (const allowedUser of uniqueAllowedUsers) {
-      authorizedKeysParameter += `--github-user "${allowedUser}" `;
-    }
+async function startUptermSession(): Promise<void> {
+  // Allowed users
+  const allowedUsers = core
+    .getInput('limit-access-to-users')
+    .split(/[\s\n,]+/)
+    .filter(Boolean);
+  if (core.getInput('limit-access-to-actor') === 'true') {
+    core.info(`Adding actor "${github.context.actor}" to allowed users.`);
+    allowedUsers.push(github.context.actor);
+  }
+  const uniqueAllowedUsers = [...new Set(allowedUsers)];
 
-    // Upterm session
-    const uptermServer = core.getInput('upterm-server');
-    const waitTimeoutMinutes = core.getInput('wait-timeout-minutes');
-    core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
-    await execShellCommand(`tmux new -d -s upterm-wrapper -x 132 -y 43 "upterm host --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x 132 -y 43"`);
+  let authorizedKeysParameter = '';
+  for (const allowedUser of uniqueAllowedUsers) {
+    authorizedKeysParameter += `--github-user "${allowedUser}" `;
+  }
+
+  // Upterm session
+  const uptermServer = core.getInput('upterm-server');
+  const waitTimeoutMinutes = core.getInput('wait-timeout-minutes');
+  core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
+  try {
+    await execShellCommand(
+      `tmux new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height}"`
+    );
     // Resize terminal for largest client by default
     await execShellCommand('tmux set -t upterm-wrapper window-size largest; tmux set -t upterm window-size largest');
-    core.debug('Created new session successfully');
+  } catch (error) {
+    throw new Error(`Failed to create upterm session: ${error}`);
+  }
+  core.debug('Created new session successfully');
 
-    // Wait timeout logic
-    if (waitTimeoutMinutes) {
-      const timeout = parseInt(waitTimeoutMinutes, 10);
-      if (isNaN(timeout)) {
-        core.error(`wait-timeout-minutes must be set to an integer.`);
-        throw new Error('Invalid wait-timeout-minutes value');
-      }
+  // Wait timeout logic
+  if (waitTimeoutMinutes) {
+    const timeout = parseInt(waitTimeoutMinutes, 10);
+    try {
       await execShellCommand(`( sleep $(( ${timeout} * 60 )); if ! pgrep -f '^tmux attach ' &>/dev/null; then tmux kill-server; fi ) & disown`);
       core.info(`wait-timeout-minutes set - will wait for ${waitTimeoutMinutes} minutes for someone to connect, otherwise shut down`);
+    } catch (error) {
+      throw new Error(`Failed to setup timeout: ${error}`);
     }
+  }
 
-    // Wait for upterm socket to be ready
-    let tries = 10;
-    while (tries-- > 0) {
-      core.info('Waiting for upterm to be ready...');
-      if (uptermSocketExists()) break;
-      await sleep(1000);
+  // Wait for upterm socket to be ready
+  let tries = UPTERM_READY_MAX_RETRIES;
+  while (tries-- > 0) {
+    core.info('Waiting for upterm to be ready...');
+    if (uptermSocketExists()) break;
+    await sleep(UPTERM_SOCKET_POLL_INTERVAL);
+  }
+  if (!uptermSocketExists()) {
+    throw new Error('Failed to start upterm - socket not found after maximum retries');
+  }
+}
+
+async function monitorSession(): Promise<void> {
+  core.debug('Entering main loop');
+  // Main loop: wait for /continue file or upterm exit
+  /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
+  while (true) {
+    if (continueFileExists()) {
+      core.info("Exiting debugging session because '/continue' file was created");
+      break;
     }
     if (!uptermSocketExists()) {
-      throw new Error('Failed to start upterm');
+      core.info("Exiting debugging session: 'upterm' quit");
+      break;
     }
-
-    core.debug('Entering main loop');
-    // Main loop: wait for /continue file or upterm exit
-    /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
-    while (true) {
-      if (continueFileExists()) {
-        core.info("Exiting debugging session because '/continue' file was created");
-        break;
-      }
-      if (!uptermSocketExists()) {
-        core.info("Exiting debugging session: 'upterm' quit");
-        break;
-      }
-      try {
-        core.info(await execShellCommand('upterm session current --admin-socket ~/.upterm/*.sock'));
-      } catch (error) {
-        core.error(`Error getting upterm session: ${error}`);
-        throw error;
-      }
-      await sleep(5000);
+    try {
+      core.info(await execShellCommand('upterm session current --admin-socket ~/.upterm/*.sock'));
+    } catch (error) {
+      throw new Error(`Failed to get upterm session status: ${error}`);
     }
-  } catch (error: unknown) {
-    if (error instanceof Error) {
-      core.setFailed(error.message);
-    } else {
-      core.setFailed(String(error));
-    }
+    await sleep(SESSION_STATUS_POLL_INTERVAL);
   }
 }
 

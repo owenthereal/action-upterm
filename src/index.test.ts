@@ -4,11 +4,11 @@ import * as core from '@actions/core';
 jest.mock('@actions/core');
 
 jest.mock('fs', () => ({
-  mkdirSync: () => true,
-  existsSync: () => true,
-  appendFileSync: () => true,
-  readdirSync: () => ['id_rsa', 'id_ed25519', 'hello.sock'],
-  readFileSync: () => '{}',
+  mkdirSync: jest.fn(() => true),
+  existsSync: jest.fn(() => true),
+  appendFileSync: jest.fn(() => true),
+  readdirSync: jest.fn(() => ['id_rsa', 'id_ed25519', 'hello.sock']),
+  readFileSync: jest.fn(() => '{}'),
   promises: {
     access: jest.fn()
   }
@@ -19,13 +19,26 @@ jest.mock('./helpers');
 const mockedExecShellCommand = jest.mocked(execShellCommand);
 
 import {run} from '.';
+import fs from 'fs';
+const mockFs = fs as jest.Mocked<typeof fs>;
 
 describe('upterm GitHub integration', () => {
   const originalPlatform = process.platform;
+  const originalArch = process.arch;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // Reset fs mocks
+    mockFs.existsSync.mockReturnValue(true);
+    (mockFs.readdirSync as jest.Mock).mockReturnValue(['id_rsa', 'id_ed25519', 'hello.sock']);
+  });
 
   afterAll(() => {
     Object.defineProperty(process, 'platform', {
       value: originalPlatform
+    });
+    Object.defineProperty(process, 'arch', {
+      value: originalArch
     });
   });
 
@@ -100,7 +113,7 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(core.error).toHaveBeenNthCalledWith(1, 'Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.');
+    expect(core.setFailed).toHaveBeenCalledWith('Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.');
   });
 
   it('should support custom known_hosts content', async () => {
@@ -146,5 +159,52 @@ describe('upterm GitHub integration', () => {
     expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
     expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready...');
     expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
+  });
+
+  it('should handle invalid wait-timeout-minutes', async () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'linux'
+    });
+    Object.defineProperty(process, 'arch', {
+      value: 'x64'
+    });
+    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('invalid');
+    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith('wait-timeout-minutes must be a non-negative integer');
+  });
+
+  it('should handle missing upterm-server', async () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'linux'
+    });
+    Object.defineProperty(process, 'arch', {
+      value: 'x64'
+    });
+    when(core.getInput).calledWith('upterm-server').mockReturnValue('');
+    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith('upterm-server is required');
+  });
+
+  it('should handle shell command failures during installation', async () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'linux'
+    });
+    Object.defineProperty(process, 'arch', {
+      value: 'x64'
+    });
+    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+
+    mockedExecShellCommand.mockRejectedValueOnce(new Error('Installation failed'));
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith('Failed to install dependencies on Linux: Error: Installation failed');
   });
 });
