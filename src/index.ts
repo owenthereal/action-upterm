@@ -131,9 +131,9 @@ async function setupSSH(): Promise<void> {
     } catch (error) {
       throw new Error(`Failed to scan SSH keys: ${error}`);
     }
-    // Add @cert-authority entry
+    // Add @cert-authority entry for uptermd.upterm.dev only
     try {
-      await execShellCommand(`cat <(cat ~/.ssh/known_hosts | awk '{ print "@cert-authority * " $2 " " $3 }') >> ~/.ssh/known_hosts`);
+      await execShellCommand(`grep '^uptermd.upterm.dev' ~/.ssh/known_hosts | awk '{ print "@cert-authority * " $2 " " $3 }' >> ~/.ssh/known_hosts`);
     } catch (error) {
       throw new Error(`Failed to generate cert-authority entry: ${error}`);
     }
@@ -154,7 +154,7 @@ async function startUptermSession(): Promise<void> {
 
   let authorizedKeysParameter = '';
   for (const allowedUser of uniqueAllowedUsers) {
-    authorizedKeysParameter += `--github-user "${allowedUser}" `;
+    authorizedKeysParameter += `--github-user '${allowedUser}' `;
   }
 
   // Upterm session
@@ -163,14 +163,24 @@ async function startUptermSession(): Promise<void> {
   core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
   try {
     await execShellCommand(
-      `tmux new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height}"`
+      `tmux new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee /tmp/upterm-command.log" 2>/tmp/tmux-error.log`
     );
     // Resize terminal for largest client by default
     await execShellCommand('tmux set -t upterm-wrapper window-size largest; tmux set -t upterm window-size largest');
   } catch (error) {
+    // Try to read the tmux error log if it exists
+    try {
+      const tmuxError = await execShellCommand('cat /tmp/tmux-error.log 2>/dev/null || echo "No tmux error log found"');
+      core.error(`Tmux error log: ${tmuxError.trim()}`);
+    } catch (logError) {
+      core.debug(`Could not read tmux error log: ${logError}`);
+    }
     throw new Error(`Failed to create upterm session: ${error}`);
   }
   core.debug('Created new session successfully');
+
+  // Give upterm a moment to initialize before checking
+  await sleep(2000);
 
   // Wait timeout logic
   if (waitTimeoutMinutes) {
@@ -186,12 +196,55 @@ async function startUptermSession(): Promise<void> {
   // Wait for upterm socket to be ready
   let tries = UPTERM_READY_MAX_RETRIES;
   while (tries-- > 0) {
-    core.info('Waiting for upterm to be ready...');
+    core.info(`Waiting for upterm to be ready... (${UPTERM_READY_MAX_RETRIES - tries}/${UPTERM_READY_MAX_RETRIES})`);
     if (uptermSocketExists()) break;
     await sleep(UPTERM_SOCKET_POLL_INTERVAL);
   }
   if (!uptermSocketExists()) {
-    throw new Error('Failed to start upterm - socket not found after maximum retries');
+    // Collect diagnostic information for user bug reports
+    const uptermDir = path.join(os.homedir(), '.upterm');
+    let diagnostics = 'Failed to start upterm - socket not found after maximum retries.\n\nDiagnostics:\n';
+
+    // Check what files exist in .upterm directory
+    if (fs.existsSync(uptermDir)) {
+      const files = fs.readdirSync(uptermDir);
+      diagnostics += `- .upterm directory contains: ${files.join(', ')}\n`;
+
+      // Read upterm.log if it exists for error details
+      const logPath = path.join(uptermDir, 'upterm.log');
+      if (fs.existsSync(logPath)) {
+        try {
+          const logContent = fs.readFileSync(logPath, 'utf8');
+          diagnostics += `- Upterm log:\n${logContent}\n`;
+        } catch (error) {
+          diagnostics += `- Could not read upterm.log: ${error}\n`;
+        }
+      }
+
+      // Read upterm command output for additional context
+      try {
+        const cmdLog = await execShellCommand('cat /tmp/upterm-command.log 2>/dev/null || echo "No command log"');
+        if (cmdLog.trim() !== 'No command log') {
+          diagnostics += `- Command output: ${cmdLog.trim()}\n`;
+        }
+      } catch (error) {
+        // Ignore command log read errors
+      }
+    } else {
+      diagnostics += '- .upterm directory does not exist\n';
+    }
+
+    // Check if tmux sessions are running
+    try {
+      const tmuxList = await execShellCommand('tmux list-sessions 2>/dev/null || echo "No tmux sessions"');
+      diagnostics += `- Tmux sessions: ${tmuxList.trim()}\n`;
+    } catch (error) {
+      diagnostics += `- Could not check tmux sessions: ${error}\n`;
+    }
+
+    diagnostics += '\nPlease report this issue with the above diagnostics at: https://github.com/owenthereal/action-upterm/issues';
+
+    throw new Error(diagnostics);
   }
 }
 

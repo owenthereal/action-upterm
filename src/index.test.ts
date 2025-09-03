@@ -70,7 +70,7 @@ describe('upterm GitHub integration', () => {
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready...');
+    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready... (1/10)');
     expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
   });
 
@@ -94,7 +94,7 @@ describe('upterm GitHub integration', () => {
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready...');
+    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready... (1/10)');
     expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
   });
 
@@ -138,7 +138,7 @@ describe('upterm GitHub integration', () => {
     expect(core.info).toHaveBeenNthCalledWith(1, 'Appending ssh-known-hosts to ~/.ssh/known_hosts. Contents of ~/.ssh/known_hosts:');
     expect(core.info).toHaveBeenNthCalledWith(2, `${customConnectionString}`);
     expect(core.info).toHaveBeenNthCalledWith(3, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(4, 'Waiting for upterm to be ready...');
+    expect(core.info).toHaveBeenNthCalledWith(4, 'Waiting for upterm to be ready... (1/10)');
     expect(core.info).toHaveBeenNthCalledWith(5, "Exiting debugging session because '/continue' file was created");
   });
 
@@ -157,7 +157,7 @@ describe('upterm GitHub integration', () => {
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'brew install owenthereal/upterm/upterm tmux');
     expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready...');
+    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready... (1/10)');
     expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
   });
 
