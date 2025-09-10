@@ -32,8 +32,8 @@ function validateInputs(): void {
   const waitTimeout = core.getInput('wait-timeout-minutes');
   if (waitTimeout) {
     const parsedTimeout = parseInt(waitTimeout, 10);
-    if (isNaN(parsedTimeout) || parsedTimeout < 0) {
-      throw new Error('wait-timeout-minutes must be a non-negative integer');
+    if (isNaN(parsedTimeout) || parsedTimeout < 0 || parsedTimeout > 1440 || !Number.isInteger(parsedTimeout)) {
+      throw new Error('wait-timeout-minutes must be a valid positive integer not exceeding 1440 (24 hours)');
     }
   }
 
@@ -186,6 +186,7 @@ async function startUptermSession(): Promise<void> {
   // Wait timeout logic
   if (waitTimeoutMinutes) {
     const timeout = parseInt(waitTimeoutMinutes, 10);
+    // Input is already validated in validateInputs(), timeout is guaranteed to be safe for shell execution
     try {
       // Create a timeout script that sets our flag and kills the server
       const timeoutScript = `
@@ -271,8 +272,7 @@ async function monitorSession(): Promise<void> {
 
     // Check if timeout was reached before checking socket
     if (isTimeoutReached()) {
-      core.info('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
-      core.info('The session was automatically shut down to prevent unnecessary resource usage');
+      logTimeoutMessage();
       break;
     }
 
@@ -286,8 +286,7 @@ async function monitorSession(): Promise<void> {
     } catch (error) {
       // Check if this error is due to timeout before throwing
       if (isTimeoutReached()) {
-        core.info('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
-        core.info('The session was automatically shut down to prevent unnecessary resource usage');
+        logTimeoutMessage();
         break;
       }
       // For other connection issues, provide more context
@@ -317,4 +316,9 @@ function continueFileExists(): boolean {
 
 function isTimeoutReached(): boolean {
   return fs.existsSync(UPTERM_TIMEOUT_FLAG_PATH);
+}
+
+function logTimeoutMessage(): void {
+  core.info('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
+  core.info('The session was automatically shut down to prevent unnecessary resource usage');
 }

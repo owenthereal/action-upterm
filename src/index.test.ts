@@ -173,7 +173,22 @@ describe('upterm GitHub integration', () => {
 
     await run();
 
-    expect(core.setFailed).toHaveBeenCalledWith('wait-timeout-minutes must be a non-negative integer');
+    expect(core.setFailed).toHaveBeenCalledWith('wait-timeout-minutes must be a valid positive integer not exceeding 1440 (24 hours)');
+  });
+
+  it('should handle wait-timeout-minutes exceeding 24 hours', async () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'linux'
+    });
+    Object.defineProperty(process, 'arch', {
+      value: 'x64'
+    });
+    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1500'); // > 24 hours
+    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith('wait-timeout-minutes must be a valid positive integer not exceeding 1440 (24 hours)');
   });
 
   it('should handle missing upterm-server', async () => {
