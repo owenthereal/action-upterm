@@ -13,6 +13,7 @@ const UPTERM_READY_MAX_RETRIES = 10;
 const SESSION_STATUS_POLL_INTERVAL = 5000;
 const SUPPORTED_UPTERM_ARCHITECTURES = ['amd64', 'arm64'] as const;
 const TMUX_DIMENSIONS = {width: 132, height: 43};
+const UPTERM_TIMEOUT_FLAG_PATH = '/tmp/upterm-timeout-flag';
 
 type UptermArchitecture = (typeof SUPPORTED_UPTERM_ARCHITECTURES)[number];
 
@@ -186,7 +187,17 @@ async function startUptermSession(): Promise<void> {
   if (waitTimeoutMinutes) {
     const timeout = parseInt(waitTimeoutMinutes, 10);
     try {
-      await execShellCommand(`( sleep $(( ${timeout} * 60 )); if ! pgrep -f '^tmux attach ' &>/dev/null; then tmux kill-server; fi ) & disown`);
+      // Create a timeout script that sets our flag and kills the server
+      const timeoutScript = `
+        ( 
+          sleep $(( ${timeout} * 60 )); 
+          if ! pgrep -f '^tmux attach ' &>/dev/null; then 
+            echo "UPTERM_TIMEOUT_REACHED" > ${UPTERM_TIMEOUT_FLAG_PATH};
+            tmux kill-server; 
+          fi 
+        ) & disown
+      `;
+      await execShellCommand(timeoutScript);
       core.info(`wait-timeout-minutes set - will wait for ${waitTimeoutMinutes} minutes for someone to connect, otherwise shut down`);
     } catch (error) {
       throw new Error(`Failed to setup timeout: ${error}`);
@@ -257,13 +268,36 @@ async function monitorSession(): Promise<void> {
       core.info("Exiting debugging session because '/continue' file was created");
       break;
     }
+
+    // Check if timeout was reached before checking socket
+    if (isTimeoutReached()) {
+      core.info('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
+      core.info('The session was automatically shut down to prevent unnecessary resource usage');
+      break;
+    }
+
     if (!uptermSocketExists()) {
       core.info("Exiting debugging session: 'upterm' quit");
       break;
     }
+
     try {
       core.info(await execShellCommand('upterm session current --admin-socket ~/.upterm/*.sock'));
     } catch (error) {
+      // Check if this error is due to timeout before throwing
+      if (isTimeoutReached()) {
+        core.info('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
+        core.info('The session was automatically shut down to prevent unnecessary resource usage');
+        break;
+      }
+      // For other connection issues, provide more context
+      const errorMessage = String(error);
+      if (errorMessage.includes('connection refused') || errorMessage.includes('No such file or directory')) {
+        core.error('Upterm session appears to have ended unexpectedly');
+        core.error(`Connection error: ${errorMessage}`);
+        core.info('This may indicate the upterm process crashed or was terminated externally');
+        break;
+      }
       throw new Error(`Failed to get upterm session status: ${error}`);
     }
     await sleep(SESSION_STATUS_POLL_INTERVAL);
@@ -279,4 +313,8 @@ function uptermSocketExists(): boolean {
 function continueFileExists(): boolean {
   const continuePath = process.platform === 'win32' ? 'C:/msys64/continue' : '/continue';
   return fs.existsSync(continuePath) || fs.existsSync(path.join(process.env.GITHUB_WORKSPACE ?? '/', 'continue'));
+}
+
+function isTimeoutReached(): boolean {
+  return fs.existsSync(UPTERM_TIMEOUT_FLAG_PATH);
 }

@@ -207,4 +207,148 @@ describe('upterm GitHub integration', () => {
 
     expect(core.setFailed).toHaveBeenCalledWith('Failed to install dependencies on Linux: Error: Installation failed');
   });
+
+  it('should handle timeout with timeout flag detection', async () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'linux'
+    });
+    Object.defineProperty(process, 'arch', {
+      value: 'x64'
+    });
+    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
+    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
+    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
+    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+
+    // Mock fs.existsSync to handle different paths correctly
+    let monitoringLoopCalls = 0;
+    mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
+      const pathStr = path.toString();
+      if (pathStr === '/tmp/upterm-timeout-flag') {
+        monitoringLoopCalls++;
+        // Return true on second call (first call is in monitoring loop)
+        return monitoringLoopCalls >= 2;
+      }
+      if (pathStr === '/continue' || pathStr.includes('continue')) {
+        return false; // Don't exit via continue file
+      }
+      return true; // Default for other paths (SSH keys, .upterm dir, etc.)
+    });
+
+    mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
+    await run();
+
+    expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 5 minutes for someone to connect, otherwise shut down');
+    expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
+    expect(core.info).toHaveBeenCalledWith('The session was automatically shut down to prevent unnecessary resource usage');
+  }, 10000);
+
+  it('should handle connection refused error during session monitoring with timeout detection', async () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'linux'
+    });
+    Object.defineProperty(process, 'arch', {
+      value: 'x64'
+    });
+    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
+    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
+    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
+    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+
+    // Mock session status command to fail with connection refused, then succeed
+    let sessionStatusCallCount = 0;
+    mockedExecShellCommand.mockImplementation((cmd: string) => {
+      if (cmd.includes('upterm session current')) {
+        sessionStatusCallCount++;
+        if (sessionStatusCallCount === 1) {
+          return Promise.reject(
+            new Error(
+              "Command failed with exit code 1: upterm session current\nStderr: rpc error: code = Unavailable desc = connection error: desc = 'transport: Error while dialing: dial unix /home/runner/.upterm/JGxpTKJ8jsJHPxiFWggH.sock: connect: connection refused'"
+            )
+          );
+        }
+      }
+      return Promise.resolve('success');
+    });
+
+    // Mock fs.existsSync to handle different paths correctly
+    let timeoutCheckCount = 0;
+    mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
+      const pathStr = path.toString();
+      if (pathStr === '/tmp/upterm-timeout-flag') {
+        timeoutCheckCount++;
+        // Return true after first check (after connection error) to simulate timeout
+        return timeoutCheckCount > 1;
+      }
+      if (pathStr === '/continue' || pathStr.includes('continue')) {
+        return false; // Don't exit via continue file
+      }
+      return true; // Default for other paths
+    });
+
+    await run();
+
+    expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
+    expect(core.info).toHaveBeenCalledWith('The session was automatically shut down to prevent unnecessary resource usage');
+  });
+
+  it('should handle connection refused error without timeout flag (unexpected termination)', async () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'linux'
+    });
+    Object.defineProperty(process, 'arch', {
+      value: 'x64'
+    });
+    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
+    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
+    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+
+    // Mock session status command to fail with connection refused
+    mockedExecShellCommand.mockImplementation((cmd: string) => {
+      if (cmd.includes('upterm session current')) {
+        return Promise.reject(new Error('Command failed with exit code 1: connection refused'));
+      }
+      return Promise.resolve('success');
+    });
+
+    // Mock fs.existsSync to handle different paths correctly
+    mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
+      const pathStr = path.toString();
+      if (pathStr === '/tmp/upterm-timeout-flag') {
+        return false; // Never return true for timeout flag (no timeout)
+      }
+      if (pathStr === '/continue' || pathStr.includes('continue')) {
+        return false; // Don't exit via continue file
+      }
+      return true; // Default for other paths
+    });
+
+    await run();
+
+    expect(core.error).toHaveBeenCalledWith('Upterm session appears to have ended unexpectedly');
+    expect(core.error).toHaveBeenCalledWith('Connection error: Error: Command failed with exit code 1: connection refused');
+    expect(core.info).toHaveBeenCalledWith('This may indicate the upterm process crashed or was terminated externally');
+  });
+
+  it('should create timeout script when wait-timeout-minutes is specified', async () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'linux'
+    });
+    Object.defineProperty(process, 'arch', {
+      value: 'x64'
+    });
+    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
+    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
+    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('10');
+    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+
+    mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
+    await run();
+
+    // Check that timeout script was created with correct timeout value
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('sleep $(( 10 * 60 ))'));
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('echo "UPTERM_TIMEOUT_REACHED" > /tmp/upterm-timeout-flag'));
+    expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 10 minutes for someone to connect, otherwise shut down');
+  });
 });
