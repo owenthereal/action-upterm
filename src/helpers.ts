@@ -16,23 +16,33 @@ export function execShellCommand(cmd: string): Promise<string> {
   }
 
   return new Promise<string>((resolve, reject) => {
-    const process = spawn(cmd, [], {shell: '/bin/bash'});
+    const proc =
+      process.platform !== 'win32'
+        ? spawn(cmd, [], {shell: true})
+        : spawn('C:\\msys64\\usr\\bin\\bash.exe', ['-lc', cmd], {
+            env: {
+              ...process.env,
+              MSYS2_PATH_TYPE: 'inherit' /* Inherit previous path */,
+              CHERE_INVOKING: '1' /* do not `cd` to home */,
+              MSYSTEM: 'MINGW64' /* include the MINGW programs in C:/msys64/mingw64/bin/ */
+            }
+          });
     let stdout = '';
     let stderr = '';
 
-    process.stdout.on('data', data => {
+    proc.stdout.on('data', data => {
       const output = data.toString();
       console.log(output);
       stdout += output;
     });
 
-    process.stderr.on('data', data => {
+    proc.stderr.on('data', data => {
       const output = data.toString();
       console.error(output);
       stderr += output;
     });
 
-    process.on('exit', code => {
+    proc.on('exit', code => {
       if (code !== 0) {
         const errorMsg = `Command failed with exit code ${code}: ${cmd}`;
         const fullError = stderr ? `${errorMsg}\nStderr: ${stderr}` : errorMsg;
@@ -42,7 +52,7 @@ export function execShellCommand(cmd: string): Promise<string> {
       resolve(stdout);
     });
 
-    process.on('error', error => {
+    proc.on('error', error => {
       reject(new Error(`Process error: ${error.message}`));
     });
   });
