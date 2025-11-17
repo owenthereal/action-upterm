@@ -5,7 +5,6 @@
   "description": "Debug your GitHub Actions via SSH by using upterm/tmux to get access to the runner system itself.",
   "main": "src/main.ts",
   "scripts": {
-    "start": "node src/index.js",
     "build": "ncc build --source-map --minify --license LICENSE -o lib",
     "lint": "yarn run prettier && yarn run eslint",
     "format": "yarn run prettier:fix && yarn run eslint:fix",
@@ -29,7 +28,8 @@
   "license": "MIT",
   "dependencies": {
     "@actions/core": "^1.11.1",
-    "@actions/github": "^6.0.1"
+    "@actions/github": "^6.0.1",
+    "@actions/tool-cache": "^2.0.2"
   },
   "devDependencies": {
     "@babel/core": "^7.28.0",

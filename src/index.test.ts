@@ -2,6 +2,10 @@ import {when} from 'jest-when';
 
 import * as core from '@actions/core';
 jest.mock('@actions/core');
+jest.mock('@actions/tool-cache', () => ({
+  downloadTool: jest.fn(),
+  extractTar: jest.fn()
+}));
 
 jest.mock('fs', () => ({
   mkdirSync: jest.fn(() => true),
@@ -18,9 +22,14 @@ import {execShellCommand} from './helpers';
 jest.mock('./helpers');
 const mockedExecShellCommand = jest.mocked(execShellCommand);
 
+import * as toolCache from '@actions/tool-cache';
+const mockedToolCache = jest.mocked(toolCache);
+
 import {run} from '.';
 import fs from 'fs';
 const mockFs = fs as jest.Mocked<typeof fs>;
+const DOWNLOAD_PATH = '/tmp/upterm.tar.gz';
+const EXTRACT_DIR = '/tmp/upterm-unique-a1b2c3d4';
 
 describe('upterm GitHub integration', () => {
   const originalPlatform = process.platform;
@@ -28,6 +37,8 @@ describe('upterm GitHub integration', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockedToolCache.downloadTool.mockResolvedValue(DOWNLOAD_PATH);
+    mockedToolCache.extractTar.mockResolvedValue(EXTRACT_DIR);
     // Reset fs mocks
     mockFs.existsSync.mockReturnValue(true);
     (mockFs.readdirSync as jest.Mock).mockReturnValue(['id_rsa', 'id_ed25519', 'hello.sock']);
@@ -57,8 +68,11 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'curl -sL https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_amd64.tar.gz | tar zxvf - -C /tmp upterm.exe && install /tmp/upterm.exe /usr/bin/');
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
+    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_amd64.tar.gz');
+    expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
+    expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
+
+    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
@@ -81,8 +95,11 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'curl -sL https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz | tar zxvf - -C /tmp upterm && sudo install /tmp/upterm /usr/local/bin/');
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
+    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz');
+    expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
+    expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
+
+    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
@@ -105,8 +122,11 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'curl -sL https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_arm64.tar.gz | tar zxvf - -C /tmp upterm && sudo install /tmp/upterm /usr/local/bin/');
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
+    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_arm64.tar.gz');
+    expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
+    expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
+
+    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
@@ -129,8 +149,11 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'curl -sL https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_arm64.tar.gz | tar zxvf - -C /tmp upterm.exe && install /tmp/upterm.exe /usr/bin/');
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
+    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_arm64.tar.gz');
+    expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
+    expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
+
+    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
@@ -173,8 +196,11 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve(customConnectionString));
     await run();
 
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'curl -sL https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz | tar zxvf - -C /tmp upterm && sudo install /tmp/upterm /usr/local/bin/');
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
+    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz');
+    expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
+    expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
+
+    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
     expect(core.info).toHaveBeenNthCalledWith(1, 'Appending ssh-known-hosts to ~/.ssh/known_hosts. Contents of ~/.ssh/known_hosts:');
     expect(core.info).toHaveBeenNthCalledWith(2, `${customConnectionString}`);
     expect(core.info).toHaveBeenNthCalledWith(3, 'Creating a new session. Connecting to upterm server ssh://myserver:22');

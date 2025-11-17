@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import * as core from '@actions/core';
 import * as github from '@actions/github';
+import * as tc from '@actions/tool-cache';
 import {execShellCommand} from './helpers';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -114,12 +115,28 @@ async function installDependencies(): Promise<void> {
   const platformHandlers = {
     linux: async () => {
       const uptermArch = validateArchitecture(process.arch);
-      await execShellCommand(`curl -sL https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_${uptermArch}.tar.gz | tar zxvf - -C /tmp upterm && sudo install /tmp/upterm /usr/local/bin/`);
+      const archive = await tc.downloadTool(`https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_${uptermArch}.tar.gz`);
+      const extractDir = await tc.extractTar(archive);
+      const uptermPath = path.join(extractDir, 'upterm');
+
+      if (!fs.existsSync(uptermPath)) {
+        throw new Error(`Downloaded upterm archive does not contain binary at expected path: ${uptermPath}`);
+      }
+
+      core.addPath(extractDir);
       await execShellCommand('if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
     },
     win32: async () => {
       const uptermArch = validateArchitecture(process.arch);
-      await execShellCommand(`curl -sL https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_${uptermArch}.tar.gz | tar zxvf - -C /tmp upterm.exe && install /tmp/upterm.exe /usr/bin/`);
+      const archive = await tc.downloadTool(`https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_${uptermArch}.tar.gz`);
+      const extractDir = await tc.extractTar(archive);
+      const uptermExePath = path.join(extractDir, 'upterm.exe');
+
+      if (!fs.existsSync(uptermExePath)) {
+        throw new Error(`Downloaded upterm archive does not contain upterm.exe at expected path: ${uptermExePath}`);
+      }
+
+      core.addPath(extractDir);
       await execShellCommand('if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
     },
     darwin: async () => {

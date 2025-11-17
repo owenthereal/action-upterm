@@ -10,7 +10,7 @@
     "@actions/exec" "^1.1.1"
     "@actions/http-client" "^2.0.1"
 
-"@actions/exec@^1.1.1":
+"@actions/exec@^1.0.0", "@actions/exec@^1.1.1":
   version "1.1.1"
   resolved "https://registry.yarnpkg.com/@actions/exec/-/exec-1.1.1.tgz#2e43f28c54022537172819a7cf886c844221a611"
   integrity sha512-+sCcHHbVdk93a0XT19ECtO/gIXoxvdsgQLzb2fE2/5sIZmWQuluYyjPQtrtTHdU1YzTZ7bAPN4sITq2xi1679w==
@@ -46,10 +46,21 @@
     tunnel "^0.0.6"
     undici "^5.25.4"
 
-"@actions/io@^1.0.1":
+"@actions/io@^1.0.1", "@actions/io@^1.1.1":
   version "1.1.3"
   resolved "https://registry.yarnpkg.com/@actions/io/-/io-1.1.3.tgz#4cdb6254da7962b07473ff5c335f3da485d94d71"
   integrity sha512-wi9JjgKLYS7U/z8PPbco+PvTb/nRWjeoFlJ1Qer83k/3C5PHQi28hiVdeE2kHXmIL99mQFawx8qt/JPjZilJ8Q==
+
+"@actions/tool-cache@^2.0.2":
+  version "2.0.2"
+  resolved "https://registry.yarnpkg.com/@actions/tool-cache/-/tool-cache-2.0.2.tgz#49ff20b0352aeac5411988e88435e47144fabb3e"
+  integrity sha512-fBhNNOWxuoLxztQebpOaWu6WeVmuwa77Z+DxIZ1B+OYvGkGQon6kTVg6Z32Cb13WCuw0szqonK+hh03mJV7Z6w==
+  dependencies:
+    "@actions/core" "^1.11.1"
+    "@actions/exec" "^1.0.0"
+    "@actions/http-client" "^2.0.1"
+    "@actions/io" "^1.1.1"
+    semver "^6.1.0"
 
 "@ampproject/remapping@^2.2.0":
   version "2.3.0"
@@ -3805,7 +3816,7 @@ run-parallel@^1.1.9:
   dependencies:
     queue-microtask "^1.2.2"
 
-semver@^6.3.0, semver@^6.3.1:
+semver@^6.1.0, semver@^6.3.0, semver@^6.3.1:
   version "6.3.1"
   resolved "https://registry.yarnpkg.com/semver/-/semver-6.3.1.tgz#556d2ef8689146e46dcea4bfdd095f3434dffcb4"
   integrity sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA==

@@ -1,0 +1,13 @@
+name: Dogfood
+
+on: workflow_dispatch
+
+jobs:
+  upterm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start upterm session
+        uses: ./
+        with:
+          limit-access-to-actor: true
