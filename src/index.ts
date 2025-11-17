@@ -13,7 +13,10 @@ const UPTERM_READY_MAX_RETRIES = 10;
 const SESSION_STATUS_POLL_INTERVAL = 5000;
 const SUPPORTED_UPTERM_ARCHITECTURES = ['amd64', 'arm64'] as const;
 const TMUX_DIMENSIONS = {width: 132, height: 43};
-const UPTERM_TIMEOUT_FLAG_PATH = '/tmp/upterm-timeout-flag';
+
+function getUptermTimeoutFlagPath(): string {
+  return process.platform === 'win32' ? 'C:/msys64/tmp/upterm-timeout-flag' : '/tmp/upterm-timeout-flag';
+}
 
 type UptermArchitecture = (typeof SUPPORTED_UPTERM_ARCHITECTURES)[number];
 
@@ -45,11 +48,6 @@ function validateInputs(): void {
 
 export async function run() {
   try {
-    if (process.platform === 'win32') {
-      core.info('Windows is not supported by upterm, skipping...');
-      return;
-    }
-
     validateInputs();
 
     await installDependencies();
@@ -78,6 +76,19 @@ async function installDependencies(): Promise<void> {
     } catch (error) {
       throw new Error(`Failed to install dependencies on Linux: ${error}`);
     }
+  } else if (process.platform === 'win32') {
+    const uptermArch = getUptermArchitecture(process.arch);
+    if (!uptermArch) {
+      throw new Error(`Unsupported architecture for upterm: ${process.arch}. Only x64 and arm64 are supported.`);
+    }
+    try {
+      // Download and install upterm for Windows
+      await execShellCommand(`curl -sL https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_${uptermArch}.tar.gz | tar zxvf - -C /tmp upterm.exe && install /tmp/upterm.exe /usr/bin/`);
+      // Check if tmux is available, install via pacman if not (MSYS2/Git Bash environment)
+      await execShellCommand('if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
+    } catch (error) {
+      throw new Error(`Failed to install dependencies on Windows: ${error}`);
+    }
   } else {
     try {
       await execShellCommand('brew install owenthereal/upterm/upterm tmux');
@@ -92,11 +103,16 @@ async function setupSSH(): Promise<void> {
   // SSH key setup
   const sshPath = path.join(os.homedir(), '.ssh');
   const idRsaPath = path.join(sshPath, 'id_rsa');
+  const idEd25519Path = path.join(sshPath, 'id_ed25519');
+
   if (!fs.existsSync(idRsaPath)) {
     core.debug('Generating SSH keys');
     fs.mkdirSync(sshPath, {recursive: true});
     try {
-      await execShellCommand(`ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa; ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519`);
+      // Use absolute paths instead of ~ to avoid MSYS2 home directory mismatch on Windows
+      const rsaKeyPath = idRsaPath.replace(/\\/g, '/');
+      const ed25519KeyPath = idEd25519Path.replace(/\\/g, '/');
+      await execShellCommand(`ssh-keygen -q -t rsa -N "" -f "${rsaKeyPath}"; ssh-keygen -q -t ed25519 -N "" -f "${ed25519KeyPath}"`);
     } catch (error) {
       throw new Error(`Failed to generate SSH keys: ${error}`);
     }
@@ -120,21 +136,22 @@ async function setupSSH(): Promise<void> {
 
   // known_hosts setup
   const knownHostsPath = path.join(sshPath, 'known_hosts');
+  const knownHostsPathForShell = knownHostsPath.replace(/\\/g, '/');
   const sshKnownHosts = core.getInput('ssh-known-hosts');
   if (sshKnownHosts && sshKnownHosts !== '') {
     core.info('Appending ssh-known-hosts to ~/.ssh/known_hosts. Contents of ~/.ssh/known_hosts:');
     fs.appendFileSync(knownHostsPath, sshKnownHosts);
-    core.info(await execShellCommand('cat ~/.ssh/known_hosts'));
+    core.info(await execShellCommand(`cat "${knownHostsPathForShell}"`));
   } else {
     core.info('Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     try {
-      await execShellCommand('ssh-keyscan uptermd.upterm.dev 2> /dev/null >> ~/.ssh/known_hosts');
+      await execShellCommand(`ssh-keyscan uptermd.upterm.dev 2> /dev/null >> "${knownHostsPathForShell}"`);
     } catch (error) {
       throw new Error(`Failed to scan SSH keys: ${error}`);
     }
     // Add @cert-authority entry for uptermd.upterm.dev only
     try {
-      await execShellCommand(`grep '^uptermd.upterm.dev' ~/.ssh/known_hosts | awk '{ print "@cert-authority * " $2 " " $3 }' >> ~/.ssh/known_hosts`);
+      await execShellCommand(`grep '^uptermd.upterm.dev' "${knownHostsPathForShell}" | awk '{ print "@cert-authority * " $2 " " $3 }' >> "${knownHostsPathForShell}"`);
     } catch (error) {
       throw new Error(`Failed to generate cert-authority entry: ${error}`);
     }
@@ -186,16 +203,17 @@ async function startUptermSession(): Promise<void> {
   // Wait timeout logic
   if (waitTimeoutMinutes) {
     const timeout = parseInt(waitTimeoutMinutes, 10);
+    const timeoutFlagPath = getUptermTimeoutFlagPath();
     // Input is already validated in validateInputs(), timeout is guaranteed to be safe for shell execution
     try {
       // Create a timeout script that sets our flag and kills the server
       const timeoutScript = `
-        ( 
-          sleep $(( ${timeout} * 60 )); 
-          if ! pgrep -f '^tmux attach ' &>/dev/null; then 
-            echo "UPTERM_TIMEOUT_REACHED" > ${UPTERM_TIMEOUT_FLAG_PATH};
-            tmux kill-server; 
-          fi 
+        (
+          sleep $(( ${timeout} * 60 ));
+          if ! pgrep -f '^tmux attach ' &>/dev/null; then
+            echo "UPTERM_TIMEOUT_REACHED" > ${timeoutFlagPath};
+            tmux kill-server;
+          fi
         ) & disown
       `;
       await execShellCommand(timeoutScript);
@@ -214,13 +232,14 @@ async function startUptermSession(): Promise<void> {
   }
   if (!uptermSocketExists()) {
     // Collect diagnostic information for user bug reports
-    const uptermDir = path.join(os.homedir(), '.upterm');
+    const uptermDir = getUptermSocketDir();
     let diagnostics = 'Failed to start upterm - socket not found after maximum retries.\n\nDiagnostics:\n';
 
-    // Check what files exist in .upterm directory
+    // Check what files exist in upterm socket directory
+    diagnostics += `- Expected socket directory: ${uptermDir}\n`;
     if (fs.existsSync(uptermDir)) {
       const files = fs.readdirSync(uptermDir);
-      diagnostics += `- .upterm directory contains: ${files.join(', ')}\n`;
+      diagnostics += `- Socket directory contains: ${files.join(', ')}\n`;
 
       // Read upterm.log if it exists for error details
       const logPath = path.join(uptermDir, 'upterm.log');
@@ -243,7 +262,7 @@ async function startUptermSession(): Promise<void> {
         // Ignore command log read errors
       }
     } else {
-      diagnostics += '- .upterm directory does not exist\n';
+      diagnostics += '- Socket directory does not exist\n';
     }
 
     // Check if tmux sessions are running
@@ -282,7 +301,15 @@ async function monitorSession(): Promise<void> {
     }
 
     try {
-      core.info(await execShellCommand('upterm session current --admin-socket ~/.upterm/*.sock'));
+      const uptermSocketDir = getUptermSocketDir();
+      // Find the actual socket file instead of using wildcard
+      const files = fs.readdirSync(uptermSocketDir);
+      const socketFile = files.find(file => file.endsWith('.sock'));
+      if (!socketFile) {
+        throw new Error('Socket file not found');
+      }
+      const socketPath = path.join(uptermSocketDir, socketFile).replace(/\\/g, '/');
+      core.info(await execShellCommand(`upterm session current --admin-socket "${socketPath}"`));
     } catch (error) {
       // Check if this error is due to timeout before throwing
       if (isTimeoutReached()) {
@@ -303,8 +330,25 @@ async function monitorSession(): Promise<void> {
   }
 }
 
+function getUptermSocketDir(): string {
+  // Upterm uses adrg/xdg library for socket storage
+  // See: https://github.com/owenthereal/upterm/pull/398
+  // XDG RuntimeDir: https://pkg.go.dev/github.com/adrg/xdg#RuntimeDir
+  if (process.platform === 'linux') {
+    // Linux: $XDG_RUNTIME_DIR/upterm or /run/user/$(id -u)/upterm
+    const uid = process.getuid ? process.getuid() : '1000';
+    return process.env.XDG_RUNTIME_DIR ? path.join(process.env.XDG_RUNTIME_DIR, 'upterm') : `/run/user/${uid}/upterm`;
+  } else if (process.platform === 'darwin') {
+    // macOS: ~/Library/Application Support/upterm
+    return path.join(os.homedir(), 'Library', 'Application Support', 'upterm');
+  } else {
+    // Windows: %LOCALAPPDATA%\upterm
+    return path.join(process.env.LOCALAPPDATA || 'C:\\Users\\runneradmin\\AppData\\Local', 'upterm');
+  }
+}
+
 function uptermSocketExists(): boolean {
-  const uptermDir = path.join(os.homedir(), '.upterm');
+  const uptermDir = getUptermSocketDir();
   if (!fs.existsSync(uptermDir)) return false;
   return fs.readdirSync(uptermDir).some(file => file.endsWith('.sock'));
 }
@@ -315,7 +359,7 @@ function continueFileExists(): boolean {
 }
 
 function isTimeoutReached(): boolean {
-  return fs.existsSync(UPTERM_TIMEOUT_FLAG_PATH);
+  return fs.existsSync(getUptermTimeoutFlagPath());
 }
 
 function logTimeoutMessage(): void {
