@@ -153,7 +153,7 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(core.setFailed).toHaveBeenCalledWith('Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.');
+    expect(core.setFailed).toHaveBeenCalledWith('Failed to install dependencies on linux: Error: Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.');
   });
 
   it('should support custom known_hosts content', async () => {
@@ -197,7 +197,7 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(core.setFailed).toHaveBeenCalledWith('Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.');
+    expect(core.setFailed).toHaveBeenCalledWith('Failed to install dependencies on win32: Error: Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.');
   });
 
   it('should install using brew on macos', async () => {
@@ -278,7 +278,7 @@ describe('upterm GitHub integration', () => {
 
     await run();
 
-    expect(core.setFailed).toHaveBeenCalledWith('Failed to install dependencies on Linux: Error: Installation failed');
+    expect(core.setFailed).toHaveBeenCalledWith('Failed to install dependencies on linux: Error: Installation failed');
   });
 
   it('should handle timeout with timeout flag detection', async () => {
