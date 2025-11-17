@@ -13,6 +13,8 @@ const UPTERM_READY_MAX_RETRIES = 10;
 const SESSION_STATUS_POLL_INTERVAL = 5000;
 const SUPPORTED_UPTERM_ARCHITECTURES = ['amd64', 'arm64'] as const;
 const TMUX_DIMENSIONS = {width: 132, height: 43};
+// Delay (in milliseconds) to allow upterm sufficient time to initialize before proceeding.
+// This 2-second delay helps ensure the upterm server is fully started and ready for connections.
 const UPTERM_INIT_DELAY = 2000;
 
 // Platform-specific paths
@@ -26,8 +28,14 @@ const PATHS = {
     unix: '/continue'
   },
   logs: {
-    uptermCommand: '/tmp/upterm-command.log',
-    tmuxError: '/tmp/tmux-error.log'
+    uptermCommand: {
+      win32: 'C:/msys64/tmp/upterm-command.log',
+      unix: '/tmp/upterm-command.log'
+    },
+    tmuxError: {
+      win32: 'C:/msys64/tmp/tmux-error.log',
+      unix: '/tmp/tmux-error.log'
+    }
   }
 } as const;
 
@@ -38,6 +46,14 @@ function toShellPath(filePath: string): string {
 
 function getUptermTimeoutFlagPath(): string {
   return process.platform === 'win32' ? PATHS.timeoutFlag.win32 : PATHS.timeoutFlag.unix;
+}
+
+function getUptermCommandLogPath(): string {
+  return process.platform === 'win32' ? PATHS.logs.uptermCommand.win32 : PATHS.logs.uptermCommand.unix;
+}
+
+function getTmuxErrorLogPath(): string {
+  return process.platform === 'win32' ? PATHS.logs.tmuxError.win32 : PATHS.logs.tmuxError.unix;
 }
 
 type UptermArchitecture = (typeof SUPPORTED_UPTERM_ARCHITECTURES)[number];
@@ -212,13 +228,13 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
   core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
   try {
     await execShellCommand(
-      `tmux new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --accept --server '${uptermServer}' ${authorizedKeysParameter}--force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${PATHS.logs.uptermCommand}" 2>${PATHS.logs.tmuxError}`
+      `tmux new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${getUptermCommandLogPath()}" 2>${getTmuxErrorLogPath()}`
     );
     await execShellCommand('tmux set -t upterm-wrapper window-size largest; tmux set -t upterm window-size largest');
     core.debug('Created new session successfully');
   } catch (error) {
     try {
-      const tmuxError = await execShellCommand(`cat ${PATHS.logs.tmuxError} 2>/dev/null || echo "No tmux error log found"`);
+      const tmuxError = await execShellCommand(`cat ${getTmuxErrorLogPath()} 2>/dev/null || echo "No tmux error log found"`);
       core.error(`Tmux error log: ${tmuxError.trim()}`);
     } catch (logError) {
       core.debug(`Could not read tmux error log: ${logError}`);
@@ -270,7 +286,7 @@ async function collectDiagnostics(): Promise<string> {
     }
 
     try {
-      const cmdLog = await execShellCommand(`cat ${PATHS.logs.uptermCommand} 2>/dev/null || echo "No command log"`);
+      const cmdLog = await execShellCommand(`cat ${getUptermCommandLogPath()} 2>/dev/null || echo "No command log"`);
       if (cmdLog.trim() !== 'No command log') {
         diagnostics += `- Command output: ${cmdLog.trim()}\n`;
       }
@@ -381,7 +397,7 @@ function getUptermSocketDir(): string {
     return path.join(os.homedir(), 'Library', 'Application Support', 'upterm');
   } else {
     // Windows: %LOCALAPPDATA%\upterm
-    return path.join(process.env.LOCALAPPDATA || 'C:\\Users\\runneradmin\\AppData\\Local', 'upterm');
+    return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'upterm');
   }
 }
 
