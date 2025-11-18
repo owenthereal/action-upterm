@@ -6,6 +6,7 @@
   "main": "src/main.ts",
   "scripts": {
     "build": "ncc build --source-map --minify --license LICENSE -o lib",
+    "watch": "yarn run build --watch",
     "lint": "yarn run prettier && yarn run eslint",
     "format": "yarn run prettier:fix && yarn run eslint:fix",
     "eslint": "eslint --max-warnings=0 .",

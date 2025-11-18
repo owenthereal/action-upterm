@@ -11,7 +11,7 @@ This GitHub Action enables direct interaction with the host system running your 
 
 - **Linux**
 - **macOS**
-- **Windows**: Unsupported (actions will skip to avoid pipeline failures).
+- **Windows**
 
 ## Getting Started
 
