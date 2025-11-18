@@ -21,20 +21,20 @@ const UPTERM_INIT_DELAY = 2000;
 // Platform-specific paths
 const PATHS = {
   timeoutFlag: {
-    win32: 'C:/msys64/tmp/upterm-timeout-flag',
+    win32: path.join(os.tmpdir(), 'upterm-timeout-flag'),
     unix: '/tmp/upterm-timeout-flag'
   },
   continueFile: {
-    win32: 'C:/msys64/continue',
+    win32: path.join(os.tmpdir(), 'upterm-continue'),
     unix: '/continue'
   },
   logs: {
     uptermCommand: {
-      win32: 'C:/msys64/tmp/upterm-command.log',
+      win32: path.join(os.tmpdir(), 'upterm-command.log'),
       unix: '/tmp/upterm-command.log'
     },
     tmuxError: {
-      win32: 'C:/msys64/tmp/tmux-error.log',
+      win32: path.join(os.tmpdir(), 'tmux-error.log'),
       unix: '/tmp/tmux-error.log'
     }
   }
@@ -137,7 +137,6 @@ async function installDependencies(): Promise<void> {
       }
 
       core.addPath(extractDir);
-      await execShellCommand('if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
     },
     darwin: async () => {
       await execShellCommand('brew install owenthereal/upterm/upterm tmux');
@@ -206,8 +205,24 @@ async function setupKnownHosts(knownHostsPath: string): Promise<void> {
   } else {
     core.info('Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     try {
-      await execShellCommand(`ssh-keyscan uptermd.upterm.dev 2> /dev/null >> "${knownHostsPathForShell}"`);
-      await execShellCommand(`grep '^uptermd.upterm.dev' "${knownHostsPathForShell}" | awk '{ print "@cert-authority * " $2 " " $3 }' >> "${knownHostsPathForShell}"`);
+      const suppression = process.platform === 'win32' ? '$null' : '/dev/null';
+      const scanOutput = await execShellCommand(`ssh-keyscan uptermd.upterm.dev 2> ${suppression}`);
+      fs.appendFileSync(knownHostsPath, scanOutput);
+
+      const certAuthorityLines = scanOutput
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.startsWith('uptermd.upterm.dev '))
+        .map(line => {
+          const parts = line.split(/\s+/);
+          if (parts.length < 3) return null;
+          return `@cert-authority * ${parts[1]} ${parts[2]}`;
+        })
+        .filter((line): line is string => Boolean(line));
+
+      if (certAuthorityLines.length > 0) {
+        fs.appendFileSync(knownHostsPath, certAuthorityLines.join('\n') + '\n');
+      }
     } catch (error) {
       throw new Error(`Failed to setup known_hosts: ${error}`);
     }
@@ -241,9 +256,30 @@ function buildAuthorizedKeysParameter(allowedUsers: string[]): string {
   return allowedUsers.map(user => `--github-user '${user}'`).join(' ') + ' ';
 }
 
-async function createUptermSession(uptermServer: string, authorizedKeysParameter: string): Promise<void> {
+function buildWindowsUptermArgs(uptermServer: string, allowedUsers: string[]): string[] {
+  return ['host', '--accept', '--server', uptermServer, ...allowedUsers.flatMap(user => ['--github-user', user])];
+}
+
+function escapeForPowerShell(arg: string): string {
+  return `'${arg.replace(/'/g, "''")}'`;
+}
+
+async function createWindowsSession(uptermServer: string, allowedUsers: string[]): Promise<void> {
+  const argsList = buildWindowsUptermArgs(uptermServer, allowedUsers).map(escapeForPowerShell).join(', ');
+  const commandLog = getUptermCommandLogPath();
+  const errorLog = `${commandLog}.err`;
+  const startProcessCommand = `Start-Process -FilePath "upterm.exe" -ArgumentList @(${argsList}) -RedirectStandardOutput "${commandLog}" -RedirectStandardError "${errorLog}" -NoNewWindow`;
+  await execShellCommand(startProcessCommand);
+}
+
+async function createUptermSession(uptermServer: string, allowedUsers: string[], authorizedKeysParameter: string): Promise<void> {
   core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
   try {
+    if (process.platform === 'win32') {
+      await createWindowsSession(uptermServer, allowedUsers);
+      core.debug('Created new session successfully');
+      return;
+    }
     await execShellCommand(
       `tmux new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${getUptermCommandLogPath()}" 2>${getTmuxErrorLogPath()}`
     );
@@ -251,8 +287,10 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
     core.debug('Created new session successfully');
   } catch (error) {
     try {
-      const tmuxError = await execShellCommand(`cat ${getTmuxErrorLogPath()} 2>/dev/null || echo "No tmux error log found"`);
-      core.error(`Tmux error log: ${tmuxError.trim()}`);
+      if (process.platform !== 'win32') {
+        const tmuxError = await execShellCommand(`cat ${getTmuxErrorLogPath()} 2>/dev/null || echo "No tmux error log found"`);
+        core.error(`Tmux error log: ${tmuxError.trim()}`);
+      }
     } catch (logError) {
       core.debug(`Could not read tmux error log: ${logError}`);
     }
@@ -261,6 +299,10 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
 }
 
 async function setupSessionTimeout(waitTimeoutMinutes: string): Promise<void> {
+  if (process.platform === 'win32') {
+    core.info(`wait-timeout-minutes set - will wait for ${waitTimeoutMinutes} minutes for someone to connect, otherwise shut down`);
+    return;
+  }
   const timeout = parseInt(waitTimeoutMinutes, 10);
   const timeoutFlagPath = getUptermTimeoutFlagPath();
 
@@ -301,24 +343,32 @@ async function collectDiagnostics(): Promise<string> {
         diagnostics += `- Could not read upterm.log: ${error}\n`;
       }
     }
-
-    try {
-      const cmdLog = await execShellCommand(`cat ${getUptermCommandLogPath()} 2>/dev/null || echo "No command log"`);
-      if (cmdLog.trim() !== 'No command log') {
-        diagnostics += `- Command output: ${cmdLog.trim()}\n`;
-      }
-    } catch (error) {
-      // Ignore command log read errors
-    }
   } else {
     diagnostics += '- Socket directory does not exist\n';
   }
 
+  const cmdLogPath = getUptermCommandLogPath();
   try {
-    const tmuxList = await execShellCommand('tmux list-sessions 2>/dev/null || echo "No tmux sessions"');
-    diagnostics += `- Tmux sessions: ${tmuxList.trim()}\n`;
+    const cmdLog = fs.existsSync(cmdLogPath) ? fs.readFileSync(cmdLogPath, 'utf8') : '';
+    if (cmdLog.trim()) {
+      diagnostics += `- Command output: ${cmdLog.trim()}\n`;
+    }
+    const errLogPath = `${cmdLogPath}.err`;
+    const errLog = fs.existsSync(errLogPath) ? fs.readFileSync(errLogPath, 'utf8') : '';
+    if (errLog.trim()) {
+      diagnostics += `- Command error output: ${errLog.trim()}\n`;
+    }
   } catch (error) {
-    diagnostics += `- Could not check tmux sessions: ${error}\n`;
+    diagnostics += `- Could not read command logs: ${error}\n`;
+  }
+
+  if (process.platform !== 'win32') {
+    try {
+      const tmuxList = await execShellCommand('tmux list-sessions 2>/dev/null || echo "No tmux sessions"');
+      diagnostics += `- Tmux sessions: ${tmuxList.trim()}\n`;
+    } catch (error) {
+      diagnostics += `- Could not check tmux sessions: ${error}\n`;
+    }
   }
 
   diagnostics += '\nPlease report this issue with the above diagnostics at: https://github.com/owenthereal/action-upterm/issues';
@@ -326,9 +376,10 @@ async function collectDiagnostics(): Promise<string> {
 }
 
 async function waitForUptermReady(): Promise<void> {
-  let tries = UPTERM_READY_MAX_RETRIES;
+  let tries = process.platform === 'win32' ? UPTERM_READY_MAX_RETRIES * 2 : UPTERM_READY_MAX_RETRIES;
   while (tries-- > 0) {
-    core.info(`Waiting for upterm to be ready... (${UPTERM_READY_MAX_RETRIES - tries}/${UPTERM_READY_MAX_RETRIES})`);
+    const attempt = (process.platform === 'win32' ? UPTERM_READY_MAX_RETRIES * 2 : UPTERM_READY_MAX_RETRIES) - tries;
+    core.info(`Waiting for upterm to be ready... (${attempt}/${process.platform === 'win32' ? UPTERM_READY_MAX_RETRIES * 2 : UPTERM_READY_MAX_RETRIES})`);
     if (uptermSocketExists()) return;
     await sleep(UPTERM_SOCKET_POLL_INTERVAL);
   }
@@ -344,7 +395,7 @@ async function startUptermSession(): Promise<void> {
   const uptermServer = core.getInput('upterm-server');
   const waitTimeoutMinutes = core.getInput('wait-timeout-minutes');
 
-  await createUptermSession(uptermServer, authorizedKeysParameter);
+  await createUptermSession(uptermServer, allowedUsers, authorizedKeysParameter);
   await sleep(UPTERM_INIT_DELAY);
 
   if (waitTimeoutMinutes) {
@@ -354,8 +405,35 @@ async function startUptermSession(): Promise<void> {
   await waitForUptermReady();
 }
 
+function hasActiveClient(sessionInfo: string): boolean {
+  const normalized = sessionInfo.toLowerCase();
+  if (!normalized.includes('client')) {
+    return false;
+  }
+  return !normalized.includes('clients: []') && !normalized.includes('clients: 0');
+}
+
+function markTimeoutReached(): void {
+  fs.writeFileSync(getUptermTimeoutFlagPath(), 'UPTERM_TIMEOUT_REACHED');
+}
+
+async function stopUptermSession(): Promise<void> {
+  if (process.platform !== 'win32') {
+    return;
+  }
+
+  try {
+    await execShellCommand('Get-Process -Name upterm -ErrorAction SilentlyContinue | Stop-Process -Force');
+  } catch (error) {
+    core.debug(`Failed to stop upterm process: ${error}`);
+  }
+}
+
 async function monitorSession(): Promise<void> {
   core.debug('Entering main loop');
+  const waitTimeoutMinutes = core.getInput('wait-timeout-minutes');
+  const timeoutDeadline = process.platform === 'win32' && waitTimeoutMinutes ? Date.now() + parseInt(waitTimeoutMinutes, 10) * 60 * 1000 : null;
+  let clientConnected = process.platform !== 'win32';
   // Main loop: wait for /continue file or upterm exit
   /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
   while (true) {
@@ -370,6 +448,13 @@ async function monitorSession(): Promise<void> {
       break;
     }
 
+    if (timeoutDeadline && !clientConnected && Date.now() >= timeoutDeadline) {
+      markTimeoutReached();
+      await stopUptermSession();
+      logTimeoutMessage();
+      break;
+    }
+
     if (!uptermSocketExists()) {
       core.info("Exiting debugging session: 'upterm' quit");
       break;
@@ -380,7 +465,11 @@ async function monitorSession(): Promise<void> {
       if (!socketPath) {
         throw new Error('Socket file not found');
       }
-      core.info(await execShellCommand(`upterm session current --admin-socket "${socketPath}"`));
+      const sessionInfo = await execShellCommand(`upterm session current --admin-socket "${socketPath}"`);
+      core.info(sessionInfo);
+      if (process.platform === 'win32' && !clientConnected && hasActiveClient(sessionInfo)) {
+        clientConnected = true;
+      }
     } catch (error) {
       // Check if this error is due to timeout before throwing
       if (isTimeoutReached()) {

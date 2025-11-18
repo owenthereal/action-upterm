@@ -19,13 +19,8 @@ export function execShellCommand(cmd: string): Promise<string> {
     const proc =
       process.platform !== 'win32'
         ? spawn(cmd, [], {shell: true})
-        : spawn('C:\\msys64\\usr\\bin\\bash.exe', ['-lc', cmd], {
-            env: {
-              ...process.env,
-              MSYS2_PATH_TYPE: 'inherit' /* Inherit previous path */,
-              CHERE_INVOKING: '1' /* do not `cd` to home */,
-              MSYSTEM: 'MINGW64' /* include the MINGW programs in C:/msys64/mingw64/bin/ */
-            }
+        : spawn('pwsh.exe', ['-NoLogo', '-NoProfile', '-Command', cmd], {
+            windowsHide: true
           });
     let stdout = '';
     let stderr = '';

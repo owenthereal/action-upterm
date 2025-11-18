@@ -7,10 +7,14 @@ jest.mock('@actions/tool-cache', () => ({
   extractTar: jest.fn()
 }));
 
+import os from 'os';
+import path from 'path';
+
 jest.mock('fs', () => ({
   mkdirSync: jest.fn(() => true),
   existsSync: jest.fn(() => true),
   appendFileSync: jest.fn(() => true),
+  writeFileSync: jest.fn(() => true),
   readdirSync: jest.fn(() => ['id_rsa', 'id_ed25519', 'hello.sock']),
   readFileSync: jest.fn(() => '{}'),
   promises: {
@@ -72,11 +76,12 @@ describe('upterm GitHub integration', () => {
     expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
     expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
 
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('Start-Process -FilePath "upterm.exe"'));
+    expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('pacman -S'));
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready... (1/20)');
     expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
   });
 
@@ -103,7 +108,7 @@ describe('upterm GitHub integration', () => {
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready... (1/20)');
     expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
   });
 
@@ -153,7 +158,8 @@ describe('upterm GitHub integration', () => {
     expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
     expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
 
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('Start-Process -FilePath "upterm.exe"'));
+    expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('pacman -S'));
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
@@ -355,15 +361,17 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
     // Mock fs.existsSync to handle different paths correctly
+    const timeoutFlagPath = path.join(os.tmpdir(), 'upterm-timeout-flag');
+    const continuePath = path.join(os.tmpdir(), 'upterm-continue');
     let monitoringLoopCalls = 0;
     mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
       const pathStr = path.toString();
-      if (pathStr === 'C:/msys64/tmp/upterm-timeout-flag') {
+      if (pathStr === timeoutFlagPath) {
         monitoringLoopCalls++;
         // Return true on second call (first call is in monitoring loop)
         return monitoringLoopCalls >= 2;
       }
-      if (pathStr === 'C:/msys64/continue' || pathStr.includes('continue')) {
+      if (pathStr === continuePath || pathStr.includes('continue')) {
         return false; // Don't exit via continue file
       }
       return true; // Default for other paths (SSH keys, .upterm dir, etc.)
@@ -372,7 +380,6 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('C:/msys64/tmp/upterm-timeout-flag'));
     expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 5 minutes for someone to connect, otherwise shut down');
     expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
     expect(core.info).toHaveBeenCalledWith('The session was automatically shut down to prevent unnecessary resource usage');
