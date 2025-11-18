@@ -1,34 +1,35 @@
+import {beforeEach, describe, expect, it, vi} from 'vitest';
 import * as core from '@actions/core';
 
-jest.mock('@actions/core');
+vi.mock('@actions/core');
 
 // Mock child_process
-jest.mock('child_process', () => ({
-  spawn: jest.fn()
+vi.mock('child_process', () => ({
+  spawn: vi.fn()
 }));
 
 import {spawn} from 'child_process';
 import {execShellCommand} from './helpers';
 
-const mockSpawn = spawn as jest.MockedFunction<typeof spawn>;
+const mockSpawn = spawn as ReturnType<typeof vi.fn>;
 
 describe('execShellCommand', () => {
   let mockProcess: {
-    stdout: {on: jest.Mock};
-    stderr: {on: jest.Mock};
-    on: jest.Mock;
+    stdout: {on: ReturnType<typeof vi.fn>};
+    stderr: {on: ReturnType<typeof vi.fn>};
+    on: ReturnType<typeof vi.fn>;
   };
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     mockProcess = {
       stdout: {
-        on: jest.fn()
+        on: vi.fn()
       },
       stderr: {
-        on: jest.fn()
+        on: vi.fn()
       },
-      on: jest.fn()
+      on: vi.fn()
     };
     mockSpawn.mockReturnValue(mockProcess as never);
   });
