@@ -301,25 +301,50 @@ async function collectDiagnostics(): Promise<string> {
         diagnostics += `- Could not read upterm.log: ${error}\n`;
       }
     }
-
-    try {
-      const cmdLog = await execShellCommand(`cat ${getUptermCommandLogPath()} 2>/dev/null || echo "No command log"`);
-      if (cmdLog.trim() !== 'No command log') {
-        diagnostics += `- Command output: ${cmdLog.trim()}\n`;
-      }
-    } catch (error) {
-      // Ignore command log read errors
-    }
   } else {
     diagnostics += '- Socket directory does not exist\n';
   }
 
+  // Check tmux sessions
   try {
     const tmuxList = await execShellCommand('tmux list-sessions 2>/dev/null || echo "No tmux sessions"');
     diagnostics += `- Tmux sessions: ${tmuxList.trim()}\n`;
   } catch (error) {
     diagnostics += `- Could not check tmux sessions: ${error}\n`;
   }
+
+  // Check tmux error log
+  try {
+    const tmuxErrorLog = await execShellCommand(`cat ${getTmuxErrorLogPath()} 2>/dev/null || echo "No tmux error log"`);
+    if (tmuxErrorLog.trim() !== 'No tmux error log') {
+      diagnostics += `- Tmux error log:\n${tmuxErrorLog.trim()}\n`;
+    }
+  } catch (error) {
+    diagnostics += `- Could not read tmux error log: ${error}\n`;
+  }
+
+  // Check upterm command output log
+  try {
+    const cmdLog = await execShellCommand(`cat ${getUptermCommandLogPath()} 2>/dev/null || echo "No command log"`);
+    if (cmdLog.trim() !== 'No command log') {
+      diagnostics += `- Upterm command output:\n${cmdLog.trim()}\n`;
+    }
+  } catch (error) {
+    diagnostics += `- Could not read command log: ${error}\n`;
+  }
+
+  // Check if upterm is in PATH
+  try {
+    const uptermVersion = await execShellCommand('upterm version 2>&1 || echo "upterm not found in PATH"');
+    diagnostics += `- Upterm binary check: ${uptermVersion.trim()}\n`;
+  } catch (error) {
+    diagnostics += `- Could not check upterm binary: ${error}\n`;
+  }
+
+  // Check environment
+  diagnostics += `- XDG_RUNTIME_DIR: ${process.env.XDG_RUNTIME_DIR || 'not set'}\n`;
+  diagnostics += `- USER: ${process.env.USER || 'not set'}\n`;
+  diagnostics += `- UID: ${process.getuid ? process.getuid() : 'unknown'}\n`;
 
   diagnostics += '\nPlease report this issue with the above diagnostics at: https://github.com/owenthereal/action-upterm/issues';
   return diagnostics;
