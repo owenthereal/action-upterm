@@ -1,4 +1,4 @@
-import {beforeEach, describe, expect, it, vi} from 'vitest';
+import {beforeEach, describe, expect, it, Mock, vi} from 'vitest';
 import * as core from '@actions/core';
 
 vi.mock('@actions/core');
@@ -11,13 +11,13 @@ vi.mock('child_process', () => ({
 import {spawn} from 'child_process';
 import {execShellCommand} from './helpers';
 
-const mockSpawn = spawn as ReturnType<typeof vi.fn>;
+const mockSpawn = spawn as Mock;
 
 describe('execShellCommand', () => {
   let mockProcess: {
-    stdout: {on: ReturnType<typeof vi.fn>};
-    stderr: {on: ReturnType<typeof vi.fn>};
-    on: ReturnType<typeof vi.fn>;
+    stdout: {on: Mock};
+    stderr: {on: Mock};
+    on: Mock;
   };
 
   beforeEach(() => {

@@ -4,6 +4,5 @@ import fs from 'fs';
 
 // Ensure fs.constants exists with all required POSIX constants
 if (!fs.constants) {
-  // @ts-ignore
   fs.constants = constants;
 }

@@ -14,11 +14,7 @@ async function build() {
       minify: true,
       external: [],
       // Ensure all dependencies are bundled
-      packages: 'bundle',
-      // Add banner to preserve license
-      banner: {
-        js: `// License: MIT\n// See LICENSE file for details\n`
-      }
+      packages: 'bundle'
     });
 
     // Copy LICENSE file to lib directory

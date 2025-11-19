@@ -1,4 +1,4 @@
-import {afterAll, beforeEach, describe, expect, it, vi} from 'vitest';
+import {afterAll, beforeEach, describe, expect, it, Mock, vi} from 'vitest';
 
 import * as core from '@actions/core';
 vi.mock('@actions/core');
@@ -50,7 +50,7 @@ describe('upterm GitHub integration', () => {
     mockedToolCache.extractTar.mockResolvedValue(EXTRACT_DIR);
     // Reset fs mocks
     mockFs.existsSync.mockReturnValue(true);
-    (mockFs.readdirSync as ReturnType<typeof vi.fn>).mockReturnValue(['id_rsa', 'id_ed25519', 'hello.sock']);
+    (mockFs.readdirSync as Mock).mockReturnValue(['id_rsa', 'id_ed25519', 'hello.sock']);
   });
 
   afterAll(() => {

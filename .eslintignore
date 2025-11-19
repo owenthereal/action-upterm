@@ -3,7 +3,4 @@ node_modules/
 coverage/
 *.config.js
 .eslintrc.js
-babel.config.js
-jest.config.js
 src/__mocks__/
-jest.setup.js
