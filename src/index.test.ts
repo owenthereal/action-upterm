@@ -1,47 +1,56 @@
-import {when} from 'jest-when';
+import {afterAll, beforeEach, describe, expect, it, Mock, vi} from 'vitest';
 
 import * as core from '@actions/core';
-jest.mock('@actions/core');
-jest.mock('@actions/tool-cache', () => ({
-  downloadTool: jest.fn(),
-  extractTar: jest.fn()
+vi.mock('@actions/core');
+vi.mock('@actions/tool-cache', () => ({
+  downloadTool: vi.fn(),
+  extractTar: vi.fn()
 }));
 
-jest.mock('fs', () => ({
-  mkdirSync: jest.fn(() => true),
-  existsSync: jest.fn(() => true),
-  appendFileSync: jest.fn(() => true),
-  readdirSync: jest.fn(() => ['id_rsa', 'id_ed25519', 'hello.sock']),
-  readFileSync: jest.fn(() => '{}'),
-  promises: {
-    access: jest.fn()
+vi.mock('fs', () => ({
+  default: {
+    mkdirSync: vi.fn(() => true),
+    existsSync: vi.fn(() => true),
+    appendFileSync: vi.fn(() => true),
+    readdirSync: vi.fn(() => ['id_rsa', 'id_ed25519', 'hello.sock']),
+    readFileSync: vi.fn(() => '{}'),
+    promises: {
+      access: vi.fn()
+    }
   }
 }));
 
 import {execShellCommand} from './helpers';
-jest.mock('./helpers');
-const mockedExecShellCommand = jest.mocked(execShellCommand);
+vi.mock('./helpers');
+const mockedExecShellCommand = vi.mocked(execShellCommand);
 
 import * as toolCache from '@actions/tool-cache';
-const mockedToolCache = jest.mocked(toolCache);
+const mockedToolCache = vi.mocked(toolCache);
 
 import {run} from '.';
 import fs from 'fs';
-const mockFs = fs as jest.Mocked<typeof fs>;
+const mockFs = fs as ReturnType<typeof vi.mocked<typeof fs>>;
 const DOWNLOAD_PATH = '/tmp/upterm.tar.gz';
 const EXTRACT_DIR = '/tmp/upterm-unique-a1b2c3d4';
+
+// Helper function to mock core.getInput
+function mockGetInput(values: Record<string, string>) {
+  vi.mocked(core.getInput).mockImplementation((name: string) => {
+    return values[name] || '';
+  });
+}
 
 describe('upterm GitHub integration', () => {
   const originalPlatform = process.platform;
   const originalArch = process.arch;
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     mockedToolCache.downloadTool.mockResolvedValue(DOWNLOAD_PATH);
     mockedToolCache.extractTar.mockResolvedValue(EXTRACT_DIR);
     // Reset fs mocks
     mockFs.existsSync.mockReturnValue(true);
-    (mockFs.readdirSync as jest.Mock).mockReturnValue(['id_rsa', 'id_ed25519', 'hello.sock']);
+    (mockFs.readdirSync as Mock).mockReturnValue(['id_rsa', 'id_ed25519', 'hello.sock']);
   });
 
   afterAll(() => {
@@ -60,10 +69,12 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'x64'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
@@ -87,10 +98,12 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'x64'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
@@ -114,10 +127,12 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'arm64'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
@@ -141,10 +156,12 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'arm64'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
@@ -168,10 +185,12 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'unknown'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
@@ -186,11 +205,13 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'x64'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
-    when(core.getInput).calledWith('ssh-known-hosts').mockReturnValueOnce('known hosts content');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '',
+      'upterm-server': 'ssh://myserver:22',
+      'ssh-known-hosts': 'known hosts content'
+    });
 
     const customConnectionString = 'foobar';
     mockedExecShellCommand.mockReturnValue(Promise.resolve(customConnectionString));
@@ -215,10 +236,12 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'unknown'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
@@ -230,10 +253,12 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'platform', {
       value: 'darwin'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
@@ -252,8 +277,10 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'x64'
     });
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('invalid');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'wait-timeout-minutes': 'invalid',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     await run();
 
@@ -267,8 +294,10 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'x64'
     });
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1500'); // > 24 hours
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'wait-timeout-minutes': '1500', // > 24 hours
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     await run();
 
@@ -282,8 +311,10 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'x64'
     });
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+    mockGetInput({
+      'upterm-server': '',
+      'wait-timeout-minutes': ''
+    });
 
     await run();
 
@@ -297,8 +328,10 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'x64'
     });
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+    mockGetInput({
+      'upterm-server': 'ssh://myserver:22',
+      'wait-timeout-minutes': ''
+    });
 
     mockedExecShellCommand.mockRejectedValueOnce(new Error('Installation failed'));
 
@@ -314,10 +347,12 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'x64'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '5',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     // Mock fs.existsSync to handle different paths correctly
     let monitoringLoopCalls = 0;
@@ -349,10 +384,12 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'x64'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '5',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     // Mock fs.existsSync to handle different paths correctly
     let monitoringLoopCalls = 0;
@@ -385,10 +422,12 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'x64'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '5',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     // Mock session status command to fail with connection refused, then succeed
     let sessionStatusCallCount = 0;
@@ -434,10 +473,12 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'x64'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     // Mock session status command to fail with connection refused
     mockedExecShellCommand.mockImplementation((cmd: string) => {
@@ -473,10 +514,12 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'arch', {
       value: 'x64'
     });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('10');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    mockGetInput({
+      'limit-access-to-users': '',
+      'limit-access-to-actor': 'false',
+      'wait-timeout-minutes': '10',
+      'upterm-server': 'ssh://myserver:22'
+    });
 
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();

@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "noEmit": true,
     "esModuleInterop": true,
     "target": "es6",
     "module": "commonjs",
@@ -13,9 +14,8 @@
     "useUnknownInCatchVariables": false,
   },
   "exclude": [
-    "./__tests__/**/*",
     "./lib/**/*",
     "node_modules",
-    "jest.config.ts"
+    "vitest.config.ts"
   ]
 }

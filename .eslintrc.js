@@ -4,7 +4,7 @@ module.exports = {
     ecmaVersion: 2020,
     sourceType: 'module'
   },
-  plugins: ['@typescript-eslint', 'prettier', 'jest'],
+  plugins: ['@typescript-eslint', 'prettier'],
   extends: ['eslint:recommended', 'plugin:@typescript-eslint/recommended', 'prettier'],
   rules: {
     '@typescript-eslint/no-unused-vars': 'error',
@@ -16,9 +16,15 @@ module.exports = {
   overrides: [
     {
       files: ['**/*.test.ts'],
-      extends: ['plugin:jest/recommended'],
-      env: {
-        jest: true
+      globals: {
+        describe: 'readonly',
+        it: 'readonly',
+        expect: 'readonly',
+        beforeEach: 'readonly',
+        afterEach: 'readonly',
+        afterAll: 'readonly',
+        beforeAll: 'readonly',
+        vi: 'readonly'
       }
     },
     {

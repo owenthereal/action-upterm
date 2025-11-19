@@ -1,6 +1,6 @@
 // Setup fs constants that @actions/io needs
-const constants = require('constants');
-const fs = require('fs');
+import constants from 'constants';
+import fs from 'fs';
 
 // Ensure fs.constants exists with all required POSIX constants
 if (!fs.constants) {
