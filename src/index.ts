@@ -191,6 +191,7 @@ function configureSSHClient(sshPath: string): void {
   ServerAliveCountMax 180
   VerifyHostKeyDNS yes
   UpdateHostKeys yes
+  AddressFamily inet
 `;
   fs.appendFileSync(path.join(sshPath, 'config'), sshConfig);
 }
@@ -206,7 +207,7 @@ async function setupKnownHosts(knownHostsPath: string): Promise<void> {
   } else {
     core.info('Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
     try {
-      await execShellCommand(`ssh-keyscan uptermd.upterm.dev 2> /dev/null >> "${knownHostsPathForShell}"`);
+      await execShellCommand(`ssh-keyscan -4 uptermd.upterm.dev 2> /dev/null >> "${knownHostsPathForShell}"`);
       await execShellCommand(`grep '^uptermd.upterm.dev' "${knownHostsPathForShell}" | awk '{ print "@cert-authority * " $2 " " $3 }' >> "${knownHostsPathForShell}"`);
     } catch (error) {
       throw new Error(`Failed to setup known_hosts: ${error}`);
