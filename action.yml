@@ -20,10 +20,6 @@ inputs:
     description: "upterm server address (required), supported protocols are ssh, ws, or wss."
     required: true
     default: "ssh://uptermd.upterm.dev:22"
-  ssh-known-hosts:
-    description: "Content for ~/.ssh/known_hosts file on the server"
-    required: false
-    default: ""
   wait-timeout-minutes:
     description: "Integer number of minutes to wait for user to connect before shutting down server. Once a user connects, the server will stay up."
     required: false
