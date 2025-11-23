@@ -196,32 +196,11 @@ function configureSSHClient(sshPath: string): void {
   fs.appendFileSync(path.join(sshPath, 'config'), sshConfig);
 }
 
-async function setupKnownHosts(knownHostsPath: string): Promise<void> {
-  const knownHostsPathForShell = toShellPath(knownHostsPath);
-  const sshKnownHosts = core.getInput('ssh-known-hosts');
-
-  if (sshKnownHosts && sshKnownHosts !== '') {
-    core.info('Appending ssh-known-hosts to ~/.ssh/known_hosts. Contents of ~/.ssh/known_hosts:');
-    fs.appendFileSync(knownHostsPath, sshKnownHosts);
-    core.info(await execShellCommand(`cat "${knownHostsPathForShell}"`));
-  } else {
-    core.info('Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
-    try {
-      await execShellCommand(`ssh-keyscan -4 uptermd.upterm.dev 2> /dev/null >> "${knownHostsPathForShell}"`);
-      await execShellCommand(`grep '^uptermd.upterm.dev' "${knownHostsPathForShell}" | awk '{ print "@cert-authority * " $2 " " $3 }' >> "${knownHostsPathForShell}"`);
-    } catch (error) {
-      throw new Error(`Failed to setup known_hosts: ${error}`);
-    }
-  }
-}
-
 async function setupSSH(): Promise<void> {
   const sshPath = path.join(os.homedir(), '.ssh');
-  const knownHostsPath = path.join(sshPath, 'known_hosts');
 
   await generateSSHKeys(sshPath);
   configureSSHClient(sshPath);
-  await setupKnownHosts(knownHostsPath);
 }
 
 function getAllowedUsers(): string[] {
@@ -246,7 +225,7 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
   core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
   try {
     await execShellCommand(
-      `tmux new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${getUptermCommandLogPath()}" 2>${getTmuxErrorLogPath()}`
+      `tmux new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${getUptermCommandLogPath()}" 2>${getTmuxErrorLogPath()}`
     );
     await execShellCommand('tmux set -t upterm-wrapper window-size largest; tmux set -t upterm window-size largest');
     core.debug('Created new session successfully');

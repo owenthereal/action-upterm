@@ -74,10 +74,9 @@ describe('upterm GitHub integration', () => {
 
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
 
-    expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
-    expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready... (1/10)');
-    expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
+    expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
+    expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenNthCalledWith(3, "Exiting debugging session because '/continue' file was created");
   });
 
   it('should handle the main loop for linux x64', async () => {
@@ -101,10 +100,9 @@ describe('upterm GitHub integration', () => {
 
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
 
-    expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
-    expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready... (1/10)');
-    expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
+    expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
+    expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenNthCalledWith(3, "Exiting debugging session because '/continue' file was created");
   });
 
   it('should handle the main loop for linux arm64', async () => {
@@ -128,10 +126,9 @@ describe('upterm GitHub integration', () => {
 
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
 
-    expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
-    expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready... (1/10)');
-    expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
+    expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
+    expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenNthCalledWith(3, "Exiting debugging session because '/continue' file was created");
   });
 
   it('should handle the main loop for windows arm64', async () => {
@@ -155,10 +152,9 @@ describe('upterm GitHub integration', () => {
 
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
 
-    expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
-    expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready... (1/10)');
-    expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
+    expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
+    expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenNthCalledWith(3, "Exiting debugging session because '/continue' file was created");
   });
 
   it('error handling for unsupported linux arch', async () => {
@@ -177,35 +173,6 @@ describe('upterm GitHub integration', () => {
     await run();
 
     expect(core.setFailed).toHaveBeenCalledWith('Failed to install dependencies on linux: Error: Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.');
-  });
-
-  it('should support custom known_hosts content', async () => {
-    Object.defineProperty(process, 'platform', {
-      value: 'linux'
-    });
-    Object.defineProperty(process, 'arch', {
-      value: 'x64'
-    });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
-    when(core.getInput).calledWith('ssh-known-hosts').mockReturnValueOnce('known hosts content');
-
-    const customConnectionString = 'foobar';
-    mockedExecShellCommand.mockReturnValue(Promise.resolve(customConnectionString));
-    await run();
-
-    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz');
-    expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
-    expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
-
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
-    expect(core.info).toHaveBeenNthCalledWith(1, 'Appending ssh-known-hosts to ~/.ssh/known_hosts. Contents of ~/.ssh/known_hosts:');
-    expect(core.info).toHaveBeenNthCalledWith(2, `${customConnectionString}`);
-    expect(core.info).toHaveBeenNthCalledWith(3, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(4, 'Waiting for upterm to be ready... (1/10)');
-    expect(core.info).toHaveBeenNthCalledWith(5, "Exiting debugging session because '/continue' file was created");
   });
 
   it('error handling for unsupported windows arch', async () => {
@@ -239,10 +206,9 @@ describe('upterm GitHub integration', () => {
     await run();
 
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'brew install owenthereal/upterm/upterm tmux');
-    expect(core.info).toHaveBeenNthCalledWith(1, 'Auto-generating ~/.ssh/known_hosts by attempting connection to uptermd.upterm.dev');
-    expect(core.info).toHaveBeenNthCalledWith(2, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(3, 'Waiting for upterm to be ready... (1/10)');
-    expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
+    expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
+    expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenNthCalledWith(3, "Exiting debugging session because '/continue' file was created");
   });
 
   it('should handle invalid wait-timeout-minutes', async () => {
