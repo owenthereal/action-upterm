@@ -72,8 +72,6 @@ describe('upterm GitHub integration', () => {
     expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
     expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
 
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
-
     expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
     expect(core.info).toHaveBeenNthCalledWith(3, "Exiting debugging session because '/continue' file was created");
@@ -149,8 +147,6 @@ describe('upterm GitHub integration', () => {
     expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_arm64.tar.gz');
     expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
     expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
-
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');

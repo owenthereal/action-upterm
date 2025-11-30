@@ -33,7 +33,10 @@ describe('execShellCommand', () => {
     mockSpawn.mockReturnValue(mockProcess as never);
   });
 
-  it('should execute command successfully', async () => {
+  it('should execute command successfully on unix', async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, 'platform', {value: 'linux', configurable: true});
+
     const command = 'echo "hello"';
     const expectedOutput = 'hello\n';
 
@@ -54,8 +57,42 @@ describe('execShellCommand', () => {
     const result = await resultPromise;
 
     expect(result).toBe(expectedOutput);
-    expect(mockSpawn).toHaveBeenCalledWith(command, [], {shell: 'bash'});
+    expect(mockSpawn).toHaveBeenCalledWith(command, [], {shell: 'bash', env: process.env});
     expect(core.debug).toHaveBeenCalledWith(`Executing shell command: [${command}]`);
+
+    Object.defineProperty(process, 'platform', {value: originalPlatform, configurable: true});
+  });
+
+  it('should execute command successfully on windows', async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, 'platform', {value: 'win32', configurable: true});
+
+    const command = 'Write-Host "hello"';
+    const expectedOutput = 'hello\n';
+
+    // Setup mock process behavior
+    mockProcess.stdout.on.mockImplementation((event, callback) => {
+      if (event === 'data') {
+        callback(Buffer.from(expectedOutput));
+      }
+    });
+
+    mockProcess.on.mockImplementation((event, callback) => {
+      if (event === 'exit') {
+        callback(0); // Success exit code
+      }
+    });
+
+    const resultPromise = execShellCommand(command);
+    const result = await resultPromise;
+
+    expect(result).toBe(expectedOutput);
+    expect(mockSpawn).toHaveBeenCalledWith('pwsh.exe', ['-NoLogo', '-NoProfile', '-Command', command], {
+      windowsHide: true
+    });
+    expect(core.debug).toHaveBeenCalledWith(`Executing shell command: [${command}]`);
+
+    Object.defineProperty(process, 'platform', {value: originalPlatform, configurable: true});
   });
 
   it('should handle command failure', async () => {

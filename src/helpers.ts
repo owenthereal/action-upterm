@@ -16,7 +16,12 @@ export function execShellCommand(cmd: string): Promise<string> {
   }
 
   return new Promise<string>((resolve, reject) => {
-    const proc = spawn(cmd, [], {shell: 'bash'});
+    const proc =
+      process.platform !== 'win32'
+        ? spawn(cmd, [], {shell: 'bash', env: process.env})
+        : spawn('pwsh.exe', ['-NoLogo', '-NoProfile', '-Command', cmd], {
+            windowsHide: true
+          });
     let stdout = '';
     let stderr = '';
 

@@ -137,7 +137,6 @@ async function installDependencies(): Promise<void> {
       }
 
       core.addPath(extractDir);
-      await execShellCommand('if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
     },
     darwin: async () => {
       await execShellCommand('brew install owenthereal/upterm/upterm tmux');
