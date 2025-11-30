@@ -54,7 +54,7 @@ describe('execShellCommand', () => {
     const result = await resultPromise;
 
     expect(result).toBe(expectedOutput);
-    expect(mockSpawn).toHaveBeenCalledWith(command, [], {shell: true});
+    expect(mockSpawn).toHaveBeenCalledWith(command, [], {shell: 'bash'});
     expect(core.debug).toHaveBeenCalledWith(`Executing shell command: [${command}]`);
   });
 
