@@ -18,7 +18,7 @@ export function execShellCommand(cmd: string): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const proc =
       process.platform !== 'win32'
-        ? spawn(cmd, [], {shell: true})
+        ? spawn(cmd, [], {shell: 'bash'})
         : spawn('C:\\msys64\\usr\\bin\\bash.exe', ['-lc', cmd], {
             env: {
               ...process.env,
