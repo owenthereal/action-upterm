@@ -9,6 +9,7 @@ import {execShellCommand} from './helpers';
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 // Constants
+const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
 const UPTERM_SOCKET_POLL_INTERVAL = 1000;
 const UPTERM_READY_MAX_RETRIES = 10;
 const SESSION_STATUS_POLL_INTERVAL = 5000;
@@ -59,7 +60,7 @@ function getTmuxErrorLogPath(): string {
 
 type UptermArchitecture = (typeof SUPPORTED_UPTERM_ARCHITECTURES)[number];
 
-function getUptermArchitecture(nodeArch: string): UptermArchitecture | null {
+export function getUptermArchitecture(nodeArch: string): UptermArchitecture | null {
   switch (nodeArch) {
     case 'x64':
       return 'amd64';
@@ -76,6 +77,20 @@ function validateArchitecture(arch: string): UptermArchitecture {
     throw new Error(`Unsupported architecture for upterm: ${arch}. Only x64 and arm64 are supported.`);
   }
   return uptermArch;
+}
+
+export function getUptermDownloadUrl(platform: 'linux' | 'darwin', nodeArch: string): string {
+  const uptermArch = validateArchitecture(nodeArch);
+  const artifactPlatform = platform === 'darwin' ? 'darwin' : 'linux';
+  const filename = `upterm_${artifactPlatform}_${uptermArch}.tar.gz`;
+
+  const versionInput = core.getInput('upterm-version');
+  const version = versionInput?.trim();
+  const versionSegment = version ? `download/${version}` : 'latest/download';
+  const url = `${UPTERM_RELEASE_BASE_URL}/${versionSegment}/${filename}`;
+
+  core.debug(`Upterm download URL resolved to ${url}`);
+  return url;
 }
 
 function validateInputs(): void {
@@ -114,8 +129,8 @@ async function installDependencies(): Promise<void> {
   core.debug('Installing dependencies');
   const platformHandlers = {
     linux: async () => {
-      const uptermArch = validateArchitecture(process.arch);
-      const archive = await tc.downloadTool(`https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_${uptermArch}.tar.gz`);
+      const archiveUrl = getUptermDownloadUrl('linux', process.arch);
+      const archive = await tc.downloadTool(archiveUrl);
       const extractDir = await tc.extractTar(archive);
       const uptermPath = path.join(extractDir, 'upterm');
 
@@ -140,7 +155,17 @@ async function installDependencies(): Promise<void> {
       await execShellCommand('if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
     },
     darwin: async () => {
-      await execShellCommand('brew install owenthereal/upterm/upterm tmux');
+      const archiveUrl = getUptermDownloadUrl('darwin', process.arch);
+      const archive = await tc.downloadTool(archiveUrl);
+      const extractDir = await tc.extractTar(archive);
+      const uptermPath = path.join(extractDir, 'upterm');
+
+      if (!fs.existsSync(uptermPath)) {
+        throw new Error(`Downloaded upterm archive does not contain binary at expected path: ${uptermPath}`);
+      }
+
+      core.addPath(extractDir);
+      await execShellCommand('brew install tmux');
     }
   };
 

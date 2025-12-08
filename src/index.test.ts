@@ -25,7 +25,7 @@ const mockedExecShellCommand = jest.mocked(execShellCommand);
 import * as toolCache from '@actions/tool-cache';
 const mockedToolCache = jest.mocked(toolCache);
 
-import {run} from '.';
+import {getUptermArchitecture, getUptermDownloadUrl, run} from '.';
 import fs from 'fs';
 const mockFs = fs as jest.Mocked<typeof fs>;
 const DOWNLOAD_PATH = '/tmp/upterm.tar.gz';
@@ -37,11 +37,18 @@ describe('upterm GitHub integration', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    Object.defineProperty(process, 'platform', {
+      value: originalPlatform
+    });
+    Object.defineProperty(process, 'arch', {
+      value: originalArch
+    });
     mockedToolCache.downloadTool.mockResolvedValue(DOWNLOAD_PATH);
     mockedToolCache.extractTar.mockResolvedValue(EXTRACT_DIR);
     // Reset fs mocks
     mockFs.existsSync.mockReturnValue(true);
     (mockFs.readdirSync as jest.Mock).mockReturnValue(['id_rsa', 'id_ed25519', 'hello.sock']);
+    when(core.getInput).calledWith('upterm-version').mockReturnValue('');
   });
 
   afterAll(() => {
@@ -50,6 +57,31 @@ describe('upterm GitHub integration', () => {
     });
     Object.defineProperty(process, 'arch', {
       value: originalArch
+    });
+  });
+
+  describe('upterm helpers', () => {
+    it('maps supported architectures correctly', () => {
+      expect(getUptermArchitecture('x64')).toBe('amd64');
+      expect(getUptermArchitecture('arm64')).toBe('arm64');
+      expect(getUptermArchitecture('ppc64le')).toBeNull();
+    });
+
+    it('builds download url for latest release when version unset', () => {
+      when(core.getInput).calledWith('upterm-version').mockReturnValue('');
+      expect(getUptermDownloadUrl('linux', 'x64')).toBe(
+        'https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz'
+      );
+      expect(getUptermDownloadUrl('darwin', 'arm64')).toBe(
+        'https://github.com/owenthereal/upterm/releases/latest/download/upterm_darwin_arm64.tar.gz'
+      );
+    });
+
+    it('builds download url for specific release when version provided', () => {
+      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.20.0');
+      expect(getUptermDownloadUrl('linux', 'x64')).toBe(
+        'https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_linux_amd64.tar.gz'
+      );
     });
   });
 
@@ -103,6 +135,25 @@ describe('upterm GitHub integration', () => {
     expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
     expect(core.info).toHaveBeenNthCalledWith(3, "Exiting debugging session because '/continue' file was created");
+  });
+
+  it('uses specified upterm version for linux downloads', async () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'linux'
+    });
+    Object.defineProperty(process, 'arch', {
+      value: 'x64'
+    });
+    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
+    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
+    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.20.0');
+
+    mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
+    await run();
+
+    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_linux_amd64.tar.gz');
   });
 
   it('should handle the main loop for linux arm64', async () => {
@@ -197,6 +248,9 @@ describe('upterm GitHub integration', () => {
     Object.defineProperty(process, 'platform', {
       value: 'darwin'
     });
+    Object.defineProperty(process, 'arch', {
+      value: 'x64'
+    });
     when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
     when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
@@ -205,7 +259,10 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'brew install owenthereal/upterm/upterm tmux');
+    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_darwin_amd64.tar.gz');
+    expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
+    expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
+    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'brew install tmux');
     expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
     expect(core.info).toHaveBeenNthCalledWith(3, "Exiting debugging session because '/continue' file was created");
