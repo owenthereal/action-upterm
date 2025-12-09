@@ -69,19 +69,13 @@ describe('upterm GitHub integration', () => {
 
     it('builds download url for latest release when version unset', () => {
       when(core.getInput).calledWith('upterm-version').mockReturnValue('');
-      expect(getUptermDownloadUrl('linux', 'x64')).toBe(
-        'https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz'
-      );
-      expect(getUptermDownloadUrl('darwin', 'arm64')).toBe(
-        'https://github.com/owenthereal/upterm/releases/latest/download/upterm_darwin_arm64.tar.gz'
-      );
+      expect(getUptermDownloadUrl('linux', 'x64')).toBe('https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz');
+      expect(getUptermDownloadUrl('darwin', 'arm64')).toBe('https://github.com/owenthereal/upterm/releases/latest/download/upterm_darwin_arm64.tar.gz');
     });
 
     it('builds download url for specific release when version provided', () => {
       when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.20.0');
-      expect(getUptermDownloadUrl('linux', 'x64')).toBe(
-        'https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_linux_amd64.tar.gz'
-      );
+      expect(getUptermDownloadUrl('linux', 'x64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_linux_amd64.tar.gz');
     });
   });
 
