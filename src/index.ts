@@ -18,7 +18,8 @@ const TMUX_DIMENSIONS = {width: 132, height: 43};
 // This 2-second delay helps ensure the upterm server is fully started and ready for connections.
 const UPTERM_INIT_DELAY = 2000;
 
-// Platform-specific paths for /continue file (must be at well-known location)
+// Continue file paths - users can touch either location to exit the session
+// /continue may require sudo, but $GITHUB_WORKSPACE/continue never does
 const CONTINUE_FILE_PATHS = {
   win32: 'C:/msys64/continue',
   unix: '/continue'
