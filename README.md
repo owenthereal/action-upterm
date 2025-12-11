@@ -94,11 +94,13 @@ jobs:
 
 ## Continue a Workflow
 
-To resume your workflow within an `upterm` session, create an empty file named `continue`:
+To resume your workflow within an `upterm` session, create a file named `continue` in one of these locations:
 
 ```bash
-touch continue
-# or
+# In the workflow workspace (recommended, no sudo required)
+cd $GITHUB_WORKSPACE && touch continue
+
+# Or at the filesystem root (may require sudo)
 sudo touch /continue
 ```
 

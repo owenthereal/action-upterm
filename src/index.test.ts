@@ -1,4 +1,5 @@
 import {when} from 'jest-when';
+import path from 'path';
 
 import * as core from '@actions/core';
 jest.mock('@actions/core');
@@ -18,6 +19,13 @@ jest.mock('fs', () => ({
   }
 }));
 
+// Mock os.tmpdir() to return a consistent path for testing
+jest.mock('os', () => ({
+  ...jest.requireActual('os'),
+  tmpdir: jest.fn(() => '/mock-tmp'),
+  homedir: jest.fn(() => '/mock-home')
+}));
+
 import {execShellCommand} from './helpers';
 jest.mock('./helpers');
 const mockedExecShellCommand = jest.mocked(execShellCommand);
@@ -30,6 +38,10 @@ import fs from 'fs';
 const mockFs = fs as jest.Mocked<typeof fs>;
 const DOWNLOAD_PATH = '/tmp/upterm.tar.gz';
 const EXTRACT_DIR = '/tmp/upterm-unique-a1b2c3d4';
+
+// Helper to get expected paths based on mocked os.tmpdir()
+const UPTERM_DATA_DIR = '/mock-tmp/upterm-data';
+const TIMEOUT_FLAG_PATH = path.join(UPTERM_DATA_DIR, 'timeout-flag');
 
 describe('upterm GitHub integration', () => {
   const originalPlatform = process.platform;
@@ -287,9 +299,9 @@ describe('upterm GitHub integration', () => {
 
     // Mock fs.existsSync to handle different paths correctly
     let monitoringLoopCalls = 0;
-    mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
-      const pathStr = path.toString();
-      if (pathStr === '/tmp/upterm-timeout-flag') {
+    mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
+      const pathStr = filePath.toString();
+      if (pathStr === TIMEOUT_FLAG_PATH) {
         monitoringLoopCalls++;
         // Return true on second call (first call is in monitoring loop)
         return monitoringLoopCalls >= 2;
@@ -321,10 +333,11 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
     // Mock fs.existsSync to handle different paths correctly
+    // Note: Even on Windows, the timeout flag path uses os.tmpdir() which is mocked to /mock-tmp
     let monitoringLoopCalls = 0;
-    mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
-      const pathStr = path.toString();
-      if (pathStr === 'C:/msys64/tmp/upterm-timeout-flag') {
+    mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
+      const pathStr = filePath.toString();
+      if (pathStr === TIMEOUT_FLAG_PATH) {
         monitoringLoopCalls++;
         // Return true on second call (first call is in monitoring loop)
         return monitoringLoopCalls >= 2;
@@ -338,7 +351,8 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('C:/msys64/tmp/upterm-timeout-flag'));
+    // Verify the timeout flag path is now based on os.tmpdir()
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('/mock-tmp/upterm-data/timeout-flag'));
     expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 5 minutes for someone to connect, otherwise shut down');
     expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
     expect(core.info).toHaveBeenCalledWith('The session was automatically shut down to prevent unnecessary resource usage');
@@ -374,9 +388,9 @@ describe('upterm GitHub integration', () => {
 
     // Mock fs.existsSync to handle different paths correctly
     let timeoutCheckCount = 0;
-    mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
-      const pathStr = path.toString();
-      if (pathStr === '/tmp/upterm-timeout-flag') {
+    mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
+      const pathStr = filePath.toString();
+      if (pathStr === TIMEOUT_FLAG_PATH) {
         timeoutCheckCount++;
         // Return true after first check (after connection error) to simulate timeout
         return timeoutCheckCount > 1;
@@ -414,9 +428,9 @@ describe('upterm GitHub integration', () => {
     });
 
     // Mock fs.existsSync to handle different paths correctly
-    mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
-      const pathStr = path.toString();
-      if (pathStr === '/tmp/upterm-timeout-flag') {
+    mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
+      const pathStr = filePath.toString();
+      if (pathStr === TIMEOUT_FLAG_PATH) {
         return false; // Never return true for timeout flag (no timeout)
       }
       if (pathStr === '/continue' || pathStr.includes('continue')) {
@@ -449,7 +463,8 @@ describe('upterm GitHub integration', () => {
 
     // Check that timeout script was created with correct timeout value
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('sleep $(( 10 * 60 ))'));
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('echo "UPTERM_TIMEOUT_REACHED" > /tmp/upterm-timeout-flag'));
+    // Timeout flag path now uses os.tmpdir() which is mocked to /mock-tmp
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('echo "UPTERM_TIMEOUT_REACHED" > /mock-tmp/upterm-data/timeout-flag'));
     expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 10 minutes for someone to connect, otherwise shut down');
   });
 });
