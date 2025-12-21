@@ -13,4 +13,3 @@ jobs:
         uses: ./
         with:
           wait-timeout-minutes: 5
-          limit-access-to-actor: true
