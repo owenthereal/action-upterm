@@ -79,48 +79,44 @@ export async function getWorkflowRunStatus(octokit: Octokit, runId: number): Pro
 }
 
 /**
- * Get workflow run logs
+ * Get SSH command from workflow run job summary
+ * The upterm action writes the SSH command to the job summary which is accessible via API.
  */
-export async function getWorkflowLogs(octokit: Octokit, runId: number): Promise<string> {
+export async function getSshCommandFromSummary(octokit: Octokit, runId: number): Promise<string | null> {
   try {
-    // Get jobs for the run
-    const {data: jobs} = await octokit.actions.listJobsForWorkflowRun({
+    // Get the workflow run to find associated check suite
+    const {data: run} = await octokit.actions.getWorkflowRun({
       owner: REPO_OWNER,
       repo: REPO_NAME,
       run_id: runId
     });
 
-    // Get logs for each job
-    let allLogs = '';
-    for (const job of jobs.jobs) {
-      try {
-        const {data: logs} = await octokit.actions.downloadJobLogsForWorkflowRun({
-          owner: REPO_OWNER,
-          repo: REPO_NAME,
-          job_id: job.id
-        });
-        allLogs += logs as string;
-      } catch {
-        // Job logs might not be available yet
+    if (!run.check_suite_id) {
+      return null;
+    }
+
+    // List check runs for this check suite
+    const {data: checkRuns} = await octokit.checks.listForSuite({
+      owner: REPO_OWNER,
+      repo: REPO_NAME,
+      check_suite_id: run.check_suite_id
+    });
+
+    // Find the upterm job's check run
+    for (const checkRun of checkRuns.check_runs) {
+      if (checkRun.output?.summary) {
+        // Parse SSH command from the summary markdown
+        const sshMatch = checkRun.output.summary.match(/ssh\s+(\S+@\S+)/i);
+        if (sshMatch) {
+          return `ssh ${sshMatch[1]}`;
+        }
       }
     }
-    return allLogs;
-  } catch {
-    return '';
-  }
-}
 
-/**
- * Parse SSH connection string from upterm output in logs
- * Example: ssh abcd1234:token@uptermd.upterm.dev
- */
-export function parseSshCommand(logs: string): string | null {
-  // Match SSH command pattern from upterm session output
-  const sshMatch = logs.match(/ssh\s+(\S+@\S*upterm\S*)/i);
-  if (sshMatch) {
-    return `ssh ${sshMatch[1]}`;
+    return null;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 /**
@@ -208,18 +204,17 @@ export async function waitForNewRun(octokit: Octokit, branch: string, afterRunId
 }
 
 /**
- * Wait for SSH connection string to appear in workflow logs
+ * Wait for SSH connection string to appear in job summary
  */
 export async function waitForSshCommand(octokit: Octokit, runId: number, timeoutMs = 180000): Promise<string> {
   return pollUntil(
     async () => {
-      const logs = await getWorkflowLogs(octokit, runId);
-      return parseSshCommand(logs);
+      return getSshCommandFromSummary(octokit, runId);
     },
     {
       timeoutMs,
       intervalMs: 5000,
-      description: 'SSH connection string in logs'
+      description: 'SSH connection string in job summary'
     }
   );
 }

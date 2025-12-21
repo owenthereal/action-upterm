@@ -1,0 +1,9 @@
+# Use medium runner for better compatibility
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+-P macos-latest=catthehacker/ubuntu:act-latest
+
+# Bind SSH agent socket if available
+--bind
+
+# Enable verbose logging
+--verbose

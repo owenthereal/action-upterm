@@ -17,8 +17,17 @@ module.exports = {
   endGroup: jest.fn(),
   isDebug: jest.fn(() => false),
   summary: {
-    addRaw: jest.fn(),
-    addHeading: jest.fn(),
-    write: jest.fn()
+    addRaw: jest.fn(function () {
+      return this;
+    }),
+    addHeading: jest.fn(function () {
+      return this;
+    }),
+    addCodeBlock: jest.fn(function () {
+      return this;
+    }),
+    write: jest.fn(function () {
+      return Promise.resolve();
+    })
   }
 };

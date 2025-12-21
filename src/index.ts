@@ -390,6 +390,32 @@ async function waitForUptermReady(): Promise<void> {
   throw new Error(diagnostics);
 }
 
+async function outputSshCommand(): Promise<void> {
+  try {
+    const socketPath = findUptermSocket();
+    if (!socketPath) {
+      core.warning('Could not find upterm socket to retrieve SSH command');
+      return;
+    }
+
+    const sessionInfo = await execShellCommand(`upterm session current --admin-socket "${socketPath}"`);
+
+    // Parse SSH command from session info
+    const sshMatch = sessionInfo.match(/ssh\s+(\S+@\S+)/i);
+    if (sshMatch) {
+      const sshCommand = `ssh ${sshMatch[1]}`;
+      core.setOutput('ssh-command', sshCommand);
+
+      // Also write to job summary for easy retrieval via API
+      await core.summary.addHeading('Upterm SSH Connection').addCodeBlock(sshCommand, 'bash').addRaw(`\n\nConnect with: <code>${sshCommand}</code>`).write();
+
+      core.info(`SSH command available as output: ${sshCommand}`);
+    }
+  } catch (error) {
+    core.debug(`Failed to extract SSH command for output: ${error}`);
+  }
+}
+
 async function startUptermSession(): Promise<void> {
   const allowedUsers = getAllowedUsers();
   const authorizedKeysParameter = buildAuthorizedKeysParameter(allowedUsers);
@@ -404,6 +430,7 @@ async function startUptermSession(): Promise<void> {
   }
 
   await waitForUptermReady();
+  await outputSshCommand();
 }
 
 async function monitorSession(): Promise<void> {

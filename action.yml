@@ -24,3 +24,6 @@ inputs:
     description: "Integer number of minutes to wait for user to connect before shutting down server. Once a user connects, the server will stay up."
     required: false
     default: ""
+outputs:
+  ssh-command:
+    description: "The SSH command to connect to the upterm session (e.g., 'ssh session:token@uptermd.upterm.dev')"

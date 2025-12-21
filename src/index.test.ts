@@ -370,18 +370,27 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
-    // Mock session status command to fail with connection refused, then succeed
+    // Mock session status command
+    // First call is from outputSshCommand() - should succeed
+    // Second call is from monitorSession() - should fail with connection refused
     let sessionStatusCallCount = 0;
     mockedExecShellCommand.mockImplementation((cmd: string) => {
       if (cmd.includes('upterm session current')) {
         sessionStatusCallCount++;
         if (sessionStatusCallCount === 1) {
+          // First call from outputSshCommand - return session info
+          return Promise.resolve('ssh test@upterm.dev\nSession: test123');
+        }
+        if (sessionStatusCallCount === 2) {
+          // Second call from monitorSession - fail with connection refused
           return Promise.reject(
             new Error(
               "Command failed with exit code 1: upterm session current\nStderr: rpc error: code = Unavailable desc = connection error: desc = 'transport: Error while dialing: dial unix /home/runner/.upterm/JGxpTKJ8jsJHPxiFWggH.sock: connect: connection refused'"
             )
           );
         }
+        // Subsequent calls succeed
+        return Promise.resolve('ssh test@upterm.dev\nSession: test123');
       }
       return Promise.resolve('success');
     });
