@@ -15,6 +15,7 @@
   "exclude": [
     "./__tests__/**/*",
     "./lib/**/*",
+    "./e2e/**/*",
     "node_modules",
     "jest.config.ts"
   ]

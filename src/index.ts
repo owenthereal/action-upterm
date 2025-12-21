@@ -18,43 +18,73 @@ const TMUX_DIMENSIONS = {width: 132, height: 43};
 // This 2-second delay helps ensure the upterm server is fully started and ready for connections.
 const UPTERM_INIT_DELAY = 2000;
 
-// Platform-specific paths
-const PATHS = {
-  timeoutFlag: {
-    win32: 'C:/msys64/tmp/upterm-timeout-flag',
-    unix: '/tmp/upterm-timeout-flag'
-  },
-  continueFile: {
-    win32: 'C:/msys64/continue',
-    unix: '/continue'
-  },
-  logs: {
-    uptermCommand: {
-      win32: 'C:/msys64/tmp/upterm-command.log',
-      unix: '/tmp/upterm-command.log'
-    },
-    tmuxError: {
-      win32: 'C:/msys64/tmp/tmux-error.log',
-      unix: '/tmp/tmux-error.log'
-    }
-  }
+// Continue file paths - users can touch either location to exit the session
+// /continue may require sudo, but $GITHUB_WORKSPACE/continue never does
+const CONTINUE_FILE_PATHS = {
+  win32: 'C:/msys64/continue',
+  unix: '/continue'
 } as const;
+
+// Deterministic directories for all upterm-related files in CI environments.
+// We explicitly set these to ensure upterm and our action create files in
+// predictable, writable locations across all platforms. This avoids issues
+// where platform defaults (e.g., /run/user/<uid> on Linux) don't exist or
+// aren't writable in CI environments like GitHub Actions.
+
+interface UptermDirs {
+  base: string;
+  runtime: string;
+  state: string;
+  config: string;
+  logs: {uptermCommand: string; tmuxError: string};
+  timeoutFlag: string;
+}
+
+// Cache for getUptermDirs() to avoid repeated path computation
+let uptermDirsCache: UptermDirs | null = null;
+
+function getUptermDirs(): UptermDirs {
+  if (uptermDirsCache) {
+    return uptermDirsCache;
+  }
+
+  const base = path.join(os.tmpdir(), 'upterm-data');
+  const state = path.join(base, 'state');
+  uptermDirsCache = {
+    base,
+    runtime: path.join(base, 'runtime'), // XDG_RUNTIME_DIR - for sockets
+    state, // XDG_STATE_HOME - for upterm's internal logs
+    config: path.join(base, 'config'), // XDG_CONFIG_HOME - for config files
+    logs: {
+      uptermCommand: path.join(state, 'upterm-command.log'), // Our action's log of upterm stdout/stderr
+      tmuxError: path.join(state, 'tmux-error.log') // Our action's log of tmux stderr
+    },
+    timeoutFlag: path.join(base, 'timeout-flag') // Flag file for timeout detection
+  };
+  return uptermDirsCache;
+}
 
 // Utility Functions
 function toShellPath(filePath: string): string {
   return filePath.replace(/\\/g, '/');
 }
 
+// Escape a string for safe use in single-quoted shell arguments.
+// Handles paths that may contain single quotes by using the '\'' escape pattern.
+function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 function getUptermTimeoutFlagPath(): string {
-  return process.platform === 'win32' ? PATHS.timeoutFlag.win32 : PATHS.timeoutFlag.unix;
+  return toShellPath(getUptermDirs().timeoutFlag);
 }
 
 function getUptermCommandLogPath(): string {
-  return process.platform === 'win32' ? PATHS.logs.uptermCommand.win32 : PATHS.logs.uptermCommand.unix;
+  return toShellPath(getUptermDirs().logs.uptermCommand);
 }
 
 function getTmuxErrorLogPath(): string {
-  return process.platform === 'win32' ? PATHS.logs.tmuxError.win32 : PATHS.logs.tmuxError.unix;
+  return toShellPath(getUptermDirs().logs.tmuxError);
 }
 
 type UptermArchitecture = (typeof SUPPORTED_UPTERM_ARCHITECTURES)[number];
@@ -218,20 +248,35 @@ function getAllowedUsers(): string[] {
 }
 
 function buildAuthorizedKeysParameter(allowedUsers: string[]): string {
-  return allowedUsers.map(user => `--github-user '${user}'`).join(' ') + ' ';
+  return allowedUsers.map(user => `--github-user ${shellEscape(user)}`).join(' ') + ' ';
 }
 
 async function createUptermSession(uptermServer: string, authorizedKeysParameter: string): Promise<void> {
   core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
+
+  // Get deterministic paths for all upterm-related files
+  const dirs = getUptermDirs();
+
+  // Create all required directories - upterm and our action expect these to exist
+  fs.mkdirSync(dirs.runtime, {recursive: true});
+  fs.mkdirSync(dirs.state, {recursive: true});
+  fs.mkdirSync(dirs.config, {recursive: true});
+  core.debug(`Created upterm directories under ${dirs.base}`);
+
+  // Pass XDG environment variables to tmux using -e flags
+  // Only upterm needs these vars to know where to create its socket; the inner tmux session doesn't
+  // Use shellEscape to handle paths with spaces, single quotes, or other special characters
+  const tmuxEnvFlags = `-e XDG_RUNTIME_DIR=${shellEscape(toShellPath(dirs.runtime))} -e XDG_STATE_HOME=${shellEscape(toShellPath(dirs.state))} -e XDG_CONFIG_HOME=${shellEscape(toShellPath(dirs.config))}`;
+
   try {
     await execShellCommand(
-      `tmux new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${getUptermCommandLogPath()}" 2>${getTmuxErrorLogPath()}`
+      `tmux new -d -s upterm-wrapper ${tmuxEnvFlags} -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`
     );
     await execShellCommand('tmux set -t upterm-wrapper window-size largest; tmux set -t upterm window-size largest');
     core.debug('Created new session successfully');
   } catch (error) {
     try {
-      const tmuxError = await execShellCommand(`cat ${getTmuxErrorLogPath()} 2>/dev/null || echo "No tmux error log found"`);
+      const tmuxError = await execShellCommand(`cat ${shellEscape(getTmuxErrorLogPath())} 2>/dev/null || echo "No tmux error log found"`);
       core.error(`Tmux error log: ${tmuxError.trim()}`);
     } catch (logError) {
       core.debug(`Could not read tmux error log: ${logError}`);
@@ -248,7 +293,7 @@ async function setupSessionTimeout(waitTimeoutMinutes: string): Promise<void> {
     (
       sleep $(( ${timeout} * 60 ));
       if ! pgrep -f '^tmux attach ' &>/dev/null; then
-        echo "UPTERM_TIMEOUT_REACHED" > ${timeoutFlagPath};
+        echo "UPTERM_TIMEOUT_REACHED" > ${shellEscape(timeoutFlagPath)};
         tmux kill-server;
       fi
     ) & disown
@@ -263,9 +308,11 @@ async function setupSessionTimeout(waitTimeoutMinutes: string): Promise<void> {
 }
 
 async function collectDiagnostics(): Promise<string> {
+  const dirs = getUptermDirs();
   const uptermDir = getUptermSocketDir();
   let diagnostics = 'Failed to start upterm - socket not found after maximum retries.\n\nDiagnostics:\n';
 
+  diagnostics += `- Upterm data directory: ${dirs.base}\n`;
   diagnostics += `- Expected socket directory: ${uptermDir}\n`;
 
   if (fs.existsSync(uptermDir)) {
@@ -295,7 +342,7 @@ async function collectDiagnostics(): Promise<string> {
 
   // Check tmux error log
   try {
-    const tmuxErrorLog = await execShellCommand(`cat ${getTmuxErrorLogPath()} 2>/dev/null || echo "No tmux error log"`);
+    const tmuxErrorLog = await execShellCommand(`cat ${shellEscape(getTmuxErrorLogPath())} 2>/dev/null || echo "No tmux error log"`);
     if (tmuxErrorLog.trim() !== 'No tmux error log') {
       diagnostics += `- Tmux error log:\n${tmuxErrorLog.trim()}\n`;
     }
@@ -305,7 +352,7 @@ async function collectDiagnostics(): Promise<string> {
 
   // Check upterm command output log
   try {
-    const cmdLog = await execShellCommand(`cat ${getUptermCommandLogPath()} 2>/dev/null || echo "No command log"`);
+    const cmdLog = await execShellCommand(`cat ${shellEscape(getUptermCommandLogPath())} 2>/dev/null || echo "No command log"`);
     if (cmdLog.trim() !== 'No command log') {
       diagnostics += `- Upterm command output:\n${cmdLog.trim()}\n`;
     }
@@ -322,7 +369,7 @@ async function collectDiagnostics(): Promise<string> {
   }
 
   // Check environment
-  diagnostics += `- XDG_RUNTIME_DIR: ${process.env.XDG_RUNTIME_DIR || 'not set'}\n`;
+  diagnostics += `- XDG_RUNTIME_DIR: ${dirs.runtime}\n`;
   diagnostics += `- USER: ${process.env.USER || 'not set'}\n`;
   diagnostics += `- UID: ${process.getuid ? process.getuid() : 'unknown'}\n`;
 
@@ -407,20 +454,11 @@ async function monitorSession(): Promise<void> {
 }
 
 function getUptermSocketDir(): string {
-  // Upterm uses adrg/xdg library for socket storage
-  // See: https://github.com/owenthereal/upterm/pull/398
-  // XDG RuntimeDir: https://pkg.go.dev/github.com/adrg/xdg#RuntimeDir
-  if (process.platform === 'linux') {
-    // Linux: $XDG_RUNTIME_DIR/upterm or /run/user/$(id -u)/upterm
-    const uid = process.getuid ? process.getuid() : '1000';
-    return process.env.XDG_RUNTIME_DIR ? path.join(process.env.XDG_RUNTIME_DIR, 'upterm') : `/run/user/${uid}/upterm`;
-  } else if (process.platform === 'darwin') {
-    // macOS: ~/Library/Application Support/upterm
-    return path.join(os.homedir(), 'Library', 'Application Support', 'upterm');
-  } else {
-    // Windows: %LOCALAPPDATA%\upterm
-    return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'upterm');
-  }
+  // We set XDG_RUNTIME_DIR to a deterministic path in createUptermSession()
+  // to ensure upterm creates sockets in a predictable, writable location
+  // across all platforms. This avoids issues where platform defaults
+  // (e.g., /run/user/<uid> on Linux) don't exist in CI environments.
+  return path.join(getUptermDirs().runtime, 'upterm');
 }
 
 function findUptermSocket(): string | null {
@@ -438,7 +476,7 @@ function uptermSocketExists(): boolean {
 }
 
 function continueFileExists(): boolean {
-  const continuePath = process.platform === 'win32' ? PATHS.continueFile.win32 : PATHS.continueFile.unix;
+  const continuePath = process.platform === 'win32' ? CONTINUE_FILE_PATHS.win32 : CONTINUE_FILE_PATHS.unix;
   return fs.existsSync(continuePath) || fs.existsSync(path.join(process.env.GITHUB_WORKSPACE ?? '/', 'continue'));
 }
 
