@@ -464,7 +464,7 @@ describe('upterm GitHub integration', () => {
     // Check that timeout script was created with correct timeout value
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('sleep $(( 10 * 60 ))'));
     // Timeout flag path now uses os.tmpdir() which is mocked to /mock-tmp
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining("echo \"UPTERM_TIMEOUT_REACHED\" > '/mock-tmp/upterm-data/timeout-flag'"));
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('echo "UPTERM_TIMEOUT_REACHED" > \'/mock-tmp/upterm-data/timeout-flag\''));
     expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 10 minutes for someone to connect, otherwise shut down');
   });
 });
