@@ -30,6 +30,10 @@ const CONTINUE_FILE_PATHS = {
 // predictable, writable locations across all platforms. This avoids issues
 // where platform defaults (e.g., /run/user/<uid> on Linux) don't exist or
 // aren't writable in CI environments like GitHub Actions.
+
+// Cache for getUptermDirs() to avoid repeated path computation
+let _uptermDirsCache: ReturnType<typeof getUptermDirs> | null = null;
+
 function getUptermDirs(): {
   base: string;
   runtime: string;
@@ -38,9 +42,13 @@ function getUptermDirs(): {
   logs: {uptermCommand: string; tmuxError: string};
   timeoutFlag: string;
 } {
+  if (_uptermDirsCache) {
+    return _uptermDirsCache;
+  }
+
   const base = path.join(os.tmpdir(), 'upterm-data');
   const state = path.join(base, 'state');
-  return {
+  _uptermDirsCache = {
     base,
     runtime: path.join(base, 'runtime'), // XDG_RUNTIME_DIR - for sockets
     state, // XDG_STATE_HOME - for upterm's internal logs
@@ -51,6 +59,7 @@ function getUptermDirs(): {
     },
     timeoutFlag: path.join(base, 'timeout-flag') // Flag file for timeout detection
   };
+  return _uptermDirsCache;
 }
 
 // Utility Functions
@@ -255,19 +264,20 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
   core.debug(`Set XDG_STATE_HOME to ${dirs.state}`);
   core.debug(`Set XDG_CONFIG_HOME to ${dirs.config}`);
 
-  // Build environment prefix for shell commands
-  // Use toShellPath to handle Windows path separators
-  const envPrefix = `XDG_RUNTIME_DIR=${toShellPath(dirs.runtime)} ` + `XDG_STATE_HOME=${toShellPath(dirs.state)} ` + `XDG_CONFIG_HOME=${toShellPath(dirs.config)} `;
+  // Pass XDG environment variables to tmux using -e flags
+  // Only upterm needs these vars to know where to create its socket; the inner tmux session doesn't
+  // Quote the values to handle paths with spaces or special characters
+  const tmuxEnvFlags = `-e 'XDG_RUNTIME_DIR=${toShellPath(dirs.runtime)}' -e 'XDG_STATE_HOME=${toShellPath(dirs.state)}' -e 'XDG_CONFIG_HOME=${toShellPath(dirs.config)}'`;
 
   try {
     await execShellCommand(
-      `${envPrefix}tmux new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "${envPrefix}upterm host --skip-host-key-check --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${getUptermCommandLogPath()}" 2>${getTmuxErrorLogPath()}`
+      `tmux new -d -s upterm-wrapper ${tmuxEnvFlags} -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee '${getUptermCommandLogPath()}'" 2>'${getTmuxErrorLogPath()}'`
     );
     await execShellCommand('tmux set -t upterm-wrapper window-size largest; tmux set -t upterm window-size largest');
     core.debug('Created new session successfully');
   } catch (error) {
     try {
-      const tmuxError = await execShellCommand(`cat ${getTmuxErrorLogPath()} 2>/dev/null || echo "No tmux error log found"`);
+      const tmuxError = await execShellCommand(`cat '${getTmuxErrorLogPath()}' 2>/dev/null || echo "No tmux error log found"`);
       core.error(`Tmux error log: ${tmuxError.trim()}`);
     } catch (logError) {
       core.debug(`Could not read tmux error log: ${logError}`);
@@ -284,7 +294,7 @@ async function setupSessionTimeout(waitTimeoutMinutes: string): Promise<void> {
     (
       sleep $(( ${timeout} * 60 ));
       if ! pgrep -f '^tmux attach ' &>/dev/null; then
-        echo "UPTERM_TIMEOUT_REACHED" > ${timeoutFlagPath};
+        echo "UPTERM_TIMEOUT_REACHED" > '${timeoutFlagPath}';
         tmux kill-server;
       fi
     ) & disown
@@ -333,7 +343,7 @@ async function collectDiagnostics(): Promise<string> {
 
   // Check tmux error log
   try {
-    const tmuxErrorLog = await execShellCommand(`cat ${getTmuxErrorLogPath()} 2>/dev/null || echo "No tmux error log"`);
+    const tmuxErrorLog = await execShellCommand(`cat '${getTmuxErrorLogPath()}' 2>/dev/null || echo "No tmux error log"`);
     if (tmuxErrorLog.trim() !== 'No tmux error log') {
       diagnostics += `- Tmux error log:\n${tmuxErrorLog.trim()}\n`;
     }
@@ -343,7 +353,7 @@ async function collectDiagnostics(): Promise<string> {
 
   // Check upterm command output log
   try {
-    const cmdLog = await execShellCommand(`cat ${getUptermCommandLogPath()} 2>/dev/null || echo "No command log"`);
+    const cmdLog = await execShellCommand(`cat '${getUptermCommandLogPath()}' 2>/dev/null || echo "No command log"`);
     if (cmdLog.trim() !== 'No command log') {
       diagnostics += `- Upterm command output:\n${cmdLog.trim()}\n`;
     }
