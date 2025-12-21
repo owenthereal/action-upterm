@@ -248,7 +248,7 @@ function getAllowedUsers(): string[] {
 }
 
 function buildAuthorizedKeysParameter(allowedUsers: string[]): string {
-  return allowedUsers.map(user => `--github-user '${user}'`).join(' ') + ' ';
+  return allowedUsers.map(user => `--github-user ${shellEscape(user)}`).join(' ') + ' ';
 }
 
 async function createUptermSession(uptermServer: string, authorizedKeysParameter: string): Promise<void> {
@@ -270,7 +270,7 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
 
   try {
     await execShellCommand(
-      `tmux new -d -s upterm-wrapper ${tmuxEnvFlags} -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`
+      `tmux new -d -s upterm-wrapper ${tmuxEnvFlags} -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`
     );
     await execShellCommand('tmux set -t upterm-wrapper window-size largest; tmux set -t upterm window-size largest');
     core.debug('Created new session successfully');
