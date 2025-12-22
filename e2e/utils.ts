@@ -27,9 +27,9 @@ export function runActWorkflow(): {
       const chunk = data.toString();
       console.log('[act stdout]', chunk);
 
-      // Look for SSH command in upterm output - flexible pattern to handle format variations
+      // Look for SSH command in upterm output - matches upterm.dev domain specifically
       // Example: "│ ➤ SSH Command:   │ ssh d07zbpLrcE4LxtHM3wKn@uptermd.upterm.dev          │"
-      const sshMatch = chunk.match(/SSH Command:[^\n]*?(ssh\s+\S+@\S+)/i);
+      const sshMatch = chunk.match(/SSH Command:[^\n]*?(ssh\s+\S+@uptermd\.upterm\.dev)/i);
       if (sshMatch && !settled) {
         settled = true;
         clearTimeout(timeout);
