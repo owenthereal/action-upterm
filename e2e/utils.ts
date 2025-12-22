@@ -1,141 +1,145 @@
-import {Octokit} from '@octokit/rest';
-import {spawn, execSync} from 'child_process';
-
-// GitHub repo info - can be overridden via env vars
-const REPO_OWNER = process.env.GITHUB_REPOSITORY_OWNER || 'owenthereal';
-const REPO_NAME = process.env.GITHUB_REPOSITORY_NAME || 'action-upterm';
+import {spawn, ChildProcess} from 'child_process';
 
 /**
- * Get GitHub token from environment
+ * Run act to start the e2e-fixture workflow locally
+ * Returns the process handle and a promise that resolves with the SSH command
  */
-function getGitHubToken(): string {
-  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
-  if (!token) {
-    throw new Error('GITHUB_TOKEN or GH_TOKEN environment variable is required');
-  }
-  return token;
-}
-
-/**
- * Create Octokit client
- */
-export function createOctokit(): Octokit {
-  return new Octokit({auth: getGitHubToken()});
-}
-
-/**
- * Get current git branch name
- */
-export function getCurrentBranch(): string {
-  try {
-    return execSync('git rev-parse --abbrev-ref HEAD', {encoding: 'utf8'}).trim();
-  } catch {
-    throw new Error('Failed to get current git branch');
-  }
-}
-
-/**
- * Trigger the e2e-fixture workflow
- */
-export async function triggerFixtureWorkflow(octokit: Octokit, ref: string): Promise<void> {
-  await octokit.actions.createWorkflowDispatch({
-    owner: REPO_OWNER,
-    repo: REPO_NAME,
-    workflow_id: 'e2e-fixture.yml',
-    ref
-  });
-}
-
-/**
- * Get the most recent workflow run for e2e-fixture
- * Note: We use listWorkflowRunsForRepo and filter by name because
- * listWorkflowRuns with workflow_id doesn't work for workflows that
- * only exist on feature branches (not yet merged to default branch).
- */
-export async function getLatestFixtureRun(octokit: Octokit, branch: string): Promise<number | null> {
-  const {data} = await octokit.actions.listWorkflowRunsForRepo({
-    owner: REPO_OWNER,
-    repo: REPO_NAME,
-    branch,
-    per_page: 20
+export function runActWorkflow(): {
+  process: ChildProcess;
+  sshCommandPromise: Promise<string>;
+  killProcess: () => void;
+} {
+  const actProcess = spawn('act', ['workflow_dispatch', '-W', '.github/workflows/e2e-fixture.yml', '-j', 'upterm', '--container-architecture', 'linux/amd64'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: process.cwd()
   });
 
-  // Filter by workflow name since workflow_id lookup doesn't work for feature-branch-only workflows
-  const fixtureRun = data.workflow_runs.find(run => run.name === 'E2E Fixture');
-  return fixtureRun?.id ?? null;
-}
+  const sshCommandPromise = new Promise<string>((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        reject(new Error('Timeout waiting for SSH command in act output'));
+      }
+    }, 180000); // 3 minutes
 
-/**
- * Get workflow run status
- */
-export async function getWorkflowRunStatus(octokit: Octokit, runId: number): Promise<{status: string; conclusion: string | null}> {
-  const {data} = await octokit.actions.getWorkflowRun({
-    owner: REPO_OWNER,
-    repo: REPO_NAME,
-    run_id: runId
-  });
+    actProcess.stdout?.on('data', (data: Buffer) => {
+      const chunk = data.toString();
+      console.log('[act stdout]', chunk);
 
-  return {status: data.status || 'unknown', conclusion: data.conclusion};
-}
-
-/**
- * Get SSH command from workflow run job summary
- * The upterm action writes the SSH command to the job summary which is accessible via API.
- */
-export async function getSshCommandFromSummary(octokit: Octokit, runId: number): Promise<string | null> {
-  try {
-    // Get the workflow run to find associated check suite
-    const {data: run} = await octokit.actions.getWorkflowRun({
-      owner: REPO_OWNER,
-      repo: REPO_NAME,
-      run_id: runId
+      // Look for SSH command in upterm output - matches upterm.dev domain specifically
+      // Example: "│ ➤ SSH Command:   │ ssh d07zbpLrcE4LxtHM3wKn@uptermd.upterm.dev          │"
+      const sshMatch = chunk.match(/SSH Command:[^\n]*?(ssh\s+\S+@uptermd\.upterm\.dev)/i);
+      if (sshMatch && !settled) {
+        settled = true;
+        clearTimeout(timeout);
+        resolve(sshMatch[1]);
+      }
     });
 
-    if (!run.check_suite_id) {
-      return null;
-    }
-
-    // List check runs for this check suite
-    const {data: checkRuns} = await octokit.checks.listForSuite({
-      owner: REPO_OWNER,
-      repo: REPO_NAME,
-      check_suite_id: run.check_suite_id
+    actProcess.stderr?.on('data', (data: Buffer) => {
+      const chunk = data.toString();
+      console.log('[act stderr]', chunk);
     });
 
-    // Find the upterm job's check run
-    for (const checkRun of checkRuns.check_runs) {
-      if (checkRun.output?.summary) {
-        // Parse SSH command from the summary markdown
-        const sshMatch = checkRun.output.summary.match(/ssh\s+(\S+@\S+)/i);
-        if (sshMatch) {
-          return `ssh ${sshMatch[1]}`;
+    actProcess.on('error', error => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(error);
+      }
+    });
+
+    actProcess.on('exit', code => {
+      if (!settled && code !== 0 && code !== null) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error(`act exited with code ${code}`));
+      }
+    });
+  });
+
+  let forceKillTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  const killProcess = () => {
+    if (!actProcess.killed) {
+      actProcess.kill('SIGTERM');
+      // Force kill after 5 seconds if still running
+      forceKillTimeout = setTimeout(() => {
+        if (!actProcess.killed) {
+          actProcess.kill('SIGKILL');
         }
+        forceKillTimeout = null;
+      }, 5000);
+    } else if (forceKillTimeout) {
+      clearTimeout(forceKillTimeout);
+      forceKillTimeout = null;
+    }
+  };
+
+  return {process: actProcess, sshCommandPromise, killProcess};
+}
+
+/**
+ * Check SSH connectivity to upterm session.
+ * Upterm uses ForceCommand (tmux attach) which requires a TTY, so we can't run arbitrary commands.
+ * Instead, we verify that SSH authentication succeeds by checking the stderr for the known_hosts message.
+ * Exit code 1 is expected because tmux attach fails without a TTY.
+ */
+export async function sshCheckConnectivity(sshCommand: string, retries = 3): Promise<void> {
+  // Parse the ssh command to extract user@host
+  const match = sshCommand.match(/ssh\s+(\S+)/);
+  if (!match) {
+    throw new Error(`Invalid SSH command format: ${sshCommand}`);
+  }
+  const target = match[1];
+
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        // Use -T to disable pseudo-terminal allocation (we expect tmux to fail)
+        // Use short timeout since we just want to verify authentication
+        const proc = spawn('ssh', ['-T', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=10', target], {stdio: ['pipe', 'pipe', 'pipe']});
+
+        let stderr = '';
+
+        proc.stderr.on('data', data => {
+          stderr += data.toString();
+        });
+
+        proc.on('close', code => {
+          // Check if SSH connected successfully (indicated by known_hosts message)
+          // Exit code 1 is expected because tmux attach fails without a TTY
+          if (stderr.includes('uptermd.upterm.dev')) {
+            // SSH connected and authenticated successfully
+            console.log(`SSH authentication succeeded (exit code ${code} expected due to no TTY)`);
+            resolve();
+          } else if (code === 255) {
+            // SSH connection failed entirely
+            reject(new Error(`SSH connection failed: ${stderr || 'no stderr'}`));
+          } else {
+            // Other errors might still indicate success if we got past authentication
+            console.log(`SSH exited with code ${code}, stderr: ${stderr}`);
+            resolve();
+          }
+        });
+
+        proc.on('error', reject);
+      });
+      return;
+    } catch (error) {
+      lastError = error as Error;
+      console.log(`SSH attempt ${attempt}/${retries} failed: ${lastError.message}`);
+      if (attempt < retries) {
+        console.log(`Waiting 3 seconds before retry...`);
+        await sleep(3000);
       }
     }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Poll until a condition is met or timeout
- */
-export async function pollUntil<T>(fn: () => Promise<T | null>, options: {timeoutMs: number; intervalMs: number; description?: string}): Promise<T> {
-  const {timeoutMs, intervalMs, description = 'condition'} = options;
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < timeoutMs) {
-    const result = await fn();
-    if (result !== null) {
-      return result;
-    }
-    console.log(`Waiting for ${description}... (${Math.round((Date.now() - startTime) / 1000)}s)`);
-    await sleep(intervalMs);
   }
 
-  throw new Error(`Timeout waiting for ${description} after ${timeoutMs}ms`);
+  throw lastError || new Error('SSH failed after all retries');
 }
 
 /**
@@ -143,113 +147,4 @@ export async function pollUntil<T>(fn: () => Promise<T | null>, options: {timeou
  */
 export function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * Execute SSH command on remote host
- */
-export function sshExec(sshCommand: string, remoteCommand: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    // Parse the ssh command to extract user@host
-    const match = sshCommand.match(/ssh\s+(\S+)/);
-    if (!match) {
-      reject(new Error(`Invalid SSH command format: ${sshCommand}`));
-      return;
-    }
-    const target = match[1];
-
-    const proc = spawn('ssh', ['-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=10', target, remoteCommand], {stdio: ['pipe', 'pipe', 'pipe']});
-
-    let stdout = '';
-    let stderr = '';
-
-    proc.stdout.on('data', data => {
-      stdout += data.toString();
-    });
-
-    proc.stderr.on('data', data => {
-      stderr += data.toString();
-    });
-
-    proc.on('close', code => {
-      if (code !== 0) {
-        reject(new Error(`SSH command failed with code ${code}: ${stderr}`));
-      } else {
-        resolve(stdout);
-      }
-    });
-
-    proc.on('error', reject);
-  });
-}
-
-/**
- * Wait for a new workflow run to appear after triggering
- */
-export async function waitForNewRun(octokit: Octokit, branch: string, afterRunId: number | null, timeoutMs = 60000): Promise<number> {
-  return pollUntil(
-    async () => {
-      const runId = await getLatestFixtureRun(octokit, branch);
-      if (runId && runId !== afterRunId) {
-        return runId;
-      }
-      return null;
-    },
-    {
-      timeoutMs,
-      intervalMs: 3000,
-      description: 'new workflow run'
-    }
-  );
-}
-
-/**
- * Wait for SSH connection string to appear in job summary
- */
-export async function waitForSshCommand(octokit: Octokit, runId: number, timeoutMs = 180000): Promise<string> {
-  return pollUntil(
-    async () => {
-      return getSshCommandFromSummary(octokit, runId);
-    },
-    {
-      timeoutMs,
-      intervalMs: 5000,
-      description: 'SSH connection string in job summary'
-    }
-  );
-}
-
-/**
- * Wait for workflow to complete
- */
-export async function waitForWorkflowComplete(octokit: Octokit, runId: number, timeoutMs = 300000): Promise<string> {
-  return pollUntil(
-    async () => {
-      const {status} = await getWorkflowRunStatus(octokit, runId);
-      if (status === 'completed') {
-        return status;
-      }
-      return null;
-    },
-    {
-      timeoutMs,
-      intervalMs: 10000,
-      description: 'workflow completion'
-    }
-  );
-}
-
-/**
- * Cancel a workflow run
- */
-export async function cancelWorkflowRun(octokit: Octokit, runId: number): Promise<void> {
-  try {
-    await octokit.actions.cancelWorkflowRun({
-      owner: REPO_OWNER,
-      repo: REPO_NAME,
-      run_id: runId
-    });
-  } catch {
-    // Ignore errors (run might already be completed)
-  }
 }

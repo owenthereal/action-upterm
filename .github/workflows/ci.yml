@@ -1,23 +1,36 @@
-name:  CI
+name: CI
 on:
   push:
     branches: [main]
   pull_request:
+
 jobs:
+  # Build, test, and lint run in parallel with e2e
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Use Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22.x
-          cache: 'npm'
-      - name: Install dependencies
-        run: yarn install
-      - name: Run tests
-        run: yarn run test
-      - name: Run lint
-        run: yarn run lint
-      - name: Build project
-        run: yarn run build
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      - run: yarn test
+      - run: yarn lint
+      - run: yarn build
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: yarn
+      - name: Install act
+        run: |
+          # Download latest act release
+          curl -sL https://github.com/nektos/act/releases/latest/download/act_Linux_x86_64.tar.gz -o /tmp/act.tar.gz
+          sudo tar -xzf /tmp/act.tar.gz -C /usr/local/bin act
+      - run: yarn install --frozen-lockfile
+      - run: yarn test:e2e
