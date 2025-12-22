@@ -280,7 +280,9 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
   // Pass XDG environment variables to tmux using -e flags
   // Only upterm needs these vars to know where to create its socket; the inner tmux session doesn't
   // Use shellEscape to handle paths with spaces, single quotes, or other special characters
-  const tmuxEnvFlags = `-e XDG_RUNTIME_DIR=${shellEscape(toShellPath(dirs.runtime))} -e XDG_STATE_HOME=${shellEscape(toShellPath(dirs.state))} -e XDG_CONFIG_HOME=${shellEscape(toShellPath(dirs.config))}`;
+  // On Windows, upterm.exe expects POSIX-style paths in XDG vars (e.g., /c/Users/... not C:/Users/...)
+  const xdgPathConverter = process.platform === 'win32' ? toMsys2Path : toShellPath;
+  const tmuxEnvFlags = `-e XDG_RUNTIME_DIR=${shellEscape(xdgPathConverter(dirs.runtime))} -e XDG_STATE_HOME=${shellEscape(xdgPathConverter(dirs.state))} -e XDG_CONFIG_HOME=${shellEscape(xdgPathConverter(dirs.config))}`;
 
   try {
     await execShellCommand(
@@ -383,7 +385,9 @@ async function collectDiagnostics(): Promise<string> {
   }
 
   // Check environment
-  diagnostics += `- XDG_RUNTIME_DIR: ${dirs.runtime}\n`;
+  const xdgPathConverter = process.platform === 'win32' ? toMsys2Path : toShellPath;
+  diagnostics += `- XDG_RUNTIME_DIR (passed to upterm): ${xdgPathConverter(dirs.runtime)}\n`;
+  diagnostics += `- XDG_RUNTIME_DIR (actual directory): ${dirs.runtime}\n`;
   diagnostics += `- USER: ${process.env.USER || 'not set'}\n`;
   diagnostics += `- UID: ${process.getuid ? process.getuid() : 'unknown'}\n`;
 
