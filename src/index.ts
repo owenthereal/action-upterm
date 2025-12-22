@@ -65,8 +65,22 @@ function getUptermDirs(): UptermDirs {
 }
 
 // Utility Functions
+
+// Convert path to forward slashes for shell use
+// For native Windows apps (like upterm.exe), keep drive letter format (C:/...)
 function toShellPath(filePath: string): string {
   return filePath.replace(/\\/g, '/');
+}
+
+// Convert Windows path to MSYS2/Cygwin POSIX-style path
+// e.g., C:/Users/... -> /c/Users/...
+// Required for MSYS2 utilities (tee, cat, etc.) on Windows
+function toMsys2Path(filePath: string): string {
+  let result = filePath.replace(/\\/g, '/');
+  if (process.platform === 'win32') {
+    result = result.replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`);
+  }
+  return result;
 }
 
 // Escape a string for safe use in single-quoted shell arguments.
@@ -76,15 +90,15 @@ function shellEscape(value: string): string {
 }
 
 function getUptermTimeoutFlagPath(): string {
-  return toShellPath(getUptermDirs().timeoutFlag);
+  return toMsys2Path(getUptermDirs().timeoutFlag);
 }
 
 function getUptermCommandLogPath(): string {
-  return toShellPath(getUptermDirs().logs.uptermCommand);
+  return toMsys2Path(getUptermDirs().logs.uptermCommand);
 }
 
 function getTmuxErrorLogPath(): string {
-  return toShellPath(getUptermDirs().logs.tmuxError);
+  return toMsys2Path(getUptermDirs().logs.tmuxError);
 }
 
 type UptermArchitecture = (typeof SUPPORTED_UPTERM_ARCHITECTURES)[number];
