@@ -27,6 +27,10 @@ jobs:
         with:
           node-version: 22.x
           cache: yarn
-      - run: curl -sfL https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash -s -- -b /usr/local/bin
+      - name: Install act
+        run: |
+          # Download latest act release
+          curl -sL https://github.com/nektos/act/releases/latest/download/act_Linux_x86_64.tar.gz -o /tmp/act.tar.gz
+          sudo tar -xzf /tmp/act.tar.gz -C /usr/local/bin act
       - run: yarn install --frozen-lockfile
       - run: yarn test:e2e

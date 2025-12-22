@@ -15,18 +15,23 @@ export function runActWorkflow(): {
   });
 
   const sshCommandPromise = new Promise<string>((resolve, reject) => {
+    let settled = false;
     const timeout = setTimeout(() => {
-      reject(new Error('Timeout waiting for SSH command in act output'));
+      if (!settled) {
+        settled = true;
+        reject(new Error('Timeout waiting for SSH command in act output'));
+      }
     }, 180000); // 3 minutes
 
     actProcess.stdout?.on('data', (data: Buffer) => {
       const chunk = data.toString();
       console.log('[act stdout]', chunk);
 
-      // Look for SSH command in upterm output
-      // Format: "│ ➤ SSH Command:   │ ssh d07zbpLrcE4LxtHM3wKn@uptermd.upterm.dev          │"
-      const sshMatch = chunk.match(/SSH Command:\s*│\s*(ssh\s+\S+@\S+)/i);
-      if (sshMatch) {
+      // Look for SSH command in upterm output - flexible pattern to handle format variations
+      // Example: "│ ➤ SSH Command:   │ ssh d07zbpLrcE4LxtHM3wKn@uptermd.upterm.dev          │"
+      const sshMatch = chunk.match(/SSH Command:[^\n]*?(ssh\s+\S+@\S+)/i);
+      if (sshMatch && !settled) {
+        settled = true;
         clearTimeout(timeout);
         resolve(sshMatch[1]);
       }
@@ -38,27 +43,37 @@ export function runActWorkflow(): {
     });
 
     actProcess.on('error', error => {
-      clearTimeout(timeout);
-      reject(error);
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(error);
+      }
     });
 
     actProcess.on('exit', code => {
-      clearTimeout(timeout);
-      if (code !== 0 && code !== null) {
+      if (!settled && code !== 0 && code !== null) {
+        settled = true;
+        clearTimeout(timeout);
         reject(new Error(`act exited with code ${code}`));
       }
     });
   });
 
+  let forceKillTimeout: ReturnType<typeof setTimeout> | null = null;
+
   const killProcess = () => {
     if (!actProcess.killed) {
       actProcess.kill('SIGTERM');
       // Force kill after 5 seconds if still running
-      setTimeout(() => {
+      forceKillTimeout = setTimeout(() => {
         if (!actProcess.killed) {
           actProcess.kill('SIGKILL');
         }
+        forceKillTimeout = null;
       }, 5000);
+    } else if (forceKillTimeout) {
+      clearTimeout(forceKillTimeout);
+      forceKillTimeout = null;
     }
   };
 
