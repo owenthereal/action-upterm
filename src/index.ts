@@ -277,8 +277,9 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
   fs.mkdirSync(dirs.config, {recursive: true});
   core.debug(`Created upterm directories under ${dirs.base}`);
 
-  // Pass XDG environment variables to tmux using -e flags
-  // Only upterm needs these vars to know where to create its socket; the inner tmux session doesn't
+  // Pass XDG environment variables to both tmux sessions
+  // The outer wrapper needs them for upterm to find its socket directory
+  // The inner session needs them so users can run `upterm session list` etc.
   // Use shellEscape to handle paths with spaces, single quotes, or other special characters
   // On Windows, upterm.exe expects POSIX-style paths in XDG vars (e.g., /c/Users/... not C:/Users/...)
   const xdgPathConverter = process.platform === 'win32' ? toMsys2Path : toShellPath;
@@ -286,7 +287,7 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
 
   try {
     await execShellCommand(
-      `tmux new -d -s upterm-wrapper ${tmuxEnvFlags} -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`
+      `tmux new -d -s upterm-wrapper ${tmuxEnvFlags} -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm ${tmuxEnvFlags} -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`
     );
     await execShellCommand('tmux set -t upterm-wrapper window-size largest; tmux set -t upterm window-size largest');
     core.debug('Created new session successfully');
