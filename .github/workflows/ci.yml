@@ -1,23 +1,32 @@
-name:  CI
+name: CI
 on:
   push:
     branches: [main]
   pull_request:
+
 jobs:
+  # Build, test, and lint run in parallel with e2e
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Use Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22.x
-          cache: 'npm'
-      - name: Install dependencies
-        run: yarn install
-      - name: Run tests
-        run: yarn run test
-      - name: Run lint
-        run: yarn run lint
-      - name: Build project
-        run: yarn run build
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      - run: yarn test
+      - run: yarn lint
+      - run: yarn build
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: yarn
+      - run: curl -sfL https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash -s -- -b /usr/local/bin
+      - run: yarn install --frozen-lockfile
+      - run: yarn test:e2e
