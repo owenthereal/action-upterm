@@ -92,11 +92,13 @@ describe('upterm GitHub integration', () => {
       when(core.getInput).calledWith('upterm-version').mockReturnValue('');
       expect(getUptermDownloadUrl('linux', 'x64')).toBe('https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz');
       expect(getUptermDownloadUrl('darwin', 'arm64')).toBe('https://github.com/owenthereal/upterm/releases/latest/download/upterm_darwin_arm64.tar.gz');
+      expect(getUptermDownloadUrl('win32', 'x64')).toBe('https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_amd64.tar.gz');
     });
 
     it('builds download url for specific release when version provided', () => {
       when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.20.0');
       expect(getUptermDownloadUrl('linux', 'x64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_linux_amd64.tar.gz');
+      expect(getUptermDownloadUrl('win32', 'arm64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_windows_arm64.tar.gz');
     });
   });
 
@@ -199,6 +201,25 @@ describe('upterm GitHub integration', () => {
     await run();
 
     expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_linux_amd64.tar.gz');
+  });
+
+  it('uses specified upterm version for windows downloads', async () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'win32'
+    });
+    Object.defineProperty(process, 'arch', {
+      value: 'x64'
+    });
+    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
+    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
+    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.20.0');
+
+    mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
+    await run();
+
+    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_windows_amd64.tar.gz');
   });
 
   it('should handle the main loop for linux arm64', async () => {

@@ -25,7 +25,7 @@ inputs:
     required: false
     default: ""
   upterm-version:
-    description: "Upterm version/tag to install on Linux/macOS (e.g., v0.20.0). Defaults to latest when unset."
+    description: "Upterm version/tag to install (e.g., v0.20.0). Works on all platforms. Defaults to latest when unset."
     required: false
 outputs:
   ssh-command:

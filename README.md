@@ -72,9 +72,9 @@ jobs:
         upterm-server: wss://YOUR_HEROKU_APP_URL
 ```
 
-## Pin a Specific Upterm Version (Linux/macOS)
+## Pin a Specific Upterm Version
 
-By default, the action downloads the latest Upterm release for Linux and macOS directly from GitHub. To pin a specific release (for example, `v0.20.0`), provide the optional `upterm-version` input:
+By default, the action downloads the latest Upterm release directly from GitHub. To pin a specific release (for example, `v0.20.0`), provide the optional `upterm-version` input:
 
 ```yaml
 name: CI
@@ -90,9 +90,8 @@ jobs:
         upterm-version: v0.20.0
 ```
 
-- Works on Linux and macOS (tarball install from GitHub releases).
-- Windows currently keeps its existing behavior and does not use `upterm-version`.
-- On macOS, Upterm is now installed from the GitHub release tarball (Homebrew is still used for installing `tmux` only).
+- Works on all platforms (Linux, macOS, and Windows).
+- On macOS, Upterm is installed from the GitHub release tarball (Homebrew is still used for installing `tmux` only).
 
 ## Shut Down the Server if No User Connects
 

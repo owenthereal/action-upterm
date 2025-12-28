@@ -173,9 +173,14 @@ function validateArchitecture(arch: string): UptermArchitecture {
   return uptermArch;
 }
 
-export function getUptermDownloadUrl(platform: 'linux' | 'darwin', nodeArch: string): string {
+export function getUptermDownloadUrl(platform: 'linux' | 'darwin' | 'win32', nodeArch: string): string {
   const uptermArch = validateArchitecture(nodeArch);
-  const artifactPlatform = platform === 'darwin' ? 'darwin' : 'linux';
+  const artifactPlatformMap: Record<string, string> = {
+    darwin: 'darwin',
+    linux: 'linux',
+    win32: 'windows'
+  };
+  const artifactPlatform = artifactPlatformMap[platform];
   const filename = `upterm_${artifactPlatform}_${uptermArch}.tar.gz`;
 
   const versionInput = core.getInput('upterm-version');
@@ -236,8 +241,8 @@ async function installDependencies(): Promise<void> {
       await execShellCommand('if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
     },
     win32: async () => {
-      const uptermArch = validateArchitecture(process.arch);
-      const archive = await tc.downloadTool(`https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_${uptermArch}.tar.gz`);
+      const archiveUrl = getUptermDownloadUrl('win32', process.arch);
+      const archive = await tc.downloadTool(archiveUrl);
       const extractDir = await tc.extractTar(archive);
       const uptermExePath = path.join(extractDir, 'upterm.exe');
 
