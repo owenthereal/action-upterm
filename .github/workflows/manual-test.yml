@@ -32,7 +32,7 @@ on:
         type: choice
         description: 'Whether to limit access to the actor only'
         required: true
-        default: 'auto'
+        default: 'true'
         options:
           - 'true'
           - 'false'
