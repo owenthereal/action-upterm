@@ -1,12 +1,11 @@
+import {execSync} from 'child_process';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
-import {execShellCommand} from './helpers';
-
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+import {execShellCommand, sleep} from './helpers';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
@@ -209,11 +208,29 @@ function validateInputs(): void {
 
 export async function run() {
   try {
+    // Check if this is the POST action
+    if (core.getState('isPost') === 'true') {
+      await runPost();
+      return;
+    }
+
     validateInputs();
+
+    // Mark that the main action has run (for POST action detection)
+    // This must happen before any fallible setup so the post action
+    // always runs cleanup instead of re-entering the main path.
+    core.saveState('isPost', 'true');
 
     await installDependencies();
     await setupSSH();
     await startUptermSession();
+
+    const detached = core.getInput('detached');
+    if (detached === 'true') {
+      await runDetachedMode();
+      return;
+    }
+
     await monitorSession();
   } catch (error: unknown) {
     if (error instanceof Error) {
@@ -544,12 +561,12 @@ async function waitForUptermReady(): Promise<void> {
   throw new Error(diagnostics);
 }
 
-async function outputSshCommand(): Promise<void> {
+async function outputSshCommand(): Promise<string | null> {
   try {
     const socketPath = findUptermSocket();
     if (!socketPath) {
       core.warning('Could not find upterm socket to retrieve SSH command');
-      return;
+      return null;
     }
 
     const sessionInfo = await execShellCommand(`upterm session current --admin-socket "${socketPath}"`);
@@ -564,10 +581,12 @@ async function outputSshCommand(): Promise<void> {
       await core.summary.addHeading('Upterm SSH Connection').addCodeBlock(sshCommand, 'bash').addRaw(`\n\nConnect with: <code>${sshCommand}</code>`).write();
 
       core.info(`SSH command available as output: ${sshCommand}`);
+      return sshCommand;
     }
   } catch (error) {
-    core.debug(`Failed to extract SSH command for output: ${error}`);
+    core.debug(`Failed to extract SSH command: ${error}`);
   }
+  return null;
 }
 
 async function startUptermSession(): Promise<void> {
@@ -579,7 +598,7 @@ async function startUptermSession(): Promise<void> {
   await createUptermSession(uptermServer, authorizedKeysParameter);
   await sleep(UPTERM_INIT_DELAY);
 
-  if (waitTimeoutMinutes) {
+  if (waitTimeoutMinutes && core.getInput('detached') !== 'true') {
     await setupSessionTimeout(waitTimeoutMinutes);
   }
 
@@ -668,4 +687,102 @@ function isTimeoutReached(): boolean {
 function logTimeoutMessage(): void {
   core.info('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
   core.info('The session was automatically shut down to prevent unnecessary resource usage');
+}
+
+async function runDetachedMode(): Promise<void> {
+  core.debug('Entering detached mode');
+
+  let sshCommand = await outputSshCommand();
+  for (let i = 0; !sshCommand && i < 12; i++) {
+    await sleep(SESSION_STATUS_POLL_INTERVAL);
+    sshCommand = await outputSshCommand();
+  }
+  if (!sshCommand) {
+    throw new Error('Failed to get upterm session information');
+  }
+
+  // Emit the notice once; use plain text for the post-action loop
+  // to avoid creating duplicate annotations in the GitHub Actions UI
+  const message = `SSH: ${sshCommand}`;
+  core.notice(message);
+
+  // Save state for the POST action
+  core.saveState('message', message);
+  core.saveState('socketPath', findUptermSocket() || '');
+
+  console.log(message);
+  core.info('Detached mode: workflow will continue while upterm session is active');
+}
+
+async function hasAnyoneConnectedYet(): Promise<boolean> {
+  try {
+    // The upterm host's tmux client is marked read-only (via `-f read-only`
+    // on `tmux new -s upterm`), so filtering for non-read-only clients
+    // gives us exactly the user SSH connections.
+    const result = await execShellCommand("tmux list-clients -t upterm -f '#{?client_readonly,,1}'");
+    return result.trim() !== '';
+  } catch {
+    return false;
+  }
+}
+
+async function runPost(): Promise<void> {
+  const message = core.getState('message');
+  const socketPath = core.getState('socketPath');
+
+  if (!message || !socketPath) {
+    // Not in detached mode or session wasn't started properly
+    return;
+  }
+
+  const shutdown = () => {
+    core.error('Got signal');
+    try {
+      execSync('tmux kill-server');
+    } catch {
+      /* Ignore errors during shutdown */
+    }
+    process.exit(1);
+  };
+
+  // Support canceling the post-job Action
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  core.debug('Waiting for session to end');
+
+  let waitTimeoutSeconds = parseInt(core.getInput('wait-timeout-minutes') || '10', 10) * 60;
+  if (isNaN(waitTimeoutSeconds) || waitTimeoutSeconds <= 0) {
+    waitTimeoutSeconds = 10 * 60; // Default 10 minutes
+  }
+
+  let anyoneConnected = false;
+
+  for (let seconds = waitTimeoutSeconds; seconds > 0; ) {
+    const connected = await hasAnyoneConnectedYet();
+    if (connected) anyoneConnected = true;
+
+    console.log(`${anyoneConnected ? 'Waiting for session to end' : `Waiting for client to connect (at most ${seconds} more second(s))`}\n${message}`);
+
+    if (continueFileExists()) {
+      core.info("Exiting debugging session because '/continue' file was created");
+      break;
+    }
+
+    if (!uptermSocketExists()) {
+      core.info("Exiting debugging session: 'upterm' quit");
+      break;
+    }
+
+    await sleep(5000);
+    if (!anyoneConnected) seconds -= 5;
+    if (seconds <= 0) core.warning(`Timed out waiting for client to connect (after ${waitTimeoutSeconds})`);
+  }
+
+  // Clean up
+  try {
+    await execShellCommand('tmux kill-server 2>/dev/null || true');
+  } catch {
+    // Ignore cleanup errors
+  }
 }

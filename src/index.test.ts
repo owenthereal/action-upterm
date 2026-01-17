@@ -27,9 +27,10 @@ jest.mock('os', () => ({
   homedir: jest.fn(() => '/mock-home')
 }));
 
-import {execShellCommand} from './helpers';
+import {execShellCommand, sleep} from './helpers';
 jest.mock('./helpers');
 const mockedExecShellCommand = jest.mocked(execShellCommand);
+const mockedSleep = jest.mocked(sleep);
 
 import * as toolCache from '@actions/tool-cache';
 const mockedToolCache = jest.mocked(toolCache);
@@ -625,6 +626,138 @@ describe('upterm GitHub integration', () => {
     expect(core.info).toHaveBeenCalledWith('This may indicate the upterm process crashed or was terminated externally');
   });
 
+  describe('detached mode', () => {
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {
+        value: 'linux'
+      });
+      Object.defineProperty(process, 'arch', {
+        value: 'x64'
+      });
+      when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
+      when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+      when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+      when(core.getState).calledWith('isPost').mockReturnValue('');
+    });
+
+    it('should save state and set outputs then exit early', async () => {
+      when(core.getInput).calledWith('detached').mockReturnValue('true');
+
+      mockedExecShellCommand.mockImplementation((cmd: string) => {
+        if (cmd.includes('upterm session current')) {
+          return Promise.resolve('SSH Session: ssh user@session123.upterm.dev');
+        }
+        return Promise.resolve('success');
+      });
+
+      await run();
+
+      expect(core.saveState).toHaveBeenCalledWith('isPost', 'true');
+      expect(core.saveState).toHaveBeenCalledWith('message', expect.stringContaining('ssh user@session123.upterm.dev'));
+      expect(core.saveState).toHaveBeenCalledWith('socketPath', expect.any(String));
+      expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
+      expect(core.info).toHaveBeenCalledWith('Detached mode: workflow will continue while upterm session is active');
+    });
+
+    it('should enter normal monitoring loop when detached is false', async () => {
+      when(core.getInput).calledWith('detached').mockReturnValue('false');
+
+      mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
+      await run();
+
+      expect(core.saveState).toHaveBeenCalledWith('isPost', 'true');
+      expect(core.setOutput).not.toHaveBeenCalled();
+      expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
+    });
+
+    it('should fail when session info cannot be retrieved', async () => {
+      when(core.getInput).calledWith('detached').mockReturnValue('true');
+
+      mockedExecShellCommand.mockImplementation((cmd: string) => {
+        if (cmd.includes('upterm session current')) {
+          return Promise.resolve('Invalid output without SSH info');
+        }
+        return Promise.resolve('success');
+      });
+
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalledWith('Failed to get upterm session information');
+
+      // Verify the retry loop waited at least 60s total
+      const totalMs = mockedSleep.mock.calls.map(c => c[0]).reduce((sum, ms) => sum + ms, 0);
+      expect(totalMs).toBeGreaterThanOrEqual(60000);
+    });
+  });
+
+  describe('POST action', () => {
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {
+        value: 'linux'
+      });
+      Object.defineProperty(process, 'arch', {
+        value: 'x64'
+      });
+    });
+
+    it('should wait for session and exit when socket disappears', async () => {
+      when(core.getState).calledWith('isPost').mockReturnValue('true');
+      when(core.getState).calledWith('message').mockReturnValue('SSH: ssh user@session.upterm.dev');
+      when(core.getState).calledWith('socketPath').mockReturnValue('/run/user/1000/upterm/test.sock');
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+
+      mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
+        const pathStr = path.toString();
+        if (pathStr === '/continue' || pathStr.includes('continue')) {
+          return false;
+        }
+        if (pathStr.includes('upterm')) {
+          return false;
+        }
+        return true;
+      });
+      (mockFs.readdirSync as jest.Mock).mockReturnValue([]);
+      mockedExecShellCommand.mockReturnValue(Promise.resolve(''));
+
+      await run();
+
+      expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+    });
+
+    it('should return early when not in detached mode', async () => {
+      when(core.getState).calledWith('isPost').mockReturnValue('true');
+      when(core.getState).calledWith('message').mockReturnValue('');
+      when(core.getState).calledWith('socketPath').mockReturnValue('');
+
+      await run();
+
+      expect(core.debug).not.toHaveBeenCalledWith('Waiting for session to end');
+      expect(mockedExecShellCommand).not.toHaveBeenCalled();
+    });
+
+    it('should exit when continue file is created', async () => {
+      when(core.getState).calledWith('isPost').mockReturnValue('true');
+      when(core.getState).calledWith('message').mockReturnValue('SSH: ssh user@session.upterm.dev');
+      when(core.getState).calledWith('socketPath').mockReturnValue('/run/user/1000/upterm/test.sock');
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('10');
+
+      mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
+        const pathStr = path.toString();
+        if (pathStr === '/continue' || pathStr.includes('continue')) {
+          return true;
+        }
+        return true;
+      });
+      (mockFs.readdirSync as jest.Mock).mockReturnValue(['test.sock']);
+      mockedExecShellCommand.mockReturnValue(Promise.resolve(''));
+
+      await run();
+
+      expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
+    });
+  });
+
   it('should create timeout script when wait-timeout-minutes is specified', async () => {
     Object.defineProperty(process, 'platform', {
       value: 'linux'
@@ -636,6 +769,8 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('10');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+    when(core.getInput).calledWith('detached').mockReturnValue('false');
+    when(core.getState).calledWith('isPost').mockReturnValue('');
 
     mockedExecShellCommand.mockImplementation((cmd: string) => {
       if (cmd.includes('upterm session current')) {

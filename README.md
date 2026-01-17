@@ -113,6 +113,28 @@ jobs:
         wait-timeout-minutes: 5
 ```
 
+## Detached Mode
+
+By default, this Action starts an `upterm` session and waits for it to end. In detached mode, the Action starts the session, prints the connection details, and continues with the next step(s) of the workflow's job. At the end of the job, the Action waits for the session to exit.
+
+```yaml
+name: CI
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Setup upterm session
+      uses: owenthereal/action-upterm@v1
+      with:
+        detached: true
+    - name: Run tests with debug session available
+      run: npm test
+```
+
+By default, detached mode waits at the end of the job for a user to connect and then terminate the session. If no user connects within the timeout period (default 10 minutes), it terminates the session gracefully.
+
 ## Continue a Workflow
 
 To resume your workflow within an `upterm` session, create a file named `continue` in one of these locations:

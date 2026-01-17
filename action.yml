@@ -7,6 +7,8 @@ branding:
 runs:
   using: "node20"
   main: "lib/index.js"
+  post: "lib/index.js"
+  post-if: "!cancelled()"
 inputs:
   limit-access-to-actor:
     description: "If only the public SSH keys of the user triggering the workflow should be authorized"
@@ -21,12 +23,16 @@ inputs:
     required: true
     default: "ssh://uptermd.upterm.dev:22"
   wait-timeout-minutes:
-    description: "Integer number of minutes to wait for user to connect before shutting down server. Once a user connects, the server will stay up."
+    description: "Integer number of minutes to wait for user to connect before shutting down server. In detached mode, the countdown starts after all regular steps finish. Once a user connects, the server will stay up."
     required: false
     default: ""
   upterm-version:
     description: "Upterm version/tag to install (e.g., v0.20.0). Works on all platforms. Defaults to latest when unset."
     required: false
+  detached:
+    description: "In detached mode, the workflow job will continue while the upterm session is active"
+    required: false
+    default: "false"
 outputs:
   ssh-command:
     description: "The SSH command to connect to the upterm session (e.g., 'ssh session:token@uptermd.upterm.dev')"
