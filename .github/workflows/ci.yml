@@ -21,6 +21,13 @@ jobs:
       - run: yarn test
       - run: yarn lint
       - run: yarn build
+      - name: Verify detached/action.yml is in sync
+        run: |
+          sed -e 's/lib\//..\/&/g' \
+            -e '/detached:/{:1;n;s/\(default: \).*/\1"true"/;t;b1}' \
+            <action.yml >detached/action.yml.expected
+          diff -u detached/action.yml detached/action.yml.expected
+        if: runner.os == 'Linux'
 
   e2e:
     runs-on: ubuntu-latest
