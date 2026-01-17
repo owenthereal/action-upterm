@@ -16,6 +16,7 @@ module.exports = {
   startGroup: jest.fn(),
   endGroup: jest.fn(),
   isDebug: jest.fn(() => false),
+  notice: jest.fn(),
   summary: {
     addRaw: jest.fn(function () {
       return this;
