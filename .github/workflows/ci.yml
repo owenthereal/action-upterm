@@ -21,6 +21,17 @@ jobs:
       - run: yarn test
       - run: yarn lint
       - run: yarn build
+      - name: Verify detached/action.yml is in sync
+        run: |
+          # The `detached/action.yml` should differ minimally from the top-level `action.yml`:
+          # 1. The path to the JavaScript entry point needs to be relative to `detached/`, i.e.
+          #    `../lib/<path>` instead of `lib/<path>`.
+          # 2. The default value for the `detached` parameter should be `true`, not `false`.
+          sed -e 's/lib\//..\/&/g' \
+            -e '/detached:/{:1;n;s/\(default: \).*/\1"true"/;t;b1}' \
+            <action.yml >detached/action.yml.expected
+          diff -u detached/action.yml detached/action.yml.expected
+        if: runner.os == 'Linux'
 
   e2e:
     runs-on: ubuntu-latest

@@ -135,6 +135,8 @@ jobs:
 
 By default, detached mode waits at the end of the job for a user to connect and then terminate the session. If no user connects within the timeout period (default 10 minutes), it terminates the session gracefully.
 
+As this mode has turned out to be so useful as to having the potential for being the default mode once time travel becomes available, it is also available as `owenthereal/action-upterm/detached` for convenience.
+
 ## Continue a Workflow
 
 To resume your workflow within an `upterm` session, create a file named `continue` in one of these locations:
