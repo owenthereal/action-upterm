@@ -1,4 +1,4 @@
-import {runActWorkflow, sshCheckConnectivity, sleep} from './utils';
+import {runActWorkflow, sshCheckConnectivity, sleep, findContainer, dockerExecTmuxSendKeys} from './utils';
 
 /**
  * E2E test that runs GitHub Actions locally using act and SSHs into it.
@@ -71,6 +71,8 @@ describe('E2E: Detached mode via act', () => {
 
     // Register output watchers early so we don't miss any messages
     const continued = waitForOutput(/DETACHED_WORKFLOW_CONTINUED/);
+    const postActionStarted = waitForOutput(/Waiting for client to connect/);
+    const sessionExited = waitForOutput(/Exiting debugging session/);
 
     // The SSH command should appear
     const sshCommand = await sshCommandPromise;
@@ -85,5 +87,18 @@ describe('E2E: Detached mode via act', () => {
     await sleep(5000);
     await sshCheckConnectivity(sshCommand);
     console.log('SSH authentication verified in detached mode');
+
+    // Wait for the post action to start monitoring
+    await postActionStarted;
+    console.log('Post action is waiting for client connection');
+
+    // End the upterm session by sending Ctrl+D to the shell inside tmux
+    const container = findContainer('act-E2E-Fixture-Detached');
+    dockerExecTmuxSendKeys(container, 'upterm', 'C-d');
+    console.log('Sent C-d to upterm tmux session');
+
+    // The post action should detect the session ended
+    await sessionExited;
+    console.log('Post action detected session exit');
   }, 300000);
 });
