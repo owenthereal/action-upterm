@@ -1,15 +1,18 @@
 import {spawn, ChildProcess} from 'child_process';
 
 /**
- * Run act to start the e2e-fixture workflow locally
+ * Run act to start an e2e-fixture workflow locally
  * Returns the process handle and a promise that resolves with the SSH command
  */
-export function runActWorkflow(): {
+export function runActWorkflow(options?: {workflowFile?: string; job?: string}): {
   process: ChildProcess;
   sshCommandPromise: Promise<string>;
+  waitForOutput: (pattern: RegExp, timeoutMs?: number) => Promise<RegExpMatchArray>;
   killProcess: () => void;
 } {
-  const actProcess = spawn('act', ['workflow_dispatch', '-W', '.github/workflows/e2e-fixture.yml', '-j', 'upterm', '--container-architecture', 'linux/amd64'], {
+  const workflowFile = options?.workflowFile ?? '.github/workflows/e2e-fixture.yml';
+  const job = options?.job ?? 'upterm';
+  const actProcess = spawn('act', ['workflow_dispatch', '-W', workflowFile, '-j', job, '--container-architecture', 'linux/amd64'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     cwd: process.cwd()
   });
@@ -78,7 +81,28 @@ export function runActWorkflow(): {
     }
   };
 
-  return {process: actProcess, sshCommandPromise, killProcess};
+  const waitForOutput = (pattern: RegExp, timeoutMs = 180000): Promise<RegExpMatchArray> => {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timeout = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error(`Timeout waiting for pattern ${pattern} in act output`));
+        }
+      }, timeoutMs);
+
+      actProcess.stdout?.on('data', (data: Buffer) => {
+        const m = data.toString().match(pattern);
+        if (m && !settled) {
+          settled = true;
+          clearTimeout(timeout);
+          resolve(m);
+        }
+      });
+    });
+  };
+
+  return {process: actProcess, sshCommandPromise, waitForOutput, killProcess};
 }
 
 /**

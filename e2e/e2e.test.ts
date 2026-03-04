@@ -50,3 +50,40 @@ describe('E2E: SSH into local GitHub Actions runner via act', () => {
     console.log('E2E test completed successfully!');
   }, 300000); // 5 min test timeout
 });
+
+describe('E2E: Detached mode via act', () => {
+  let killActProcess: (() => void) | null = null;
+
+  afterAll(async () => {
+    if (killActProcess) {
+      console.log('Cleaning up: killing act process...');
+      killActProcess();
+      await sleep(2000);
+    }
+  });
+
+  it('should start upterm session and continue workflow', async () => {
+    console.log('Starting act workflow (detached mode)...');
+    const {sshCommandPromise, waitForOutput, killProcess} = runActWorkflow({
+      workflowFile: '.github/workflows/e2e-fixture-detached.yml'
+    });
+    killActProcess = killProcess;
+
+    // Register output watchers early so we don't miss any messages
+    const continued = waitForOutput(/DETACHED_WORKFLOW_CONTINUED/);
+
+    // The SSH command should appear
+    const sshCommand = await sshCommandPromise;
+    console.log(`Found SSH command: ${sshCommand}`);
+    expect(sshCommand).toMatch(/^ssh\s+\S+@uptermd\.upterm\.dev$/);
+
+    // The workflow should continue past the upterm step
+    await continued;
+    console.log('Workflow continued past upterm step (detached mode works)');
+
+    // Verify SSH connectivity still works
+    await sleep(5000);
+    await sshCheckConnectivity(sshCommand);
+    console.log('SSH authentication verified in detached mode');
+  }, 300000);
+});
