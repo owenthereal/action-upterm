@@ -1,0 +1,19 @@
+name: E2E Fixture (Detached)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  upterm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start upterm session (detached)
+        id: upterm
+        uses: ./detached
+
+      - name: Verify workflow continued
+        run: |
+          echo "DETACHED_WORKFLOW_CONTINUED"
+          echo "SSH_OUTPUT=${{ steps.upterm.outputs.ssh-command }}"
