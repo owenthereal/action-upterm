@@ -1,4 +1,4 @@
-import {spawn, ChildProcess} from 'child_process';
+import {spawn, execSync, ChildProcess} from 'child_process';
 
 /**
  * Run act to start an e2e-fixture workflow locally
@@ -172,4 +172,23 @@ export async function sshCheckConnectivity(sshCommand: string, retries = 3): Pro
  */
 export function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Find a running Docker container whose name matches the given substring.
+ */
+export function findContainer(nameSubstring: string): string {
+  const out = execSync(`docker ps --filter "name=${nameSubstring}" --format "{{.Names}}"`, {encoding: 'utf8'}).trim();
+  const names = out.split('\n').filter(Boolean);
+  if (names.length !== 1) {
+    throw new Error(`Expected exactly one container matching "${nameSubstring}", found ${names.length}: ${names.join(', ')}`);
+  }
+  return names[0];
+}
+
+/**
+ * Send tmux keys to a session inside a Docker container.
+ */
+export function dockerExecTmuxSendKeys(container: string, tmuxTarget: string, keys: string): void {
+  execSync(`docker exec ${container} tmux send-keys -t ${tmuxTarget} ${keys}`, {encoding: 'utf8'});
 }
