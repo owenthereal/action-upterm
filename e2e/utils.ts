@@ -71,6 +71,7 @@ export function runActWorkflow(): {
         }
         forceKillTimeout = null;
       }, 5000);
+      forceKillTimeout.unref();
     } else if (forceKillTimeout) {
       clearTimeout(forceKillTimeout);
       forceKillTimeout = null;
