@@ -398,7 +398,7 @@ setw -g aggressive-resize on
 
   try {
     await execShellCommand(
-      `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`
+      `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -f read-only -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`
     );
     core.debug('Created new session successfully');
   } catch (error) {
@@ -436,7 +436,7 @@ async function setupSessionTimeout(waitTimeoutMinutes: string): Promise<void> {
   const timeoutScript = `
     (
       sleep $(( ${timeout} * 60 ));
-      if ! pgrep -f '^tmux attach ' &>/dev/null; then
+      if [ -z "$(tmux list-clients -t upterm -f '#{?client_readonly,,1}')" ]; then
         echo "UPTERM_TIMEOUT_REACHED" > ${shellEscape(timeoutFlagPath)};
         tmux kill-server;
       fi
