@@ -1,6 +1,8 @@
 import * as core from '@actions/core';
 import {spawn} from 'child_process';
 
+export const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 /**
  * Executes a shell command and returns the output as a Promise.
  *

@@ -6,8 +6,8 @@ branding:
   color: "purple"
 runs:
   using: "node20"
-  main: "lib/index.js"
-  post: "lib/index.js"
+  main: "../lib/index.js"
+  post: "../lib/index.js"
   post-if: "!cancelled()"
 inputs:
   limit-access-to-actor:
@@ -32,7 +32,7 @@ inputs:
   detached:
     description: "In detached mode, the workflow job will continue while the upterm session is active"
     required: false
-    default: "false"
+    default: "true"
 outputs:
   ssh-command:
     description: "The SSH command to connect to the upterm session (e.g., 'ssh session:token@uptermd.upterm.dev')"
