@@ -5,7 +5,7 @@ import path from 'path';
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
-import {execShellCommand, sleep} from './helpers';
+import {execShellCommand, launchOutsideJobObject, sleep} from './helpers';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
@@ -414,9 +414,28 @@ setw -g aggressive-resize on
   const tmuxConfFlagInner = `-f ${tmuxConfPathPosix}`;
 
   try {
-    await execShellCommand(
-      `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -f read-only -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`
-    );
+    const tmuxCmd = `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -f read-only -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`;
+
+    if (process.platform === 'win32') {
+      // On Windows, launch the tmux/upterm process tree outside the
+      // runner's Job Object via WMI.  Without this, a sibling step's
+      // timeout-minutes limit terminates the entire Job Object, taking
+      // tmux and upterm with it.  WMI's Win32_Process::Create spawns
+      // the process under WmiPrvSE.exe, which is outside the runner's
+      // Job Object and therefore immune to step timeout cascades.
+      //
+      // Pass the current PATH so that the WMI-spawned bash can find
+      // tmux and upterm (which were added to PATH by installDependencies).
+      launchOutsideJobObject(tmuxCmd, {
+        PATH: process.env.PATH || '',
+        HOME: process.env.USERPROFILE || os.homedir(),
+        MSYS2_PATH_TYPE: 'inherit',
+        CHERE_INVOKING: '1',
+        MSYSTEM: 'MINGW64'
+      });
+    } else {
+      await execShellCommand(tmuxCmd);
+    }
     core.debug('Created new session successfully');
   } catch (error) {
     try {
