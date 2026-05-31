@@ -700,7 +700,12 @@ function continueFileExists(): boolean {
 }
 
 function isTimeoutReached(): boolean {
-  return fs.existsSync(getUptermTimeoutFlagPath());
+  // This is a Node fs check, so it must use the native filesystem path.
+  // getUptermTimeoutFlagPath() returns the MSYS "/c/..." form used by the bash
+  // writer in setupSessionTimeout(); Node cannot resolve that on Windows (it
+  // maps to C:\c\...), so check the native path the flag actually lives at -
+  // mirroring how findUptermSocket() reads the upterm socket.
+  return fs.existsSync(getUptermDirs().timeoutFlag);
 }
 
 function logTimeoutMessage(): void {
