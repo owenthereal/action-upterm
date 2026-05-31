@@ -15,6 +15,7 @@ jest.mock('fs', () => ({
   writeFileSync: jest.fn(() => true),
   readdirSync: jest.fn(() => ['id_rsa', 'id_ed25519', 'hello.sock']),
   readFileSync: jest.fn(() => '{}'),
+  rmSync: jest.fn(() => undefined),
   promises: {
     access: jest.fn()
   }

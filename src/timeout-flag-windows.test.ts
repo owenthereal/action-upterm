@@ -27,6 +27,7 @@ jest.mock('fs', () => ({
   writeFileSync: jest.fn(() => true),
   readdirSync: jest.fn(() => []),
   readFileSync: jest.fn(() => '{}'),
+  rmSync: jest.fn(),
   promises: {access: jest.fn()}
 }));
 
@@ -107,5 +108,33 @@ describe('isTimeoutReached on Windows', () => {
     // With the buggy "/c/..." path this is never logged; the timeout would be
     // misreported as "'upterm' quit" once bash's kill-server drops the socket.
     expect(core.info).toHaveBeenCalledWith(TIMEOUT_MESSAGE);
+  });
+
+  it('clears a stale timeout flag from a reused temp dir instead of timing out immediately', async () => {
+    // A reused temp directory (self-hosted runner, or a second invocation in
+    // the same job) can still hold a timeout-flag from an earlier run. It must
+    // be removed during session setup; otherwise monitorSession() would read
+    // the stale flag and report a timeout before this session's timer is armed.
+    let flagCleared = false;
+    (mockFs.rmSync as jest.Mock).mockImplementation((p: fs.PathLike) => {
+      if (p.toString().includes('timeout-flag')) flagCleared = true;
+    });
+    let socketReads = 0;
+    (mockFs.readdirSync as jest.Mock).mockImplementation(() => (++socketReads <= 6 ? ['upterm.sock'] : []));
+    mockFs.existsSync.mockImplementation((p: fs.PathLike) => {
+      const s = p.toString();
+      if (s.includes('id_rsa') || s.includes('id_ed25519')) return false;
+      if (s.endsWith('upterm.exe')) return true;
+      if (s.includes('continue')) return false;
+      if (s.includes('timeout-flag')) return !flagCleared && !s.startsWith('/c/'); // stale until cleared
+      return true;
+    });
+
+    await run();
+
+    // The stale flag is removed at the native path, and no timeout is reported
+    // (the run exits via "'upterm' quit" once the socket disappears).
+    expect(mockFs.rmSync).toHaveBeenCalledWith('C:/Users/runneradmin/AppData/Local/Temp/upterm-data/timeout-flag', expect.objectContaining({force: true}));
+    expect(core.info).not.toHaveBeenCalledWith(TIMEOUT_MESSAGE);
   });
 });
