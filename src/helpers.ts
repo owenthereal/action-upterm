@@ -94,8 +94,8 @@ export function launchOutsideJobObject(cmd: string, env?: Record<string, string>
 
   // Build environment export lines.  On Windows, paths must be converted
   // from Windows format (backslashes, semicolons) to POSIX format
-  // (forward slashes, colons) for bash.  PATH uses cygpath --path for
-  // the full semicolon-separated list; other paths use cygpath -u.
+  // (forward slashes, colons) for bash.  PATH uses cygpath --path --unix
+  // for the full semicolon-separated list; other paths use cygpath -u.
   const envLines: string[] = [];
   if (env) {
     for (const [key, value] of Object.entries(env)) {
@@ -137,7 +137,7 @@ ${cmd}
   // quoting issues; we just need to pass the path.
   const psCommand = [
     '$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create',
-    `-Arguments @{CommandLine='${bashExe} -l ${scriptPathForward}'}`,
+    `-Arguments @{CommandLine='"${bashExe}" -l "${scriptPathForward}"'}`,
     '; if ($r.ReturnValue -ne 0) { throw "WMI failed: $($r.ReturnValue)" }',
     '; Write-Host "WMI PID: $($r.ProcessId)"'
   ].join(' ');

@@ -426,12 +426,12 @@ setw -g aggressive-resize on
       //
       // Pass the current PATH so that the WMI-spawned bash can find
       // tmux and upterm (which were added to PATH by installDependencies).
+      // MSYSTEM and CHERE_INVOKING are set by the launch script itself
+      // (the WMI-spawned process has a minimal environment), so we only
+      // need to forward PATH and HOME here.
       launchOutsideJobObject(tmuxCmd, {
         PATH: process.env.PATH || '',
-        HOME: process.env.USERPROFILE || os.homedir(),
-        MSYS2_PATH_TYPE: 'inherit',
-        CHERE_INVOKING: '1',
-        MSYSTEM: 'MINGW64'
+        HOME: process.env.USERPROFILE || os.homedir()
       });
     } else {
       await execShellCommand(tmuxCmd);
