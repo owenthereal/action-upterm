@@ -27,9 +27,10 @@ jest.mock('os', () => ({
   homedir: jest.fn(() => '/mock-home')
 }));
 
-import {execShellCommand, sleep} from './helpers';
+import {execShellCommand, launchOutsideJobObject, sleep} from './helpers';
 jest.mock('./helpers');
 const mockedExecShellCommand = jest.mocked(execShellCommand);
+const mockedLaunchOutsideJobObject = jest.mocked(launchOutsideJobObject);
 const mockedSleep = jest.mocked(sleep);
 
 import * as toolCache from '@actions/tool-cache';
@@ -134,9 +135,9 @@ describe('upterm GitHub integration', () => {
     // Check SSH key generation
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, expect.stringContaining('ssh-keygen -q -t rsa'));
 
-    // Check upterm session creation with tmux config
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(3, expect.stringContaining('tmux -f'));
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(3, expect.stringContaining('/mock-tmp/upterm-data/tmux.conf'));
+    // Check upterm session creation via WMI on Windows
+    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}));
+    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('/mock-tmp/upterm-data/tmux.conf'), expect.objectContaining({PATH: expect.any(String)}));
 
     // Check that tmux config file was written
     expect(mockFs.writeFileSync).toHaveBeenCalledWith(path.join(UPTERM_DATA_DIR, 'tmux.conf'), expect.stringContaining('set-environment -g XDG_RUNTIME_DIR'));
@@ -290,8 +291,8 @@ describe('upterm GitHub integration', () => {
     // Check SSH key generation
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, expect.stringContaining('ssh-keygen -q -t rsa'));
 
-    // Check upterm session creation with tmux config
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(3, expect.stringContaining('tmux -f'));
+    // Check upterm session creation via WMI on Windows
+    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}));
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
