@@ -51,7 +51,13 @@ const mockedToolCache = jest.mocked(toolCache);
 
 import {run} from '.';
 import fs from 'fs';
+import path from 'path';
 const mockFs = fs as jest.Mocked<typeof fs>;
+
+// Build expected paths with path.join so assertions match the runtime
+// separator on every OS (backslashes on Windows, forward slashes elsewhere).
+const WINDOWS_TMPDIR = 'C:/Users/runneradmin/AppData/Local/Temp';
+const NATIVE_TIMEOUT_FLAG = path.join(WINDOWS_TMPDIR, 'upterm-data', 'timeout-flag');
 
 const TIMEOUT_MESSAGE = 'Upterm session timed out - no client connected within the specified wait-timeout-minutes';
 
@@ -134,7 +140,7 @@ describe('isTimeoutReached on Windows', () => {
 
     // The stale flag is removed at the native path, and no timeout is reported
     // (the run exits via "'upterm' quit" once the socket disappears).
-    expect(mockFs.rmSync).toHaveBeenCalledWith('C:/Users/runneradmin/AppData/Local/Temp/upterm-data/timeout-flag', expect.objectContaining({force: true}));
+    expect(mockFs.rmSync).toHaveBeenCalledWith(NATIVE_TIMEOUT_FLAG, expect.objectContaining({force: true}));
     expect(core.info).not.toHaveBeenCalledWith(TIMEOUT_MESSAGE);
   });
 });
