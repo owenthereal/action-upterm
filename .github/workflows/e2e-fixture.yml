@@ -9,7 +9,7 @@ jobs:
     outputs:
       ssh-command: ${{ steps.upterm.outputs.ssh-command }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Start upterm session
         id: upterm
