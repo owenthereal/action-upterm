@@ -24,7 +24,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
     - name: Setup upterm session
       uses: owenthereal/action-upterm@v1
 ```
@@ -42,7 +42,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
     - name: Setup upterm session
       uses: owenthereal/action-upterm@v1
       with:
@@ -64,7 +64,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
     - name: Setup upterm session
       uses: owenthereal/action-upterm@v1
       with:
@@ -83,7 +83,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
     - name: Setup upterm session
       uses: owenthereal/action-upterm@v1
       with:
@@ -104,7 +104,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
     - name: Setup upterm session
       uses: owenthereal/action-upterm@v1
       if: ${{ failure() }}
@@ -124,7 +124,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
     - name: Setup upterm session
       uses: owenthereal/action-upterm@v1
       with:
