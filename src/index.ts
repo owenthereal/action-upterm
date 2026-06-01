@@ -268,6 +268,18 @@ async function installDependencies(): Promise<void> {
       }
 
       core.addPath(extractDir);
+
+      // core.addPath only puts the tool-cache dir on the Node process PATH and
+      // on subsequent (non-MSYS2) steps via GITHUB_PATH. The interactive
+      // SSH/tmux session spawns bash login shells that re-source /etc/profile
+      // with the default MSYS2_PATH_TYPE=minimal, which rebuilds PATH and drops
+      // that tool-cache dir - so upterm would be missing once the user connects.
+      // /usr/bin is always on the minimal MSYS2 PATH (it's where bash and the
+      // pacman-installed tmux live), so copy the binary there to guarantee it
+      // resolves in every MSYS2 context. Done via bash `cp` so /usr/bin tracks
+      // whichever MSYS2 root the shell uses rather than a hardcoded location.
+      await execShellCommand(`cp ${shellEscape(toMsys2Path(uptermExePath))} /usr/bin/upterm.exe`);
+
       await execShellCommand('if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
     },
     darwin: async () => {

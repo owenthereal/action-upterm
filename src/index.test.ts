@@ -130,11 +130,13 @@ describe('upterm GitHub integration', () => {
     expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
     expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
 
-    // Check dependency installation
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
+    // Check dependency installation: upterm is copied onto the MSYS2 PATH
+    // (/usr/bin) first, then tmux is installed.
+    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, `cp '${EXTRACT_DIR}/upterm.exe' /usr/bin/upterm.exe`);
+    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
 
     // Check SSH key generation
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, expect.stringContaining('ssh-keygen -q -t rsa'));
+    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(3, expect.stringContaining('ssh-keygen -q -t rsa'));
 
     // Check upterm session creation via WMI on Windows
     expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}));
@@ -147,6 +149,35 @@ describe('upterm GitHub integration', () => {
     expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
     expect(core.info).toHaveBeenNthCalledWith(3, expect.stringContaining('SSH command available as output'));
     expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
+  });
+
+  it('copies upterm into /usr/bin so it stays on PATH inside interactive MSYS2 sessions (windows)', async () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'win32'
+    });
+    Object.defineProperty(process, 'arch', {
+      value: 'x64'
+    });
+    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
+    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
+    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+
+    mockedExecShellCommand.mockImplementation((cmd: string) => {
+      if (cmd.includes('upterm session current')) {
+        return Promise.resolve('ssh test@upterm.dev');
+      }
+      return Promise.resolve('foobar');
+    });
+    await run();
+
+    // core.addPath(extractDir) only reaches the Node process and subsequent
+    // (non-MSYS2) steps via GITHUB_PATH. The interactive SSH/tmux login shells
+    // re-source /etc/profile with the default MSYS2_PATH_TYPE=minimal, which
+    // rebuilds PATH and drops the tool-cache dir. /usr/bin is always on the
+    // minimal MSYS2 PATH (it's where bash and the pacman-installed tmux live),
+    // so copying upterm.exe there keeps it reachable once the user connects.
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(`cp '${EXTRACT_DIR}/upterm.exe' /usr/bin/upterm.exe`);
   });
 
   it('should handle the main loop for linux x64', async () => {
@@ -287,10 +318,11 @@ describe('upterm GitHub integration', () => {
     expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
     expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
 
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
+    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, `cp '${EXTRACT_DIR}/upterm.exe' /usr/bin/upterm.exe`);
+    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
 
     // Check SSH key generation
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, expect.stringContaining('ssh-keygen -q -t rsa'));
+    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(3, expect.stringContaining('ssh-keygen -q -t rsa'));
 
     // Check upterm session creation via WMI on Windows
     expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}));
