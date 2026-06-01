@@ -380,6 +380,12 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
   fs.mkdirSync(dirs.config, {recursive: true});
   core.debug(`Created upterm directories under ${dirs.base}`);
 
+  // Remove any stale timeout flag left in a reused temp directory (e.g. on a
+  // self-hosted runner, or a second invocation in the same job). Otherwise
+  // monitorSession() would read the old flag via the native path and report a
+  // timeout for this fresh session before its timer has even been armed.
+  fs.rmSync(dirs.timeoutFlag, {force: true});
+
   // On Windows, upterm.exe expects POSIX-style paths in XDG vars (e.g., /c/Users/... not C:/Users/...)
   const xdgPathConverter = process.platform === 'win32' ? toMsys2Path : toShellPath;
   const xdgRuntimeDir = xdgPathConverter(dirs.runtime);
@@ -700,7 +706,12 @@ function continueFileExists(): boolean {
 }
 
 function isTimeoutReached(): boolean {
-  return fs.existsSync(getUptermTimeoutFlagPath());
+  // This is a Node fs check, so it must use the native filesystem path.
+  // getUptermTimeoutFlagPath() returns the MSYS "/c/..." form used by the bash
+  // writer in setupSessionTimeout(); Node cannot resolve that on Windows (it
+  // maps to C:\c\...), so check the native path the flag actually lives at -
+  // mirroring how findUptermSocket() reads the upterm socket.
+  return fs.existsSync(getUptermDirs().timeoutFlag);
 }
 
 function logTimeoutMessage(): void {
