@@ -9,6 +9,8 @@ jest.mock('@actions/tool-cache', () => ({
 }));
 
 jest.mock('fs', () => ({
+  mkdtempSync: jest.fn((prefix: string) => (prefix.includes('upterm-runtime-') ? '/tmp/upterm-runtime-abc123' : '/mock-tmp/upterm-action-abc123')),
+  chmodSync: jest.fn(),
   mkdirSync: jest.fn(() => true),
   existsSync: jest.fn(() => true),
   appendFileSync: jest.fn(() => true),
@@ -44,7 +46,7 @@ const DOWNLOAD_PATH = '/tmp/upterm.tar.gz';
 const EXTRACT_DIR = '/tmp/upterm-unique-a1b2c3d4';
 
 // Helper to get expected paths based on mocked os.tmpdir()
-const UPTERM_DATA_DIR = '/mock-tmp/upterm-data';
+const UPTERM_DATA_DIR = '/mock-tmp/upterm-action-abc123';
 const TIMEOUT_FLAG_PATH = path.join(UPTERM_DATA_DIR, 'timeout-flag');
 
 describe('upterm GitHub integration', () => {
@@ -99,9 +101,12 @@ describe('upterm GitHub integration', () => {
     });
 
     it('builds download url for specific release when version provided', () => {
-      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.20.0');
-      expect(getUptermDownloadUrl('linux', 'x64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_linux_amd64.tar.gz');
-      expect(getUptermDownloadUrl('win32', 'arm64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_windows_arm64.tar.gz');
+      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.29.0');
+      expect(getUptermDownloadUrl('linux', 'x64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.29.0/upterm_linux_amd64.tar.gz');
+      expect(getUptermDownloadUrl('win32', 'arm64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.29.0/upterm_windows_arm64.tar.gz');
+
+      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.30.0');
+      expect(getUptermDownloadUrl('linux', 'arm64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.30.0/upterm_linux_arm64.tar.gz');
     });
   });
 
@@ -140,7 +145,7 @@ describe('upterm GitHub integration', () => {
 
     // Check upterm session creation via WMI on Windows
     expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}));
-    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('/mock-tmp/upterm-data/tmux.conf'), expect.objectContaining({PATH: expect.any(String)}));
+    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('/mock-tmp/upterm-action-abc123/tmux.conf'), expect.objectContaining({PATH: expect.any(String)}));
 
     // Check that tmux config file was written
     expect(mockFs.writeFileSync).toHaveBeenCalledWith(path.join(UPTERM_DATA_DIR, 'tmux.conf'), expect.stringContaining('set-environment -g XDG_RUNTIME_DIR'));
@@ -544,7 +549,7 @@ describe('upterm GitHub integration', () => {
     await run();
 
     // Verify the timeout flag path is now based on os.tmpdir()
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('/mock-tmp/upterm-data/timeout-flag'));
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('/mock-tmp/upterm-action-abc123/timeout-flag'));
     expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 5 minutes for someone to connect, otherwise shut down');
     expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
     expect(core.info).toHaveBeenCalledWith('The session was automatically shut down to prevent unnecessary resource usage');
@@ -689,6 +694,7 @@ describe('upterm GitHub integration', () => {
 
       expect(core.saveState).toHaveBeenCalledWith('isPost', 'true');
       expect(core.saveState).toHaveBeenCalledWith('message', expect.stringContaining('ssh user@session123.upterm.dev'));
+      expect(core.saveState).toHaveBeenCalledWith('adminSocketPath', expect.any(String));
       expect(core.saveState).toHaveBeenCalledWith('socketPath', expect.any(String));
       expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
       expect(core.info).toHaveBeenCalledWith('Detached mode: workflow will continue while upterm session is active');
@@ -739,6 +745,8 @@ describe('upterm GitHub integration', () => {
       when(core.getState).calledWith('isPost').mockReturnValue('true');
       when(core.getState).calledWith('message').mockReturnValue('SSH: ssh user@session.upterm.dev');
       when(core.getState).calledWith('socketPath').mockReturnValue('/run/user/1000/upterm/test.sock');
+      when(core.getState).calledWith('uptermBaseDir').mockReturnValue('/tmp/action-owned-upterm-data');
+      when(core.getState).calledWith('uptermRuntimeDir').mockReturnValue('/tmp/action-owned-upterm-runtime');
       when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
 
       mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
@@ -757,6 +765,8 @@ describe('upterm GitHub integration', () => {
       await run();
 
       expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+      expect(mockFs.rmSync).toHaveBeenCalledWith('/tmp/action-owned-upterm-data', {recursive: true, force: true});
+      expect(mockFs.rmSync).toHaveBeenCalledWith('/tmp/action-owned-upterm-runtime', {recursive: true, force: true});
     });
 
     it('should return early when not in detached mode', async () => {
@@ -817,7 +827,7 @@ describe('upterm GitHub integration', () => {
     // Check that timeout script was created with correct timeout value
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('sleep $(( 10 * 60 ))'));
     // Timeout flag path now uses os.tmpdir() which is mocked to /mock-tmp
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('echo "UPTERM_TIMEOUT_REACHED" > \'/mock-tmp/upterm-data/timeout-flag\''));
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('echo "UPTERM_TIMEOUT_REACHED" > \'/mock-tmp/upterm-action-abc123/timeout-flag\''));
     expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 10 minutes for someone to connect, otherwise shut down');
   });
 });

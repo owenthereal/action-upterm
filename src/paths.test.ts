@@ -1,3 +1,8 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import {createUptermBaseDir, createUptermRuntimeDir, DARWIN_UNIX_SOCKET_PATH_LIMIT, getUptermAttachSocketPath} from './paths';
+
 /**
  * Platform-specific path handling integration tests
  *
@@ -187,6 +192,39 @@ describe('Path handling', () => {
       const tmuxConfPath = 'C:/temp/upterm-data/tmux.conf';
       const shellPath = tmuxConfPath.replace(/\\/g, '/');
       expect(shellPath).toBe('C:/temp/upterm-data/tmux.conf');
+    });
+  });
+
+  describe('Upterm runtime root', () => {
+    const created: string[] = [];
+
+    afterEach(() => {
+      for (const directory of created.splice(0)) {
+        fs.rmSync(directory, {recursive: true, force: true});
+      }
+    });
+
+    it("keeps the v0.30 attach socket below Darwin's AF_UNIX limit despite a long os.tmpdir()", () => {
+      const oldTmpdir = '/var/folders/36/tjdph2t965j8snz9_vkdnw0r0000gn/T';
+      const oldPath = path.join(oldTmpdir, 'upterm-data', 'runtime', 'upterm', 'sessions', 'tmux-1ae6', 'attach.sock');
+      expect(oldPath.length).toBeGreaterThan(DARWIN_UNIX_SOCKET_PATH_LIMIT);
+
+      const base = createUptermBaseDir(os.tmpdir());
+      const runtime = createUptermRuntimeDir('darwin', oldTmpdir);
+      created.push(base, runtime);
+      expect(base).toContain(os.tmpdir());
+      const attachPath = getUptermAttachSocketPath(runtime, 'tmux-1ae6');
+      expect(attachPath.length).toBeLessThanOrEqual(DARWIN_UNIX_SOCKET_PATH_LIMIT);
+    });
+
+    it('creates private, unique runtime roots for concurrent action invocations', () => {
+      const first = createUptermRuntimeDir('darwin', os.tmpdir());
+      const second = createUptermRuntimeDir('darwin', os.tmpdir());
+      created.push(first, second);
+
+      expect(first).not.toBe(second);
+      expect(fs.statSync(first).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(second).mode & 0o777).toBe(0o700);
     });
   });
 });

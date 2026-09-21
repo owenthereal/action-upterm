@@ -228,9 +228,9 @@ action-upterm follows the [XDG Base Directory Specification](https://specificati
 
 | Variable | Purpose | Example (Unix) | Example (Windows) |
 |----------|---------|----------------|-------------------|
-| `XDG_RUNTIME_DIR` | Runtime files, sockets | `/tmp/upterm-data/runtime` | `/c/Users/runner/AppData/Local/Temp/upterm-data/runtime` |
-| `XDG_STATE_HOME` | State data, logs | `/tmp/upterm-data/state` | `/c/Users/runner/AppData/Local/Temp/upterm-data/state` |
-| `XDG_CONFIG_HOME` | Configuration files | `/tmp/upterm-data/config` | `/c/Users/runner/AppData/Local/Temp/upterm-data/config` |
+| `XDG_RUNTIME_DIR` | Runtime files, sockets | `/tmp/upterm-runtime-XXXXXX` | `/c/Users/runner/AppData/Local/Temp/upterm-runtime-XXXXXX` |
+| `XDG_STATE_HOME` | State data, logs | `/tmp/upterm-action-XXXXXX/state` | `/c/Users/runner/AppData/Local/Temp/upterm-action-XXXXXX/state` |
+| `XDG_CONFIG_HOME` | Configuration files | `/tmp/upterm-action-XXXXXX/config` | `/c/Users/runner/AppData/Local/Temp/upterm-action-XXXXXX/config` |
 
 **Why XDG Variables:**
 - Platform defaults may not exist in CI environments
@@ -242,7 +242,7 @@ action-upterm follows the [XDG Base Directory Specification](https://specificati
 
 A custom tmux configuration file is generated at runtime:
 
-**Location:** `{tmpdir}/upterm-data/tmux.conf`
+**Location:** `{private-action-tempdir}/tmux.conf`
 
 **Contents:**
 ```tmux
@@ -275,7 +275,7 @@ setw -g aggressive-resize on
    - Wait for upterm to initialize (2 second delay)
 
 2. **Readiness Check** (`waitForUptermReady()`)
-   - Polls for socket file existence
+   - Polls the propagated `UPTERM_ADMIN_SOCKET` and validates it with `upterm session current -o json`
    - Maximum 10 retries with 1 second intervals
    - Collects diagnostics on failure
 
@@ -335,16 +335,19 @@ This information helps users report issues with full context.
 ## File Structure
 
 ```
-{tmpdir}/upterm-data/
-├── runtime/              # XDG_RUNTIME_DIR
-│   └── upterm/
-│       └── {session}.sock  # Unix socket for upterm
-├── state/               # XDG_STATE_HOME
+{private-runtime-tempdir}/
+└── upterm/               # XDG_RUNTIME_DIR
+    └── sessions/{name}/
+        ├── admin.sock    # Admin API socket
+        └── attach.sock   # Local terminal attach socket
+
+{private-action-tempdir}/
+├── state/                # XDG_STATE_HOME
 │   ├── upterm-command.log  # Upterm stdout/stderr
 │   └── tmux-error.log      # Tmux stderr
-├── config/              # XDG_CONFIG_HOME
-├── tmux.conf            # Custom tmux configuration
-└── timeout-flag         # Created when timeout is reached
+├── config/               # XDG_CONFIG_HOME
+├── tmux.conf             # Custom tmux configuration
+└── timeout-flag          # Created when timeout is reached
 ```
 
 ## Error Handling

@@ -21,6 +21,8 @@ jest.mock('@actions/tool-cache', () => ({
 }));
 
 jest.mock('fs', () => ({
+  mkdtempSync: jest.fn((prefix: string) => (prefix.includes('upterm-runtime-') ? 'C:/Users/runneradmin/AppData/Local/Temp/upterm-runtime-abc123' : 'C:/Users/runneradmin/AppData/Local/Temp/upterm-action-abc123')),
+  chmodSync: jest.fn(),
   mkdirSync: jest.fn(() => true),
   existsSync: jest.fn(() => true),
   appendFileSync: jest.fn(() => true),
@@ -57,7 +59,7 @@ const mockFs = fs as jest.Mocked<typeof fs>;
 // Build expected paths with path.join so assertions match the runtime
 // separator on every OS (backslashes on Windows, forward slashes elsewhere).
 const WINDOWS_TMPDIR = 'C:/Users/runneradmin/AppData/Local/Temp';
-const NATIVE_TIMEOUT_FLAG = path.join(WINDOWS_TMPDIR, 'upterm-data', 'timeout-flag');
+const NATIVE_TIMEOUT_FLAG = path.join(WINDOWS_TMPDIR, 'upterm-action-abc123', 'timeout-flag');
 
 const TIMEOUT_MESSAGE = 'Upterm session timed out - no client connected within the specified wait-timeout-minutes';
 

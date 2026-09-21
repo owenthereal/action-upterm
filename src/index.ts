@@ -6,6 +6,8 @@ import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
 import {execShellCommand, launchOutsideJobObject, sleep} from './helpers';
+import {createUptermBaseDir, createUptermRuntimeDir} from './paths';
+import {findUptermAdminSocketInFilesystem, parseAdminSocketEnvironment} from './socket';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
@@ -48,11 +50,20 @@ function getUptermDirs(): UptermDirs {
     return uptermDirsCache;
   }
 
-  const base = path.join(os.tmpdir(), 'upterm-data');
+  const savedBase = core.getState('uptermBaseDir');
+  const base = savedBase || createUptermBaseDir();
+  if (!savedBase) {
+    core.saveState('uptermBaseDir', base);
+  }
+  const savedRuntime = core.getState('uptermRuntimeDir');
+  const runtime = savedRuntime || createUptermRuntimeDir();
+  if (!savedRuntime) {
+    core.saveState('uptermRuntimeDir', runtime);
+  }
   const state = path.join(base, 'state');
   uptermDirsCache = {
     base,
-    runtime: path.join(base, 'runtime'), // XDG_RUNTIME_DIR - for sockets
+    runtime, // XDG_RUNTIME_DIR - for sockets
     state, // XDG_STATE_HOME - for upterm's internal logs
     config: path.join(base, 'config'), // XDG_CONFIG_HOME - for config files
     logs: {
@@ -116,6 +127,11 @@ function toMsys2Path(filePath: string): string {
     result = result.replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`);
   }
   return result;
+}
+
+function fromMsys2Path(filePath: string): string {
+  if (process.platform !== 'win32') return filePath;
+  return filePath.replace(/^\/([A-Za-z])\//, (_, drive) => `${drive.toUpperCase()}:/`);
 }
 
 /**
@@ -508,14 +524,27 @@ async function setupSessionTimeout(waitTimeoutMinutes: string): Promise<void> {
 async function collectDiagnostics(): Promise<string> {
   const dirs = getUptermDirs();
   const uptermDir = getUptermSocketDir();
-  let diagnostics = 'Failed to start upterm - socket not found after maximum retries.\n\nDiagnostics:\n';
+  let diagnostics = 'Upterm did not become ready after maximum retries.\n\nDiagnostics:\n';
 
   diagnostics += `- Upterm data directory: ${dirs.base}\n`;
-  diagnostics += `- Expected socket directory: ${uptermDir}\n`;
+  diagnostics += `- Expected admin socket root: ${uptermDir}\n`;
+
+  try {
+    const tmuxEnvironment = await execShellCommand('tmux show-environment -g UPTERM_ADMIN_SOCKET 2>/dev/null || true');
+    diagnostics += `- Tmux UPTERM_ADMIN_SOCKET: ${tmuxEnvironment.trim() || 'not set'}\n`;
+  } catch (error) {
+    diagnostics += `- Could not inspect tmux UPTERM_ADMIN_SOCKET: ${error}\n`;
+  }
 
   if (fs.existsSync(uptermDir)) {
     const files = fs.readdirSync(uptermDir);
-    diagnostics += `- Socket directory contains: ${files.join(', ')}\n`;
+    diagnostics += `- Admin socket root contains: ${files.join(', ')}\n`;
+
+    const sessionsDir = path.join(uptermDir, 'sessions');
+    if (fs.existsSync(sessionsDir)) {
+      const sessions = fs.readdirSync(sessionsDir);
+      diagnostics += `- Session directories contain: ${sessions.join(', ')}\n`;
+    }
 
     const logPath = path.join(uptermDir, 'upterm.log');
     if (fs.existsSync(logPath)) {
@@ -589,7 +618,19 @@ async function waitForUptermReady(): Promise<void> {
   let tries = UPTERM_READY_MAX_RETRIES;
   while (tries-- > 0) {
     core.info(`Waiting for upterm to be ready... (${UPTERM_READY_MAX_RETRIES - tries}/${UPTERM_READY_MAX_RETRIES})`);
-    if (uptermSocketExists()) return;
+    const socketPath = await findUptermAdminSocket();
+    if (socketPath) {
+      try {
+        // Query the admin socket instead of treating a filesystem entry as
+        // readiness. This works with both v0.29 and v0.30 and proves the
+        // running host can answer the command the action needs later.
+        await execShellCommand(`upterm session current --admin-socket ${shellEscape(socketPath)} -o json`);
+        core.saveState('adminSocketPath', socketPath);
+        return;
+      } catch (error) {
+        core.debug(`Upterm admin socket is not ready yet: ${error}`);
+      }
+    }
     await sleep(UPTERM_SOCKET_POLL_INTERVAL);
   }
 
@@ -600,13 +641,14 @@ async function waitForUptermReady(): Promise<void> {
 
 async function outputSshCommand(): Promise<string | null> {
   try {
-    const socketPath = findUptermSocket();
+    const socketPath = await findUptermAdminSocket();
     if (!socketPath) {
-      core.warning('Could not find upterm socket to retrieve SSH command');
+      core.warning('Could not find the Upterm admin socket to retrieve the SSH command');
       return null;
     }
 
-    const sessionInfo = await execShellCommand(`upterm session current --admin-socket "${socketPath}"`);
+    const sessionInfo = await execShellCommand(`upterm session current --admin-socket ${shellEscape(socketPath)}`);
+    core.saveState('adminSocketPath', socketPath);
 
     // Parse SSH command from session info
     const sshMatch = sessionInfo.match(/ssh\s+(\S+@\S+)/i);
@@ -659,17 +701,14 @@ async function monitorSession(): Promise<void> {
       break;
     }
 
-    if (!uptermSocketExists()) {
+    const socketPath = await findUptermAdminSocket();
+    if (!socketPath) {
       core.info("Exiting debugging session: 'upterm' quit");
       break;
     }
 
     try {
-      const socketPath = findUptermSocket();
-      if (!socketPath) {
-        throw new Error('Socket file not found');
-      }
-      core.info(await execShellCommand(`upterm session current --admin-socket "${socketPath}"`));
+      core.info(await execShellCommand(`upterm session current --admin-socket ${shellEscape(socketPath)}`));
     } catch (error) {
       // Check if this error is due to timeout before throwing
       if (isTimeoutReached()) {
@@ -698,18 +737,20 @@ function getUptermSocketDir(): string {
   return path.join(getUptermDirs().runtime, 'upterm');
 }
 
-function findUptermSocket(): string | null {
-  const uptermDir = getUptermSocketDir();
-  if (!fs.existsSync(uptermDir)) return null;
+async function findUptermAdminSocket(): Promise<string | null> {
+  const savedSocket = core.getState('adminSocketPath') || core.getState('socketPath');
+  if (savedSocket) return fs.existsSync(savedSocket) ? savedSocket : null;
 
-  const socketFile = fs.readdirSync(uptermDir).find(file => file.endsWith('.sock'));
-  if (!socketFile) return null;
+  try {
+    const environment = await execShellCommand('tmux show-environment -g UPTERM_ADMIN_SOCKET 2>/dev/null');
+    const socket = parseAdminSocketEnvironment(environment);
+    if (socket) return toShellPath(fromMsys2Path(socket));
+  } catch {
+    // The tmux server may not have received the environment update yet.
+  }
 
-  return toShellPath(path.join(uptermDir, socketFile));
-}
-
-function uptermSocketExists(): boolean {
-  return findUptermSocket() !== null;
+  const socket = findUptermAdminSocketInFilesystem(getUptermDirs().runtime);
+  return socket ? toShellPath(socket) : null;
 }
 
 function continueFileExists(): boolean {
@@ -722,7 +763,7 @@ function isTimeoutReached(): boolean {
   // getUptermTimeoutFlagPath() returns the MSYS "/c/..." form used by the bash
   // writer in setupSessionTimeout(); Node cannot resolve that on Windows (it
   // maps to C:\c\...), so check the native path the flag actually lives at -
-  // mirroring how findUptermSocket() reads the upterm socket.
+  // mirroring how the action reads its saved admin socket.
   return fs.existsSync(getUptermDirs().timeoutFlag);
 }
 
@@ -750,7 +791,10 @@ async function runDetachedMode(): Promise<void> {
 
   // Save state for the POST action
   core.saveState('message', message);
-  core.saveState('socketPath', findUptermSocket() || '');
+  const socketPath = await findUptermAdminSocket();
+  core.saveState('adminSocketPath', socketPath || '');
+  // Keep the old state key for already-published detached action versions.
+  core.saveState('socketPath', socketPath || '');
 
   console.log(message);
   core.info('Detached mode: workflow will continue while upterm session is active');
@@ -768,12 +812,24 @@ async function hasAnyoneConnectedYet(): Promise<boolean> {
   }
 }
 
+function cleanupUptermData(): void {
+  const base = core.getState('uptermBaseDir');
+  if (base) {
+    fs.rmSync(base, {recursive: true, force: true});
+  }
+  const runtime = core.getState('uptermRuntimeDir');
+  if (runtime && runtime !== base) {
+    fs.rmSync(runtime, {recursive: true, force: true});
+  }
+}
+
 async function runPost(): Promise<void> {
   const message = core.getState('message');
-  const socketPath = core.getState('socketPath');
+  const socketPath = core.getState('adminSocketPath') || core.getState('socketPath');
 
   if (!message || !socketPath) {
     // Not in detached mode or session wasn't started properly
+    cleanupUptermData();
     return;
   }
 
@@ -811,7 +867,7 @@ async function runPost(): Promise<void> {
       break;
     }
 
-    if (!uptermSocketExists()) {
+    if (!(await findUptermAdminSocket())) {
       core.info("Exiting debugging session: 'upterm' quit");
       break;
     }
@@ -827,4 +883,6 @@ async function runPost(): Promise<void> {
   } catch {
     // Ignore cleanup errors
   }
+
+  cleanupUptermData();
 }
