@@ -805,6 +805,33 @@ describe('upterm GitHub integration', () => {
       await run();
 
       expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('lost its connection to the server'));
+      // Distinct from the ordinary quit path on purpose: an unreachable session
+      // and a session that exited are different things, and the logs have to
+      // say which happened.
+      expect(core.info).not.toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+    });
+
+    it('retries readiness when the first lookup throws instead of failing the run', async () => {
+      // A lookup that failed is not a session that failed. Abandoning the
+      // remaining retries here would fail the job on a hiccup - and would skip
+      // collectDiagnostics(), the report written for exactly this case.
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation((cmd: string) => {
+        if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.30.0\n');
+        if (cmd.includes('session info')) {
+          polls++;
+          if (polls === 1) return Promise.reject(new Error('Command failed with exit code 1: connection refused'));
+          return Promise.resolve(readySession());
+        }
+        return Promise.resolve('foobar');
+      });
+
+      await run();
+
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
+      // The rejected lookup burned a retry rather than ending readiness.
+      expect(polls).toBeGreaterThanOrEqual(2);
     });
 
     it('reuses the readiness result in detached mode instead of re-querying', async () => {

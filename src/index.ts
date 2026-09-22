@@ -665,6 +665,25 @@ async function collectDiagnostics(): Promise<string> {
 }
 
 /**
+ * One lookup per poll.
+ *
+ * Three outcomes, deliberately distinct. Collapsing 'unknown' into 'gone'
+ * would make a transient registry hiccup end a live debugging session - the
+ * exact failure this whole change exists to remove.
+ */
+type PollResult = {kind: 'session'; session: SessionInfo} | {kind: 'gone'} | {kind: 'unknown'};
+
+async function pollSession(): Promise<PollResult> {
+  try {
+    const session = await getSession(getSessionName());
+    return session ? {kind: 'session', session} : {kind: 'gone'};
+  } catch (error) {
+    core.debug(`Session lookup failed, treating as unknown: ${error}`);
+    return {kind: 'unknown'};
+  }
+}
+
+/**
  * Wait until the session is genuinely usable.
  *
  * Readiness requires BOTH status === 'ready' AND live detail. upterm returns
@@ -673,15 +692,21 @@ async function collectDiagnostics(): Promise<string> {
  * sshCommand is one nobody can connect to.
  */
 async function waitForUptermReady(): Promise<SessionInfo> {
-  const name = getSessionName();
   let tries = UPTERM_READY_MAX_RETRIES;
 
   while (tries-- > 0) {
     core.info(`Waiting for upterm to be ready... (${UPTERM_READY_MAX_RETRIES - tries}/${UPTERM_READY_MAX_RETRIES})`);
-    const session = await getSession(name);
+    const poll = await pollSession();
 
-    if (session?.status === 'ready' && session.hasLiveDetail) return session;
-    if (session && isTerminal(session.status)) break;
+    if (poll.kind === 'session') {
+      if (poll.session.status === 'ready' && poll.session.hasLiveDetail) return poll.session;
+      if (isTerminal(poll.session.status)) break;
+    }
+    // 'gone' (the record is not published this early) and 'unknown' (the lookup
+    // itself failed) both mean "not ready YET", never "failed": burn a retry,
+    // exactly as a `starting` status does. An unguarded lookup here would let
+    // one hiccup abandon the remaining retries and fail the job - and would
+    // skip collectDiagnostics(), the report written for precisely this case.
 
     await sleep(UPTERM_SOCKET_POLL_INTERVAL);
   }
@@ -732,25 +757,6 @@ function logSessionEnded(session: SessionInfo): void {
   if (session.reason && session.reason !== 'unknown') core.info(`Reason: ${session.reason}`);
   if (session.exitCode !== undefined) core.info(`Exit code: ${session.exitCode}`);
   if (session.signal) core.info(`Signal: ${session.signal}`);
-}
-
-/**
- * One lookup per poll.
- *
- * Three outcomes, deliberately distinct. Collapsing 'unknown' into 'gone'
- * would make a transient registry hiccup end a live debugging session - the
- * exact failure this whole change exists to remove.
- */
-type PollResult = {kind: 'session'; session: SessionInfo} | {kind: 'gone'} | {kind: 'unknown'};
-
-async function pollSession(): Promise<PollResult> {
-  try {
-    const session = await getSession(getSessionName());
-    return session ? {kind: 'session', session} : {kind: 'gone'};
-  } catch (error) {
-    core.debug(`Session lookup failed, treating as unknown: ${error}`);
-    return {kind: 'unknown'};
-  }
 }
 
 async function monitorSession(): Promise<void> {

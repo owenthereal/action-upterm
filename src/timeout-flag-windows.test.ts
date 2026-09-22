@@ -199,6 +199,11 @@ describe('isTimeoutReached on Windows', () => {
       if (s.includes('timeout-flag')) return !s.startsWith('/c/'); // visible only via the native path
       return true; // directories, logs, etc.
     });
+    // Terminal fallback. The timeout check should end the loop on its first
+    // iteration, so this is never reached - but without it a regression in
+    // timeout detection would hang the monitoring loop and OOM the worker
+    // instead of failing the assertion below.
+    baselineShell(readySession(), JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', reason: 'session_ended'}));
 
     await run();
 
