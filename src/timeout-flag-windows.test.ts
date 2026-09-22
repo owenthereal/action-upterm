@@ -12,7 +12,8 @@
 // has no drive letter, so toMsys2Path() is a no-op there and cannot reproduce
 // the bug.
 
-import * as core from '@actions/core';
+import {when} from 'jest-when';
+
 jest.mock('@actions/core');
 
 jest.mock('@actions/tool-cache', () => ({
@@ -28,6 +29,8 @@ jest.mock('fs', () => ({
   readdirSync: jest.fn(() => []),
   readFileSync: jest.fn(() => '{}'),
   rmSync: jest.fn(),
+  mkdtempSync: jest.fn((prefix: string) => `${prefix}abc123`),
+  chmodSync: jest.fn(),
   promises: {access: jest.fn()}
 }));
 
@@ -40,7 +43,6 @@ jest.mock('os', () => ({
   homedir: jest.fn(() => 'C:/Users/runneradmin')
 }));
 
-import {execShellCommand, launchOutsideJobObject, sleep} from './helpers';
 // Partial mock: shellEscape is a pure string function that the assertions
 // below depend on producing real output. Automocking it would make every
 // command string contain "undefined".
@@ -50,17 +52,10 @@ jest.mock('./helpers', () => ({
   launchOutsideJobObject: jest.fn(),
   sleep: jest.fn()
 }));
-const mockedExecShellCommand = jest.mocked(execShellCommand);
-const mockedLaunchOutsideJobObject = jest.mocked(launchOutsideJobObject);
-const mockedSleep = jest.mocked(sleep);
 
-import * as toolCache from '@actions/tool-cache';
-const mockedToolCache = jest.mocked(toolCache);
-
-import {run} from '.';
+// Kept for fs.PathLike type annotations below; the runtime handle is mockFs.
 import fs from 'fs';
 import path from 'path';
-const mockFs = fs as jest.Mocked<typeof fs>;
 
 // Build expected paths with path.join so assertions match the runtime
 // separator on every OS (backslashes on Windows, forward slashes elsewhere).
@@ -69,20 +64,105 @@ const NATIVE_TIMEOUT_FLAG = path.join(WINDOWS_TMPDIR, 'upterm-data', 'timeout-fl
 
 const TIMEOUT_MESSAGE = 'Upterm session timed out - no client connected within the specified wait-timeout-minutes';
 
+process.env.RUNNER_TEMP = WINDOWS_TMPDIR;
+
+const READY_SESSION = {name: 'gha-3f9a1c05', status: 'ready', sessionId: 's1', sshCommand: 'ssh user@session123.upterm.dev', guestCount: 0};
+
+function readySession(overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({...READY_SESSION, ...overrides});
+}
+
+// Everything the action imports is re-acquired here. resetModules() hands the
+// re-required action new mock instances; any handle captured at module scope
+// would point at the old ones and see zero calls.
+let core: jest.Mocked<typeof import('@actions/core')>;
+let mockFs: jest.Mocked<typeof import('fs')>;
+let mockedToolCache: jest.Mocked<typeof import('@actions/tool-cache')>;
+let mockedExecShellCommand: jest.MockedFunction<typeof import('./helpers').execShellCommand>;
+let mockedLaunchOutsideJobObject: jest.MockedFunction<typeof import('./helpers').launchOutsideJobObject>;
+let mockedSleep: jest.MockedFunction<typeof import('./helpers').sleep>;
+let run: typeof import('.').run;
+
+function loadAction(): void {
+  jest.resetModules();
+
+  core = require('@actions/core');
+  mockFs = require('fs');
+  mockedToolCache = require('@actions/tool-cache');
+
+  const helpers = require('./helpers');
+  mockedExecShellCommand = helpers.execShellCommand;
+  mockedLaunchOutsideJobObject = helpers.launchOutsideJobObject;
+  mockedSleep = helpers.sleep;
+
+  ({run} = require('.'));
+}
+
+function baselineInputs(): void {
+  when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+  when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
+  when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
+  when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+  when(core.getInput).calledWith('upterm-version').mockReturnValue('');
+  when(core.getInput).calledWith('detached').mockReturnValue('false');
+}
+
+/**
+ * Default shell responses. `upterm version` must satisfy the gate, and
+ * `session info` must return JSON - a bare 'foobar' would make getSession()
+ * throw a JSON parse error rather than exercise the path under test.
+ *
+ * The `session current` branch is still here because production still uses it
+ * until Task 7. Task 7 Step 9 removes it.
+ */
+function baselineShell(...sessionResponses: string[]): void {
+  const queue = sessionResponses.length ? [...sessionResponses] : [readySession()];
+  mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+    if (cmd.includes('upterm version')) return 'Upterm version v0.30.0\n';
+    if (cmd.includes('session current')) return 'ssh user@session123.upterm.dev';
+    if (cmd.includes('session info')) return queue.length > 1 ? (queue.shift() as string) : queue[0];
+    return 'foobar';
+  });
+}
+
+/**
+ * Filesystem baseline for LIFECYCLE tests.
+ *
+ * The default existsSync returns true for everything but SSH keys, which makes
+ * continueFileExists() true on the first poll - so a lifecycle test would exit
+ * with "'/continue' file was created" before ever consuming its session
+ * response. Any test asserting on ready/ended/disconnected must use this.
+ */
+function fsWithoutExitFiles(): void {
+  mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
+    const p = filePath.toString();
+    if (p.includes('id_rsa') || p.includes('id_ed25519')) return false;
+    // CONTINUE_FILE_PATHS: '/continue' (unix), 'C:/msys64/continue' (win32),
+    // plus $GITHUB_WORKSPACE/continue.
+    if (p.endsWith('continue')) return false;
+    if (p.includes('timeout-flag')) return false;
+    return true;
+  });
+}
+
 describe('isTimeoutReached on Windows', () => {
   const originalPlatform = process.platform;
   const originalArch = process.arch;
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    loadAction();
+
     Object.defineProperty(process, 'platform', {value: 'win32'});
     Object.defineProperty(process, 'arch', {value: 'x64'});
 
     mockedToolCache.downloadTool.mockResolvedValue('/mock/upterm.tar.gz');
     mockedToolCache.extractTar.mockResolvedValue('/mock/upterm-extract');
-    mockedExecShellCommand.mockResolvedValue('');
     mockedLaunchOutsideJobObject.mockReturnValue(undefined);
     mockedSleep.mockResolvedValue(undefined);
+
+    baselineInputs();
+    baselineShell();
+    fsWithoutExitFiles();
 
     (core.getInput as jest.Mock).mockImplementation((name: string) => {
       switch (name) {
@@ -95,6 +175,12 @@ describe('isTimeoutReached on Windows', () => {
       }
     });
     (core.getState as jest.Mock).mockReturnValue('');
+
+    // exportXdgEnvironment() writes to the real process.env; these survive
+    // between tests and would mask a missing assignment.
+    delete process.env.XDG_RUNTIME_DIR;
+    delete process.env.XDG_STATE_HOME;
+    delete process.env.XDG_CONFIG_HOME;
   });
 
   afterAll(() => {

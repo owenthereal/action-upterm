@@ -1,7 +1,6 @@
 import {when} from 'jest-when';
 import path from 'path';
 
-import * as core from '@actions/core';
 jest.mock('@actions/core');
 jest.mock('@actions/tool-cache', () => ({
   downloadTool: jest.fn(),
@@ -16,6 +15,8 @@ jest.mock('fs', () => ({
   readdirSync: jest.fn(() => ['id_rsa', 'id_ed25519', 'hello.sock']),
   readFileSync: jest.fn(() => '{}'),
   rmSync: jest.fn(() => undefined),
+  mkdtempSync: jest.fn((prefix: string) => `${prefix}abc123`),
+  chmodSync: jest.fn(),
   promises: {
     access: jest.fn()
   }
@@ -28,7 +29,6 @@ jest.mock('os', () => ({
   homedir: jest.fn(() => '/mock-home')
 }));
 
-import {execShellCommand, launchOutsideJobObject, sleep} from './helpers';
 // Partial mock: shellEscape is a pure string function that the assertions
 // below depend on producing real output. Automocking it would make every
 // command string contain "undefined".
@@ -38,16 +38,10 @@ jest.mock('./helpers', () => ({
   launchOutsideJobObject: jest.fn(),
   sleep: jest.fn()
 }));
-const mockedExecShellCommand = jest.mocked(execShellCommand);
-const mockedLaunchOutsideJobObject = jest.mocked(launchOutsideJobObject);
-const mockedSleep = jest.mocked(sleep);
 
-import * as toolCache from '@actions/tool-cache';
-const mockedToolCache = jest.mocked(toolCache);
-
-import {getUptermArchitecture, getUptermDownloadUrl, run} from '.';
+// Kept for fs.PathLike type annotations below; the runtime handle is mockFs.
 import fs from 'fs';
-const mockFs = fs as jest.Mocked<typeof fs>;
+
 const DOWNLOAD_PATH = '/tmp/upterm.tar.gz';
 const EXTRACT_DIR = '/tmp/upterm-unique-a1b2c3d4';
 
@@ -55,18 +49,109 @@ const EXTRACT_DIR = '/tmp/upterm-unique-a1b2c3d4';
 const UPTERM_DATA_DIR = '/mock-tmp/upterm-data';
 const TIMEOUT_FLAG_PATH = path.join(UPTERM_DATA_DIR, 'timeout-flag');
 
+process.env.RUNNER_TEMP = '/runner/_temp';
+
+const READY_SESSION = {name: 'gha-3f9a1c05', status: 'ready', sessionId: 's1', sshCommand: 'ssh user@session123.upterm.dev', guestCount: 0};
+
+function readySession(overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({...READY_SESSION, ...overrides});
+}
+
+// Everything the action imports is re-acquired here. resetModules() hands the
+// re-required action new mock instances; any handle captured at module scope
+// would point at the old ones and see zero calls.
+let core: jest.Mocked<typeof import('@actions/core')>;
+let mockFs: jest.Mocked<typeof import('fs')>;
+let mockedToolCache: jest.Mocked<typeof import('@actions/tool-cache')>;
+let mockedExecShellCommand: jest.MockedFunction<typeof import('./helpers').execShellCommand>;
+let mockedLaunchOutsideJobObject: jest.MockedFunction<typeof import('./helpers').launchOutsideJobObject>;
+let mockedSleep: jest.MockedFunction<typeof import('./helpers').sleep>;
+let run: typeof import('.').run;
+let getUptermArchitecture: typeof import('.').getUptermArchitecture;
+let getUptermDownloadUrl: typeof import('.').getUptermDownloadUrl;
+
+function loadAction(): void {
+  jest.resetModules();
+
+  core = require('@actions/core');
+  mockFs = require('fs');
+  mockedToolCache = require('@actions/tool-cache');
+
+  const helpers = require('./helpers');
+  mockedExecShellCommand = helpers.execShellCommand;
+  mockedLaunchOutsideJobObject = helpers.launchOutsideJobObject;
+  mockedSleep = helpers.sleep;
+
+  ({run, getUptermArchitecture, getUptermDownloadUrl} = require('.'));
+}
+
+function baselineInputs(): void {
+  when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+  when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
+  when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
+  when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+  when(core.getInput).calledWith('upterm-version').mockReturnValue('');
+  when(core.getInput).calledWith('detached').mockReturnValue('false');
+}
+
+/**
+ * Default shell responses. `upterm version` must satisfy the gate, and
+ * `session info` must return JSON - a bare 'foobar' would make getSession()
+ * throw a JSON parse error rather than exercise the path under test.
+ *
+ * The `session current` branch is still here because production still uses it
+ * until Task 7. Task 7 Step 9 removes it.
+ */
+function baselineShell(...sessionResponses: string[]): void {
+  const queue = sessionResponses.length ? [...sessionResponses] : [readySession()];
+  mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+    if (cmd.includes('upterm version')) return 'Upterm version v0.30.0\n';
+    if (cmd.includes('session current')) return 'ssh user@session123.upterm.dev';
+    if (cmd.includes('session info')) return queue.length > 1 ? (queue.shift() as string) : queue[0];
+    return 'foobar';
+  });
+}
+
+/**
+ * Filesystem baseline for LIFECYCLE tests.
+ *
+ * The default existsSync returns true for everything but SSH keys, which makes
+ * continueFileExists() true on the first poll - so a lifecycle test would exit
+ * with "'/continue' file was created" before ever consuming its session
+ * response. Any test asserting on ready/ended/disconnected must use this.
+ */
+// Not yet called in this suite: no current test exercises the session-API
+// lifecycle. Task 5 is the first consumer. Calling it from the shared
+// beforeEach would break every test that relies on the default '/continue'
+// file existing to end the monitoring loop.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function fsWithoutExitFiles(): void {
+  mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
+    const p = filePath.toString();
+    if (p.includes('id_rsa') || p.includes('id_ed25519')) return false;
+    // CONTINUE_FILE_PATHS: '/continue' (unix), 'C:/msys64/continue' (win32),
+    // plus $GITHUB_WORKSPACE/continue.
+    if (p.endsWith('continue')) return false;
+    if (p.includes('timeout-flag')) return false;
+    return true;
+  });
+}
+
 describe('upterm GitHub integration', () => {
   const originalPlatform = process.platform;
   const originalArch = process.arch;
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    loadAction();
+
     Object.defineProperty(process, 'platform', {
       value: originalPlatform
     });
     Object.defineProperty(process, 'arch', {
       value: originalArch
     });
+
+    mockedSleep.mockResolvedValue(undefined);
     mockedToolCache.downloadTool.mockResolvedValue(DOWNLOAD_PATH);
     mockedToolCache.extractTar.mockResolvedValue(EXTRACT_DIR);
     // Reset fs mocks - by default return false for SSH key files to trigger generation
@@ -79,8 +164,18 @@ describe('upterm GitHub integration', () => {
       // Everything else exists (directories, socket, etc.)
       return true;
     });
+    // hello.sock stays until Task 7: production still uses socket discovery,
+    // and the existing tests terminate monitoring by making it disappear.
     (mockFs.readdirSync as jest.Mock).mockReturnValue(['id_rsa', 'id_ed25519', 'hello.sock']);
-    when(core.getInput).calledWith('upterm-version').mockReturnValue('');
+
+    baselineInputs();
+    baselineShell();
+
+    // exportXdgEnvironment() writes to the real process.env; these survive
+    // between tests and would mask a missing assignment.
+    delete process.env.XDG_RUNTIME_DIR;
+    delete process.env.XDG_STATE_HOME;
+    delete process.env.XDG_CONFIG_HOME;
   });
 
   afterAll(() => {
