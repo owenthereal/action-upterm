@@ -1,4 +1,4 @@
-import {getSession, isTerminal, parseSessionInfo} from './session';
+import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported} from './session';
 import {execShellCommand} from './helpers';
 
 jest.mock('./helpers', () => ({
@@ -102,5 +102,46 @@ describe('getSession', () => {
   it('propagates any other failure instead of reporting not-found', async () => {
     mockedExec.mockRejectedValue(new Error('Command failed with exit code 127\nStderr: upterm: command not found'));
     await expect(getSession('gha-3f9a1c05')).rejects.toThrow('command not found');
+  });
+});
+
+describe('generateSessionName', () => {
+  it('produces a short name upterm accepts', () => {
+    const name = generateSessionName();
+    // upterm's nameRe: ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$
+    expect(name).toMatch(/^gha-[0-9a-f]{8}$/);
+    expect(name).toHaveLength(12);
+  });
+
+  it('produces a different name each time', () => {
+    expect(generateSessionName()).not.toBe(generateSessionName());
+  });
+});
+
+describe('parseUptermVersion', () => {
+  it('parses the first line of `upterm version`', () => {
+    expect(parseUptermVersion('Upterm version v0.30.0\nGit commit: abc\n')).toEqual({major: 0, minor: 30, patch: 0});
+  });
+
+  it('parses a version without a leading v', () => {
+    expect(parseUptermVersion('Upterm version 0.31.2')).toEqual({major: 0, minor: 31, patch: 2});
+  });
+
+  it('returns null for an unrecognized string', () => {
+    expect(parseUptermVersion('Upterm version dev')).toBeNull();
+    expect(parseUptermVersion('')).toBeNull();
+  });
+});
+
+describe('isUptermVersionSupported', () => {
+  it('accepts 0.30.0 and newer', () => {
+    expect(isUptermVersionSupported({major: 0, minor: 30, patch: 0})).toBe(true);
+    expect(isUptermVersionSupported({major: 0, minor: 31, patch: 2})).toBe(true);
+    expect(isUptermVersionSupported({major: 1, minor: 0, patch: 0})).toBe(true);
+  });
+
+  it('rejects anything older', () => {
+    expect(isUptermVersionSupported({major: 0, minor: 29, patch: 0})).toBe(false);
+    expect(isUptermVersionSupported({major: 0, minor: 20, patch: 0})).toBe(false);
   });
 });

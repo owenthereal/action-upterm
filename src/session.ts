@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import {execShellCommand, shellEscape} from './helpers';
 
 /**
@@ -76,4 +77,36 @@ export async function getSession(name: string): Promise<SessionInfo | null> {
     throw error;
   }
   return parseSessionInfo(raw);
+}
+
+export const UPTERM_MIN_VERSION = {major: 0, minor: 30, patch: 0};
+
+export interface UptermVersion {
+  major: number;
+  minor: number;
+  patch: number;
+}
+
+/**
+ * Generate this run's session name.
+ *
+ * Short on purpose: the name becomes a path component under the runtime root,
+ * and upterm caps the resulting socket path at 103 bytes on every platform.
+ */
+export function generateSessionName(): string {
+  return `gha-${crypto.randomBytes(4).toString('hex')}`;
+}
+
+/** Parse `upterm version`, whose first line is "Upterm version v0.30.0". */
+export function parseUptermVersion(output: string): UptermVersion | null {
+  const match = output.match(/version\s+v?(\d+)\.(\d+)\.(\d+)/i);
+  if (!match) return null;
+  return {major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3])};
+}
+
+export function isUptermVersionSupported(v: UptermVersion): boolean {
+  const {major, minor, patch} = UPTERM_MIN_VERSION;
+  if (v.major !== major) return v.major > major;
+  if (v.minor !== minor) return v.minor > minor;
+  return v.patch >= patch;
 }
