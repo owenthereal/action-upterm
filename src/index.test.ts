@@ -12,7 +12,7 @@ jest.mock('fs', () => ({
   existsSync: jest.fn(() => true),
   appendFileSync: jest.fn(() => true),
   writeFileSync: jest.fn(() => true),
-  readdirSync: jest.fn(() => ['id_rsa', 'id_ed25519', 'hello.sock']),
+  readdirSync: jest.fn(() => ['id_rsa', 'id_ed25519']),
   readFileSync: jest.fn(() => '{}'),
   rmSync: jest.fn(() => undefined),
   mkdtempSync: jest.fn((prefix: string) => `${prefix}abc123`),
@@ -59,6 +59,15 @@ function readySession(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({...READY_SESSION, ...overrides});
 }
 
+// "ready" straight from upterm's record: the admin query failed, so there is no
+// sshCommand and nothing to connect to yet.
+const noDetail = JSON.stringify({name: 'gha-3f9a1c05', status: 'ready', sessionId: 's1'});
+const endedResponse = JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', reason: 'session_ended'});
+
+function sessionInfoCalls(): number {
+  return mockedExecShellCommand.mock.calls.filter(c => c[0].includes('session info')).length;
+}
+
 // Everything the action imports is re-acquired here. resetModules() hands the
 // re-required action new mock instances; any handle captured at module scope
 // would point at the old ones and see zero calls.
@@ -101,14 +110,13 @@ function baselineInputs(): void {
  * `session info` must return JSON - a bare 'foobar' would make getSession()
  * throw a JSON parse error rather than exercise the path under test.
  *
- * The `session current` branch is still here because production still uses it
- * until Task 7. Task 7 Step 9 removes it.
+ * Responses are consumed one per lookup; the last one repeats forever, so a
+ * sequence ending in a terminal status keeps monitorSession() bounded.
  */
 function baselineShell(...sessionResponses: string[]): void {
   const queue = sessionResponses.length ? [...sessionResponses] : [readySession()];
   mockedExecShellCommand.mockImplementation(async (cmd: string) => {
     if (cmd.includes('upterm version')) return 'Upterm version v0.30.0\n';
-    if (cmd.includes('session current')) return 'ssh user@session123.upterm.dev';
     if (cmd.includes('session info')) return queue.length > 1 ? (queue.shift() as string) : queue[0];
     return 'foobar';
   });
@@ -122,11 +130,8 @@ function baselineShell(...sessionResponses: string[]): void {
  * with "'/continue' file was created" before ever consuming its session
  * response. Any test asserting on ready/ended/disconnected must use this.
  */
-// Not yet called in this suite: no current test exercises the session-API
-// lifecycle. Task 5 is the first consumer. Calling it from the shared
-// beforeEach would break every test that relies on the default '/continue'
-// file existing to end the monitoring loop.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
+// Opt-in, not part of the shared beforeEach: every test that relies on the
+// default '/continue' file to end the monitoring loop would break.
 function fsWithoutExitFiles(): void {
   mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
     const p = filePath.toString();
@@ -163,12 +168,10 @@ describe('upterm GitHub integration', () => {
       if (pathStr.includes('id_rsa') || pathStr.includes('id_ed25519')) {
         return false;
       }
-      // Everything else exists (directories, socket, etc.)
+      // Everything else exists (directories, the /continue file, etc.)
       return true;
     });
-    // hello.sock stays until Task 7: production still uses socket discovery,
-    // and the existing tests terminate monitoring by making it disappear.
-    (mockFs.readdirSync as jest.Mock).mockReturnValue(['id_rsa', 'id_ed25519', 'hello.sock']);
+    (mockFs.readdirSync as jest.Mock).mockReturnValue(['id_rsa', 'id_ed25519']);
 
     baselineInputs();
     baselineShell();
@@ -204,9 +207,9 @@ describe('upterm GitHub integration', () => {
     });
 
     it('builds download url for specific release when version provided', () => {
-      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.20.0');
-      expect(getUptermDownloadUrl('linux', 'x64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_linux_amd64.tar.gz');
-      expect(getUptermDownloadUrl('win32', 'arm64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_windows_arm64.tar.gz');
+      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.30.0');
+      expect(getUptermDownloadUrl('linux', 'x64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.30.0/upterm_linux_amd64.tar.gz');
+      expect(getUptermDownloadUrl('win32', 'arm64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.30.0/upterm_windows_arm64.tar.gz');
     });
   });
 
@@ -222,7 +225,13 @@ describe('upterm GitHub integration', () => {
     });
 
     it('proceeds with a warning when the version string is unrecognized', async () => {
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('upterm version') ? 'Upterm version dev\n' : ''));
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) return 'Upterm version dev\n';
+        // The run must actually proceed past the gate, so the session lookup
+        // has to answer with real JSON rather than an empty string.
+        if (cmd.includes('session info')) return readySession();
+        return '';
+      });
 
       await run();
 
@@ -256,13 +265,6 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
-    mockedExecShellCommand.mockImplementation((cmd: string) => {
-      // outputSshCommand() calls upterm session current to get SSH command
-      if (cmd.includes('upterm session current')) {
-        return Promise.resolve('ssh test@upterm.dev');
-      }
-      return Promise.resolve('foobar');
-    });
     await run();
 
     expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_amd64.tar.gz');
@@ -284,10 +286,10 @@ describe('upterm GitHub integration', () => {
     // Check that tmux config file was written
     expect(mockFs.writeFileSync).toHaveBeenCalledWith(path.join(UPTERM_DATA_DIR, 'tmux.conf'), expect.stringContaining('set-environment -g XDG_RUNTIME_DIR'));
 
-    expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
-    expect(core.info).toHaveBeenNthCalledWith(3, expect.stringContaining('SSH command available as output'));
-    expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
+    expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
+    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
+    expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
 
   it('copies upterm into /usr/bin so it stays on PATH inside interactive MSYS2 sessions (windows)', async () => {
@@ -302,12 +304,6 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
-    mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm session current')) {
-        return Promise.resolve('ssh test@upterm.dev');
-      }
-      return Promise.resolve('foobar');
-    });
     await run();
 
     // core.addPath(extractDir) only reaches the Node process and subsequent
@@ -331,12 +327,6 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
-    mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm session current')) {
-        return Promise.resolve('ssh test@upterm.dev');
-      }
-      return Promise.resolve('foobar');
-    });
     await run();
 
     expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz');
@@ -351,10 +341,10 @@ describe('upterm GitHub integration', () => {
     // Check upterm session creation with tmux config
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('tmux -f'));
 
-    expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
-    expect(core.info).toHaveBeenNthCalledWith(3, expect.stringContaining('SSH command available as output'));
-    expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
+    expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
+    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
+    expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
 
   it('uses specified upterm version for linux downloads', async () => {
@@ -368,12 +358,11 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
-    when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.20.0');
+    when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.30.0');
 
-    mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_linux_amd64.tar.gz');
+    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/download/v0.30.0/upterm_linux_amd64.tar.gz');
   });
 
   it('uses specified upterm version for windows downloads', async () => {
@@ -387,12 +376,11 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
-    when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.20.0');
+    when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.30.0');
 
-    mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/download/v0.20.0/upterm_windows_amd64.tar.gz');
+    expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/download/v0.30.0/upterm_windows_amd64.tar.gz');
   });
 
   it('should handle the main loop for linux arm64', async () => {
@@ -407,12 +395,6 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
-    mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm session current')) {
-        return Promise.resolve('ssh test@upterm.dev');
-      }
-      return Promise.resolve('foobar');
-    });
     await run();
 
     expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_arm64.tar.gz');
@@ -427,10 +409,10 @@ describe('upterm GitHub integration', () => {
     // Check upterm session creation with tmux config
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('tmux -f'));
 
-    expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
-    expect(core.info).toHaveBeenNthCalledWith(3, expect.stringContaining('SSH command available as output'));
-    expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
+    expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
+    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
+    expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
 
   it('should handle the main loop for windows arm64', async () => {
@@ -445,12 +427,6 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
-    mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm session current')) {
-        return Promise.resolve('ssh test@upterm.dev');
-      }
-      return Promise.resolve('foobar');
-    });
     await run();
 
     expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_arm64.tar.gz');
@@ -466,10 +442,10 @@ describe('upterm GitHub integration', () => {
     // Check upterm session creation via WMI on Windows
     expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}));
 
-    expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
-    expect(core.info).toHaveBeenNthCalledWith(3, expect.stringContaining('SSH command available as output'));
-    expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
+    expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
+    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
+    expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
 
   it('error handling for unsupported linux arch', async () => {
@@ -520,12 +496,6 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
-    mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm session current')) {
-        return Promise.resolve('ssh test@upterm.dev');
-      }
-      return Promise.resolve('foobar');
-    });
     await run();
 
     expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_darwin_amd64.tar.gz');
@@ -538,10 +508,10 @@ describe('upterm GitHub integration', () => {
 
     // Check upterm session creation with tmux config
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('tmux -f'));
-    expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
-    expect(core.info).toHaveBeenNthCalledWith(3, expect.stringContaining('SSH command available as output'));
-    expect(core.info).toHaveBeenNthCalledWith(4, "Exiting debugging session because '/continue' file was created");
+    expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
+    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
+    expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
 
   it('should handle invalid wait-timeout-minutes', async () => {
@@ -633,12 +603,6 @@ describe('upterm GitHub integration', () => {
       return true; // Default for other paths (SSH keys, .upterm dir, etc.)
     });
 
-    mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm session current')) {
-        return Promise.resolve('ssh test@upterm.dev');
-      }
-      return Promise.resolve('foobar');
-    });
     await run();
 
     expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 5 minutes for someone to connect, otherwise shut down');
@@ -675,12 +639,6 @@ describe('upterm GitHub integration', () => {
       return true; // Default for other paths (SSH keys, .upterm dir, etc.)
     });
 
-    mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm session current')) {
-        return Promise.resolve('ssh test@upterm.dev');
-      }
-      return Promise.resolve('foobar');
-    });
     await run();
 
     // Verify the timeout flag path is now rooted at the private per-run directory
@@ -702,27 +660,23 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
-    // Mock session status command
-    // First call is from outputSshCommand() - should succeed
+    // Mock the session lookup.
+    // First call is from waitForUptermReady() - should succeed
     // Second call is from monitorSession() - should fail with connection refused
-    let sessionStatusCallCount = 0;
+    let sessionInfoCallCount = 0;
     mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm session current')) {
-        sessionStatusCallCount++;
-        if (sessionStatusCallCount === 1) {
-          // First call from outputSshCommand - return session info
-          return Promise.resolve('ssh test@upterm.dev\nSession: test123');
-        }
-        if (sessionStatusCallCount === 2) {
+      if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.30.0\n');
+      if (cmd.includes('session info')) {
+        sessionInfoCallCount++;
+        if (sessionInfoCallCount === 2) {
           // Second call from monitorSession - fail with connection refused
           return Promise.reject(
             new Error(
-              "Command failed with exit code 1: upterm session current\nStderr: rpc error: code = Unavailable desc = connection error: desc = 'transport: Error while dialing: dial unix /home/runner/.upterm/JGxpTKJ8jsJHPxiFWggH.sock: connect: connection refused'"
+              "Command failed with exit code 1: upterm session info\nStderr: rpc error: code = Unavailable desc = connection error: desc = 'transport: Error while dialing: dial unix /home/runner/.upterm/sessions/gha-3f9a1c05/admin.sock: connect: connection refused'"
             )
           );
         }
-        // Subsequent calls succeed
-        return Promise.resolve('ssh test@upterm.dev\nSession: test123');
+        return Promise.resolve(readySession());
       }
       return Promise.resolve('success');
     });
@@ -744,11 +698,17 @@ describe('upterm GitHub integration', () => {
 
     await run();
 
+    // The failed lookup is UNKNOWN, so the loop keeps going; the next
+    // iteration's timeout check is what ends it.
     expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
     expect(core.info).toHaveBeenCalledWith('The session was automatically shut down to prevent unnecessary resource usage');
   });
 
-  it('should handle connection refused error without timeout flag (unexpected termination)', async () => {
+  it('keeps polling when the session lookup keeps failing instead of ending the session', async () => {
+    // A lookup that throws is UNKNOWN, not "gone". Ending the session here
+    // would let a transient registry hiccup kill a live debugging session -
+    // the exact failure this change exists to remove. The loop must exit by
+    // another signal (here, the continue file) instead.
     Object.defineProperty(process, 'platform', {
       value: 'linux'
     });
@@ -760,44 +720,105 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
-    // Mock session status command
-    // First call is from outputSshCommand() - should succeed
-    // Second call is from monitorSession() - should fail with connection refused
-    let sessionStatusCallCount = 0;
+    // First lookup (readiness) succeeds; every one after it fails.
+    let polls = 0;
     mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm session current')) {
-        sessionStatusCallCount++;
-        if (sessionStatusCallCount === 1) {
-          // First call from outputSshCommand - return session info
-          return Promise.resolve('ssh test@upterm.dev\nSession: test123');
-        }
-        // Second call from monitorSession - fail with connection refused
+      if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.30.0\n');
+      if (cmd.includes('session info')) {
+        polls++;
+        if (polls === 1) return Promise.resolve(readySession());
         return Promise.reject(new Error('Command failed with exit code 1: connection refused'));
       }
       return Promise.resolve('success');
     });
 
-    // Mock fs.existsSync to handle different paths correctly
+    // The continue file appears only once several lookups have failed, so the
+    // loop has to have survived them to reach it.
     mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
       const pathStr = filePath.toString();
-      // Normalize paths for comparison (convert backslashes to forward slashes)
-      const normalizedPath = pathStr.replace(/\\/g, '/');
-      const normalizedTimeoutPath = TIMEOUT_FLAG_PATH.replace(/\\/g, '/');
-      if (normalizedPath === normalizedTimeoutPath) {
-        return false; // Never return true for timeout flag (no timeout)
-      }
-      // Be specific about continue file paths to avoid matching unintended paths on Windows
-      if (pathStr === '/continue' || pathStr.endsWith('/continue') || pathStr.endsWith('\\continue')) {
-        return false; // Don't exit via continue file
-      }
-      return true; // Default for other paths (SSH keys, socket dir, etc.)
+      if (pathStr.includes('id_rsa') || pathStr.includes('id_ed25519')) return false;
+      if (pathStr.includes('timeout-flag')) return false;
+      if (pathStr.endsWith('continue')) return polls >= 4;
+      return true;
     });
 
     await run();
 
-    expect(core.error).toHaveBeenCalledWith('Upterm session appears to have ended unexpectedly');
-    expect(core.error).toHaveBeenCalledWith('Connection error: Error: Command failed with exit code 1: connection refused');
-    expect(core.info).toHaveBeenCalledWith('This may indicate the upterm process crashed or was terminated externally');
+    expect(polls).toBeGreaterThanOrEqual(4);
+    expect(core.info).not.toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+    expect(core.setFailed).not.toHaveBeenCalled();
+    expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
+  });
+
+  describe('session lifecycle', () => {
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      Object.defineProperty(process, 'arch', {value: 'x64'});
+    });
+
+    it('names the upterm session and saves it for the post process', async () => {
+      baselineShell(readySession(), endedResponse);
+
+      await run();
+
+      const tmuxCmd = mockedExecShellCommand.mock.calls.map(c => c[0]).find(c => c.includes('upterm host'));
+      expect(tmuxCmd).toMatch(/--name gha-[0-9a-f]{8}/);
+      expect(core.saveState).toHaveBeenCalledWith('sessionName', expect.stringMatching(/^gha-[0-9a-f]{8}$/));
+    });
+
+    it('does not treat ready-without-ssh-command as ready', async () => {
+      // status is "ready" but the admin query failed, so there is no usable connect
+      // string yet. Declaring success here would print an empty command.
+      //
+      // The sequence MUST end in a terminal status. fsWithoutExitFiles() removes
+      // both exit files and `detached` defaults to false, so run() proceeds into
+      // monitorSession() - a sequence that stayed `ready` would never return.
+      fsWithoutExitFiles();
+      baselineShell(noDetail, noDetail, readySession(), endedResponse);
+
+      await run();
+
+      expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
+      // Proves readiness actually rejected the two detail-less responses rather
+      // than succeeding on the first.
+      expect(sessionInfoCalls()).toBeGreaterThanOrEqual(3);
+    });
+
+    it('ends monitoring on ended, including after a crash', async () => {
+      // Ready first so startup succeeds, then ended - a terminal status supplied
+      // during startup would fail readiness instead of exercising monitoring.
+      // Without this the continue-file shortcut ends the loop before the terminal
+      // response is ever read.
+      fsWithoutExitFiles();
+      baselineShell(readySession(), JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', reason: 'unknown', signal: 'SIGKILL'}));
+
+      await run();
+
+      expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+      expect(core.info).toHaveBeenCalledWith('Signal: SIGKILL');
+    });
+
+    it('ends monitoring on disconnected with its own message', async () => {
+      fsWithoutExitFiles();
+      baselineShell(readySession(), JSON.stringify({name: 'gha-3f9a1c05', status: 'disconnected', sessionId: 's1'}));
+
+      await run();
+
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('lost its connection to the server'));
+    });
+
+    it('reuses the readiness result in detached mode instead of re-querying', async () => {
+      // A transient admin-query failure straight after readiness must not fail a
+      // healthy session.
+      when(core.getInput).calledWith('detached').mockReturnValue('true');
+      // Detached mode returns before monitoring, so no terminal response is needed.
+      baselineShell(readySession(), noDetail);
+
+      await run();
+
+      expect(core.saveState).toHaveBeenCalledWith('message', 'SSH: ssh user@session123.upterm.dev');
+      expect(core.setFailed).not.toHaveBeenCalled();
+    });
   });
 
   describe('detached mode', () => {
@@ -818,18 +839,12 @@ describe('upterm GitHub integration', () => {
     it('should save state and set outputs then exit early', async () => {
       when(core.getInput).calledWith('detached').mockReturnValue('true');
 
-      mockedExecShellCommand.mockImplementation((cmd: string) => {
-        if (cmd.includes('upterm session current')) {
-          return Promise.resolve('SSH Session: ssh user@session123.upterm.dev');
-        }
-        return Promise.resolve('success');
-      });
+      baselineShell(readySession());
 
       await run();
 
       expect(core.saveState).toHaveBeenCalledWith('isPost', 'true');
       expect(core.saveState).toHaveBeenCalledWith('message', expect.stringContaining('ssh user@session123.upterm.dev'));
-      expect(core.saveState).toHaveBeenCalledWith('socketPath', expect.any(String));
       expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
       expect(core.info).toHaveBeenCalledWith('Detached mode: workflow will continue while upterm session is active');
     });
@@ -837,31 +852,29 @@ describe('upterm GitHub integration', () => {
     it('should enter normal monitoring loop when detached is false', async () => {
       when(core.getInput).calledWith('detached').mockReturnValue('false');
 
-      mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
       await run();
 
       expect(core.saveState).toHaveBeenCalledWith('isPost', 'true');
-      expect(core.setOutput).not.toHaveBeenCalled();
+      // Detached mode is the only thing that saves a message for the post step.
+      expect(core.saveState).not.toHaveBeenCalledWith('message', expect.anything());
       expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
     });
 
-    it('should fail when session info cannot be retrieved', async () => {
+    it('should fail when the session never becomes usable', async () => {
       when(core.getInput).calledWith('detached').mockReturnValue('true');
 
-      mockedExecShellCommand.mockImplementation((cmd: string) => {
-        if (cmd.includes('upterm session current')) {
-          return Promise.resolve('Invalid output without SSH info');
-        }
-        return Promise.resolve('success');
-      });
+      // "ready" straight from the record, with no connect string - never usable,
+      // so readiness must exhaust its retries and fail with diagnostics rather
+      // than hand detached mode a session nobody can reach.
+      baselineShell(noDetail);
 
       await run();
 
-      expect(core.setFailed).toHaveBeenCalledWith('Failed to get upterm session information');
-
-      // Verify the retry loop waited at least 60s total
-      const totalMs = mockedSleep.mock.calls.map(c => c[0]).reduce((sum, ms) => sum + ms, 0);
-      expect(totalMs).toBeGreaterThanOrEqual(60000);
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Upterm did not become ready after maximum retries'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Session name: gha-'));
+      expect(core.saveState).not.toHaveBeenCalledWith('message', expect.anything());
+      // One lookup per readiness retry.
+      expect(sessionInfoCalls()).toBeGreaterThanOrEqual(10);
     });
   });
 
@@ -875,10 +888,10 @@ describe('upterm GitHub integration', () => {
       });
     });
 
-    it('should wait for session and exit when socket disappears', async () => {
+    it('should wait for session and exit when the session ends', async () => {
       when(core.getState).calledWith('isPost').mockReturnValue('true');
       when(core.getState).calledWith('message').mockReturnValue('SSH: ssh user@session.upterm.dev');
-      when(core.getState).calledWith('socketPath').mockReturnValue('/run/user/1000/upterm/test.sock');
+      when(core.getState).calledWith('sessionName').mockReturnValue('gha-3f9a1c05');
       when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
 
       mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
@@ -886,23 +899,19 @@ describe('upterm GitHub integration', () => {
         if (pathStr === '/continue' || pathStr.includes('continue')) {
           return false;
         }
-        if (pathStr.includes('upterm')) {
-          return false;
-        }
         return true;
       });
-      (mockFs.readdirSync as jest.Mock).mockReturnValue([]);
-      mockedExecShellCommand.mockReturnValue(Promise.resolve(''));
+      baselineShell(endedResponse);
 
       await run();
 
       expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+      expect(core.info).toHaveBeenCalledWith('Reason: session_ended');
     });
 
     it('should return early when not in detached mode', async () => {
       when(core.getState).calledWith('isPost').mockReturnValue('true');
       when(core.getState).calledWith('message').mockReturnValue('');
-      when(core.getState).calledWith('socketPath').mockReturnValue('');
 
       await run();
 
@@ -913,18 +922,11 @@ describe('upterm GitHub integration', () => {
     it('should exit when continue file is created', async () => {
       when(core.getState).calledWith('isPost').mockReturnValue('true');
       when(core.getState).calledWith('message').mockReturnValue('SSH: ssh user@session.upterm.dev');
-      when(core.getState).calledWith('socketPath').mockReturnValue('/run/user/1000/upterm/test.sock');
+      when(core.getState).calledWith('sessionName').mockReturnValue('gha-3f9a1c05');
       when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('10');
 
-      mockFs.existsSync.mockImplementation((path: fs.PathLike) => {
-        const pathStr = path.toString();
-        if (pathStr === '/continue' || pathStr.includes('continue')) {
-          return true;
-        }
-        return true;
-      });
-      (mockFs.readdirSync as jest.Mock).mockReturnValue(['test.sock']);
-      mockedExecShellCommand.mockReturnValue(Promise.resolve(''));
+      mockFs.existsSync.mockReturnValue(true);
+      baselineShell(readySession());
 
       await run();
 
@@ -946,12 +948,6 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('detached').mockReturnValue('false');
     when(core.getState).calledWith('isPost').mockReturnValue('');
 
-    mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm session current')) {
-        return Promise.resolve('ssh test@upterm.dev');
-      }
-      return Promise.resolve('foobar');
-    });
     await run();
 
     // Check that timeout script was created with correct timeout value

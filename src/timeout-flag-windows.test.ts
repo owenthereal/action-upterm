@@ -112,14 +112,13 @@ function baselineInputs(): void {
  * `session info` must return JSON - a bare 'foobar' would make getSession()
  * throw a JSON parse error rather than exercise the path under test.
  *
- * The `session current` branch is still here because production still uses it
- * until Task 7. Task 7 Step 9 removes it.
+ * Responses are consumed one per lookup; the last one repeats forever, so a
+ * sequence ending in a terminal status keeps monitorSession() bounded.
  */
 function baselineShell(...sessionResponses: string[]): void {
   const queue = sessionResponses.length ? [...sessionResponses] : [readySession()];
   mockedExecShellCommand.mockImplementation(async (cmd: string) => {
     if (cmd.includes('upterm version')) return 'Upterm version v0.30.0\n';
-    if (cmd.includes('session current')) return 'ssh user@session123.upterm.dev';
     if (cmd.includes('session info')) return queue.length > 1 ? (queue.shift() as string) : queue[0];
     return 'foobar';
   });
@@ -192,21 +191,19 @@ describe('isTimeoutReached on Windows', () => {
     // The flag file exists on disk. Node can only see it via the native
     // drive-letter path (C:/...); the MSYS "/c/..." form resolves to a
     // different, non-existent location and must therefore appear absent.
-    let socketReads = 0;
-    (mockFs.readdirSync as jest.Mock).mockImplementation(() => (++socketReads <= 12 ? ['upterm.sock'] : []));
     mockFs.existsSync.mockImplementation((p: fs.PathLike) => {
       const s = p.toString();
       if (s.includes('id_rsa') || s.includes('id_ed25519')) return false; // force SSH key generation
       if (s.endsWith('upterm.exe')) return true; // downloaded binary is present
       if (s.includes('continue')) return false; // no /continue file
       if (s.includes('timeout-flag')) return !s.startsWith('/c/'); // visible only via the native path
-      return true; // directories, socket dir, etc.
+      return true; // directories, logs, etc.
     });
 
     await run();
 
-    // With the buggy "/c/..." path this is never logged; the timeout would be
-    // misreported as "'upterm' quit" once bash's kill-server drops the socket.
+    // With the buggy "/c/..." path this is never logged; the session stays
+    // "ready" forever and the timeout is never reported.
     expect(core.info).toHaveBeenCalledWith(TIMEOUT_MESSAGE);
   });
 
@@ -219,8 +216,6 @@ describe('isTimeoutReached on Windows', () => {
     (mockFs.rmSync as jest.Mock).mockImplementation((p: fs.PathLike) => {
       if (p.toString().includes('timeout-flag')) flagCleared = true;
     });
-    let socketReads = 0;
-    (mockFs.readdirSync as jest.Mock).mockImplementation(() => (++socketReads <= 6 ? ['upterm.sock'] : []));
     mockFs.existsSync.mockImplementation((p: fs.PathLike) => {
       const s = p.toString();
       if (s.includes('id_rsa') || s.includes('id_ed25519')) return false;
@@ -229,11 +224,13 @@ describe('isTimeoutReached on Windows', () => {
       if (s.includes('timeout-flag')) return !flagCleared && !s.startsWith('/c/'); // stale until cleared
       return true;
     });
+    // The loop needs some other way out, so end the session after readiness.
+    baselineShell(readySession(), JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', reason: 'session_ended'}));
 
     await run();
 
     // The stale flag is removed at the native path, and no timeout is reported
-    // (the run exits via "'upterm' quit" once the socket disappears).
+    // (the run exits via "'upterm' quit" when the session reports it ended).
     expect(mockFs.rmSync).toHaveBeenCalledWith(NATIVE_TIMEOUT_FLAG, expect.objectContaining({force: true}));
     expect(core.info).not.toHaveBeenCalledWith(TIMEOUT_MESSAGE);
   });

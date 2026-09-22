@@ -6,7 +6,7 @@ import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
 import {execShellCommand, launchOutsideJobObject, shellEscape, sleep} from './helpers';
-import {isUptermVersionSupported, parseUptermVersion} from './session';
+import {generateSessionName, getSession, isTerminal, isUptermVersionSupported, parseUptermVersion, SessionInfo} from './session';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
@@ -90,6 +90,25 @@ function getUptermDirs(): UptermDirs {
     timeoutFlag: path.join(base, 'timeout-flag') // Flag file for timeout detection
   };
   return uptermDirsCache;
+}
+
+// Cache for getSessionName(); the name must be identical for every call within
+// a process, and identical across main and post.
+let sessionNameCache: string | null = null;
+
+/**
+ * This run's session name.
+ *
+ * Minted once in main and saved as state, so the post process - a separate Node
+ * process - addresses the same session rather than inventing a new name that
+ * matches nothing.
+ */
+function getSessionName(): string {
+  if (sessionNameCache) return sessionNameCache;
+  const saved = core.getState('sessionName');
+  sessionNameCache = saved || generateSessionName();
+  if (!saved) core.saveState('sessionName', sessionNameCache);
+  return sessionNameCache;
 }
 
 /**
@@ -249,11 +268,10 @@ export async function run() {
     await installDependencies();
     await assertSupportedUptermVersion();
     await setupSSH();
-    await startUptermSession();
+    const session = await startUptermSession();
 
-    const detached = core.getInput('detached');
-    if (detached === 'true') {
-      await runDetachedMode();
+    if (core.getInput('detached') === 'true') {
+      await runDetachedMode(session);
       return;
     }
 
@@ -489,7 +507,13 @@ setw -g aggressive-resize on
   const tmuxConfFlagInner = `-f ${tmuxConfPathPosix}`;
 
   try {
-    const tmuxCmd = `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -f read-only -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`;
+    const tmuxCmd = `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --name ${getSessionName()} --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -f read-only -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`;
+
+    // Evidence for the post step that process teardown is warranted. isPost is
+    // saved before installDependencies(), so without this a failed download or
+    // a rejected upterm version would reach finalizeSession() and kill the
+    // shared default tmux server.
+    core.saveState('sessionStarted', 'true');
 
     if (process.platform === 'win32') {
       // On Windows, launch the tmux/upterm process tree outside the
@@ -564,27 +588,25 @@ async function setupSessionTimeout(waitTimeoutMinutes: string): Promise<void> {
 
 async function collectDiagnostics(): Promise<string> {
   const dirs = getUptermDirs();
-  const uptermDir = getUptermSocketDir();
-  let diagnostics = 'Failed to start upterm - socket not found after maximum retries.\n\nDiagnostics:\n';
+  const name = getSessionName();
+  let diagnostics = 'Upterm did not become ready after maximum retries.\n\nDiagnostics:\n';
 
   diagnostics += `- Upterm data directory: ${dirs.base}\n`;
-  diagnostics += `- Expected socket directory: ${uptermDir}\n`;
+  diagnostics += `- Session name: ${name}\n`;
 
-  if (fs.existsSync(uptermDir)) {
-    const files = fs.readdirSync(uptermDir);
-    diagnostics += `- Socket directory contains: ${files.join(', ')}\n`;
+  const session = await getSession(name).catch(error => {
+    diagnostics += `- Session lookup failed: ${error}\n`;
+    return null;
+  });
 
-    const logPath = path.join(uptermDir, 'upterm.log');
-    if (fs.existsSync(logPath)) {
-      try {
-        const logContent = fs.readFileSync(logPath, 'utf8');
-        diagnostics += `- Upterm log:\n${logContent}\n`;
-      } catch (error) {
-        diagnostics += `- Could not read upterm.log: ${error}\n`;
-      }
-    }
-  } else {
-    diagnostics += '- Socket directory does not exist\n';
+  diagnostics += `- Session status: ${session ? session.status : 'no session record found'}\n`;
+  if (session && !session.hasLiveDetail) diagnostics += '- Upterm answered from its record only; its admin query did not succeed\n';
+  if (session?.reason) diagnostics += `- Reason: ${session.reason}\n`;
+
+  // upterm writes its log under XDG_STATE_HOME, not the runtime dir - the old
+  // path never existed, so this section was always silently omitted.
+  if (session?.logPath && fs.existsSync(session.logPath)) {
+    diagnostics += `- Upterm log:\n${fs.readFileSync(session.logPath, 'utf8')}\n`;
   }
 
   // Check tmux sessions
@@ -642,48 +664,45 @@ async function collectDiagnostics(): Promise<string> {
   return diagnostics;
 }
 
-async function waitForUptermReady(): Promise<void> {
+/**
+ * Wait until the session is genuinely usable.
+ *
+ * Readiness requires BOTH status === 'ready' AND live detail. upterm returns
+ * "ready" from the record alone when its admin query fails
+ * (cmd/upterm/command/session.go:485-488), and a "ready" session with no
+ * sshCommand is one nobody can connect to.
+ */
+async function waitForUptermReady(): Promise<SessionInfo> {
+  const name = getSessionName();
   let tries = UPTERM_READY_MAX_RETRIES;
+
   while (tries-- > 0) {
     core.info(`Waiting for upterm to be ready... (${UPTERM_READY_MAX_RETRIES - tries}/${UPTERM_READY_MAX_RETRIES})`);
-    if (uptermSocketExists()) return;
+    const session = await getSession(name);
+
+    if (session?.status === 'ready' && session.hasLiveDetail) return session;
+    if (session && isTerminal(session.status)) break;
+
     await sleep(UPTERM_SOCKET_POLL_INTERVAL);
   }
 
-  // Socket not found after retries, collect diagnostics
-  const diagnostics = await collectDiagnostics();
-  throw new Error(diagnostics);
+  throw new Error(await collectDiagnostics());
 }
 
-async function outputSshCommand(): Promise<string | null> {
-  try {
-    const socketPath = findUptermSocket();
-    if (!socketPath) {
-      core.warning('Could not find upterm socket to retrieve SSH command');
-      return null;
-    }
-
-    const sessionInfo = await execShellCommand(`upterm session current --admin-socket "${socketPath}"`);
-
-    // Parse SSH command from session info
-    const sshMatch = sessionInfo.match(/ssh\s+(\S+@\S+)/i);
-    if (sshMatch) {
-      const sshCommand = `ssh ${sshMatch[1]}`;
-      core.setOutput('ssh-command', sshCommand);
-
-      // Also write to job summary for easy retrieval via API
-      await core.summary.addHeading('Upterm SSH Connection').addCodeBlock(sshCommand, 'bash').addRaw(`\n\nConnect with: <code>${sshCommand}</code>`).write();
-
-      core.info(`SSH command available as output: ${sshCommand}`);
-      return sshCommand;
-    }
-  } catch (error) {
-    core.debug(`Failed to extract SSH command: ${error}`);
+async function outputSshCommand(session: SessionInfo): Promise<string | null> {
+  const sshCommand = session.sshCommand;
+  if (!sshCommand) {
+    core.warning('Upterm reported a session without an SSH command');
+    return null;
   }
-  return null;
+
+  core.setOutput('ssh-command', sshCommand);
+  await core.summary.addHeading('Upterm SSH Connection').addCodeBlock(sshCommand, 'bash').addRaw(`\n\nConnect with: <code>${sshCommand}</code>`).write();
+  core.info(`SSH command available as output: ${sshCommand}`);
+  return sshCommand;
 }
 
-async function startUptermSession(): Promise<void> {
+async function startUptermSession(): Promise<SessionInfo> {
   const allowedUsers = getAllowedUsers();
   const authorizedKeysParameter = buildAuthorizedKeysParameter(allowedUsers);
   const uptermServer = core.getInput('upterm-server');
@@ -696,8 +715,42 @@ async function startUptermSession(): Promise<void> {
     await setupSessionTimeout(waitTimeoutMinutes);
   }
 
-  await waitForUptermReady();
-  await outputSshCommand();
+  const session = await waitForUptermReady();
+  await outputSshCommand(session);
+  return session;
+}
+
+/** Log the end of a session, distinguishing an unreachable one from an exit. */
+function logSessionEnded(session: SessionInfo): void {
+  if (session.status === 'disconnected') {
+    // Unrecoverable in 0.30: the host keeps running but its connect string
+    // cannot connect (cmd/upterm/command/session.go:469-476).
+    core.warning('upterm lost its connection to the server; this session can no longer be reached');
+    return;
+  }
+  core.info("Exiting debugging session: 'upterm' quit");
+  if (session.reason && session.reason !== 'unknown') core.info(`Reason: ${session.reason}`);
+  if (session.exitCode !== undefined) core.info(`Exit code: ${session.exitCode}`);
+  if (session.signal) core.info(`Signal: ${session.signal}`);
+}
+
+/**
+ * One lookup per poll.
+ *
+ * Three outcomes, deliberately distinct. Collapsing 'unknown' into 'gone'
+ * would make a transient registry hiccup end a live debugging session - the
+ * exact failure this whole change exists to remove.
+ */
+type PollResult = {kind: 'session'; session: SessionInfo} | {kind: 'gone'} | {kind: 'unknown'};
+
+async function pollSession(): Promise<PollResult> {
+  try {
+    const session = await getSession(getSessionName());
+    return session ? {kind: 'session', session} : {kind: 'gone'};
+  } catch (error) {
+    core.debug(`Session lookup failed, treating as unknown: ${error}`);
+    return {kind: 'unknown'};
+  }
 }
 
 async function monitorSession(): Promise<void> {
@@ -710,63 +763,29 @@ async function monitorSession(): Promise<void> {
       break;
     }
 
-    // Check if timeout was reached before checking socket
+    // Check if timeout was reached before looking the session up
     if (isTimeoutReached()) {
       logTimeoutMessage();
       break;
     }
 
-    if (!uptermSocketExists()) {
+    const poll = await pollSession();
+    if (poll.kind === 'gone') {
       core.info("Exiting debugging session: 'upterm' quit");
       break;
     }
-
-    try {
-      const socketPath = findUptermSocket();
-      if (!socketPath) {
-        throw new Error('Socket file not found');
-      }
-      core.info(await execShellCommand(`upterm session current --admin-socket "${socketPath}"`));
-    } catch (error) {
-      // Check if this error is due to timeout before throwing
-      if (isTimeoutReached()) {
-        logTimeoutMessage();
+    if (poll.kind === 'session') {
+      if (isTerminal(poll.session.status)) {
+        logSessionEnded(poll.session);
         break;
       }
-      // For other connection issues, provide more context
-      const errorMessage = String(error);
-      if (errorMessage.includes('connection refused') || errorMessage.includes('No such file or directory')) {
-        core.error('Upterm session appears to have ended unexpectedly');
-        core.error(`Connection error: ${errorMessage}`);
-        core.info('This may indicate the upterm process crashed or was terminated externally');
-        break;
-      }
-      throw new Error(`Failed to get upterm session status: ${error}`);
+      if (poll.session.sshCommand) core.info(`Session ${poll.session.name} (${poll.session.status}): ${poll.session.sshCommand}`);
     }
+    // poll.kind === 'unknown' falls through: a lookup that failed is not a
+    // session that ended. The checks at the top of the loop remain the exits.
+
     await sleep(SESSION_STATUS_POLL_INTERVAL);
   }
-}
-
-function getUptermSocketDir(): string {
-  // We set XDG_RUNTIME_DIR to a deterministic path in createUptermSession()
-  // to ensure upterm creates sockets in a predictable, writable location
-  // across all platforms. This avoids issues where platform defaults
-  // (e.g., /run/user/<uid> on Linux) don't exist in CI environments.
-  return path.join(getUptermDirs().runtime, 'upterm');
-}
-
-function findUptermSocket(): string | null {
-  const uptermDir = getUptermSocketDir();
-  if (!fs.existsSync(uptermDir)) return null;
-
-  const socketFile = fs.readdirSync(uptermDir).find(file => file.endsWith('.sock'));
-  if (!socketFile) return null;
-
-  return toShellPath(path.join(uptermDir, socketFile));
-}
-
-function uptermSocketExists(): boolean {
-  return findUptermSocket() !== null;
 }
 
 function continueFileExists(): boolean {
@@ -778,8 +797,7 @@ function isTimeoutReached(): boolean {
   // This is a Node fs check, so it must use the native filesystem path.
   // getUptermTimeoutFlagPath() returns the MSYS "/c/..." form used by the bash
   // writer in setupSessionTimeout(); Node cannot resolve that on Windows (it
-  // maps to C:\c\...), so check the native path the flag actually lives at -
-  // mirroring how findUptermSocket() reads the upterm socket.
+  // maps to C:\c\...), so check the native path the flag actually lives at.
   return fs.existsSync(getUptermDirs().timeoutFlag);
 }
 
@@ -788,26 +806,20 @@ function logTimeoutMessage(): void {
   core.info('The session was automatically shut down to prevent unnecessary resource usage');
 }
 
-async function runDetachedMode(): Promise<void> {
+async function runDetachedMode(session: SessionInfo): Promise<void> {
   core.debug('Entering detached mode');
 
-  let sshCommand = await outputSshCommand();
-  for (let i = 0; !sshCommand && i < 12; i++) {
-    await sleep(SESSION_STATUS_POLL_INTERVAL);
-    sshCommand = await outputSshCommand();
-  }
-  if (!sshCommand) {
-    throw new Error('Failed to get upterm session information');
-  }
-
+  // waitForUptermReady() already proved this session has a usable connect
+  // string. Re-querying here would let a transient admin-query failure fail a
+  // healthy session moments after startup succeeded.
+  //
   // Emit the notice once; use plain text for the post-action loop
-  // to avoid creating duplicate annotations in the GitHub Actions UI
-  const message = `SSH: ${sshCommand}`;
+  // to avoid creating duplicate annotations in the GitHub Actions UI.
+  const message = `SSH: ${session.sshCommand}`;
   core.notice(message);
 
   // Save state for the POST action
   core.saveState('message', message);
-  core.saveState('socketPath', findUptermSocket() || '');
 
   console.log(message);
   core.info('Detached mode: workflow will continue while upterm session is active');
@@ -827,12 +839,11 @@ async function hasAnyoneConnectedYet(): Promise<boolean> {
 
 async function runPost(): Promise<void> {
   const message = core.getState('message');
-  const socketPath = core.getState('socketPath');
-
-  if (!message || !socketPath) {
+  if (!message) {
     // Not in detached mode or session wasn't started properly
     return;
   }
+  exportXdgEnvironment();
 
   const shutdown = () => {
     core.error('Got signal');
@@ -868,8 +879,10 @@ async function runPost(): Promise<void> {
       break;
     }
 
-    if (!uptermSocketExists()) {
-      core.info("Exiting debugging session: 'upterm' quit");
+    const session = await getSession(getSessionName());
+    if (!session || isTerminal(session.status)) {
+      if (session) logSessionEnded(session);
+      else core.info("Exiting debugging session: 'upterm' quit");
       break;
     }
 
