@@ -208,6 +208,27 @@ describe('upterm GitHub integration', () => {
     });
   });
 
+  describe('upterm version gate', () => {
+    it('fails with an actionable message when the pinned upterm is too old', async () => {
+      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.20.0');
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('upterm version') ? 'Upterm version v0.20.0\n' : ''));
+
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('requires upterm >= v0.30.0'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('v1.15.0'));
+    });
+
+    it('proceeds with a warning when the version string is unrecognized', async () => {
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('upterm version') ? 'Upterm version dev\n' : ''));
+
+      await run();
+
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Could not determine the installed upterm version'));
+      expect(core.setFailed).not.toHaveBeenCalledWith(expect.stringContaining('requires upterm'));
+    });
+  });
+
   it('should handle the main loop for windows x64', async () => {
     Object.defineProperty(process, 'platform', {
       value: 'win32'
@@ -239,7 +260,7 @@ describe('upterm GitHub integration', () => {
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
 
     // Check SSH key generation
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(3, expect.stringContaining('ssh-keygen -q -t rsa'));
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('ssh-keygen -q -t rsa'));
 
     // Check upterm session creation via WMI on Windows
     expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}));
@@ -310,10 +331,10 @@ describe('upterm GitHub integration', () => {
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
 
     // Check SSH key generation
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, expect.stringContaining('ssh-keygen -q -t rsa'));
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('ssh-keygen -q -t rsa'));
 
     // Check upterm session creation with tmux config
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(3, expect.stringContaining('tmux -f'));
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('tmux -f'));
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
@@ -386,10 +407,10 @@ describe('upterm GitHub integration', () => {
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
 
     // Check SSH key generation
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, expect.stringContaining('ssh-keygen -q -t rsa'));
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('ssh-keygen -q -t rsa'));
 
     // Check upterm session creation with tmux config
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(3, expect.stringContaining('tmux -f'));
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('tmux -f'));
 
     expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
@@ -425,7 +446,7 @@ describe('upterm GitHub integration', () => {
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
 
     // Check SSH key generation
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(3, expect.stringContaining('ssh-keygen -q -t rsa'));
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('ssh-keygen -q -t rsa'));
 
     // Check upterm session creation via WMI on Windows
     expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}));
@@ -498,10 +519,10 @@ describe('upterm GitHub integration', () => {
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'brew install tmux');
 
     // Check SSH key generation
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, expect.stringContaining('ssh-keygen -q -t rsa'));
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('ssh-keygen -q -t rsa'));
 
     // Check upterm session creation with tmux config
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(3, expect.stringContaining('tmux -f'));
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('tmux -f'));
     expect(core.info).toHaveBeenNthCalledWith(1, 'Creating a new session. Connecting to upterm server ssh://myserver:22');
     expect(core.info).toHaveBeenNthCalledWith(2, 'Waiting for upterm to be ready... (1/10)');
     expect(core.info).toHaveBeenNthCalledWith(3, expect.stringContaining('SSH command available as output'));

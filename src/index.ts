@@ -6,6 +6,7 @@ import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
 import {execShellCommand, launchOutsideJobObject, shellEscape, sleep} from './helpers';
+import {isUptermVersionSupported, parseUptermVersion} from './session';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
@@ -201,6 +202,7 @@ export async function run() {
     core.saveState('isPost', 'true');
 
     await installDependencies();
+    await assertSupportedUptermVersion();
     await setupSSH();
     await startUptermSession();
 
@@ -292,6 +294,30 @@ async function installDependencies(): Promise<void> {
     };
     const guidance = platformGuidance[process.platform] || '';
     throw new Error(`Failed to install dependencies on ${process.platform}: ${error}\n\n` + (guidance ? `Tip: ${guidance}` : ''));
+  }
+}
+
+/**
+ * Refuse to run against an upterm older than 0.30.
+ *
+ * The action addresses its session with `--name` and `upterm session info NAME
+ * -o json`, neither of which exists before 0.30. Failing here beats failing
+ * later with a socket that was never going to be found.
+ */
+async function assertSupportedUptermVersion(): Promise<void> {
+  const output = await execShellCommand('upterm version');
+  const version = parseUptermVersion(output);
+
+  if (!version) {
+    core.warning(`Could not determine the installed upterm version from: ${output.trim()}. Continuing, but this action requires upterm >= v0.30.0.`);
+    return;
+  }
+
+  if (!isUptermVersionSupported(version)) {
+    throw new Error(
+      `action-upterm requires upterm >= v0.30.0 (found v${version.major}.${version.minor}.${version.patch}). ` +
+        `Remove the upterm-version input to use the latest release, or pin owenthereal/action-upterm@v1.15.0 to keep using an older upterm.`
+    );
   }
 }
 
