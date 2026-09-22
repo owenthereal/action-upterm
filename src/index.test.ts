@@ -287,7 +287,7 @@ describe('upterm GitHub integration', () => {
     expect(mockFs.writeFileSync).toHaveBeenCalledWith(path.join(UPTERM_DATA_DIR, 'tmux.conf'), expect.stringContaining('set-environment -g XDG_RUNTIME_DIR'));
 
     expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/30)');
     expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
     expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
@@ -342,7 +342,7 @@ describe('upterm GitHub integration', () => {
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('tmux -f'));
 
     expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/30)');
     expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
     expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
@@ -410,7 +410,7 @@ describe('upterm GitHub integration', () => {
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('tmux -f'));
 
     expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/30)');
     expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
     expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
@@ -443,7 +443,7 @@ describe('upterm GitHub integration', () => {
     expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}), UPTERM_DATA_DIR);
 
     expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/30)');
     expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
     expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
@@ -509,7 +509,7 @@ describe('upterm GitHub integration', () => {
     // Check upterm session creation with tmux config
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('tmux -f'));
     expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/10)');
+    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/30)');
     expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
     expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
@@ -901,7 +901,7 @@ describe('upterm GitHub integration', () => {
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Session name: gha-'));
       expect(core.saveState).not.toHaveBeenCalledWith('message', expect.anything());
       // One lookup per readiness retry.
-      expect(sessionInfoCalls()).toBeGreaterThanOrEqual(10);
+      expect(sessionInfoCalls()).toBeGreaterThanOrEqual(30);
     });
   });
 
@@ -984,6 +984,77 @@ describe('upterm GitHub integration', () => {
       expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
     });
 
+    it('warns about a persistently failing lookup without spending the countdown', async () => {
+      // 'unknown' skips every break AND the countdown, so a lookup that fails on
+      // every iteration leaves the loop with no exit at all. core.debug is
+      // invisible at default verbosity, so the only symptom was a number that
+      // never moved. The deferral stays (spending the countdown could kill a
+      // session someone attached to before any poll succeeded) - the failure
+      // just has to be VISIBLE.
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        throw new Error('Command failed with exit code 2\nStderr: registry unavailable');
+      });
+      // Run past the 12 waits a 1-minute timeout would take, so the countdown
+      // assertion below is a real one, and past the 12th consecutive failure so
+      // the periodic repeat fires too.
+      mockFs.existsSync.mockImplementation(() => polls >= 18);
+
+      await run();
+
+      expect(polls).toBeGreaterThanOrEqual(18);
+      // Loud, and it names the actual error rather than just "unknown".
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Could not query the upterm session (attempt 1)'));
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('registry unavailable'));
+      const lookupWarnings = core.warning.mock.calls.filter(c => String(c[0]).includes('Could not query the upterm session'));
+      // First failure, then periodically - not once per poll, which would bury
+      // the log it exists to make readable.
+      expect(lookupWarnings.length).toBeGreaterThanOrEqual(2);
+      expect(lookupWarnings.length).toBeLessThan(polls);
+      // The countdown still does NOT advance on an unknown.
+      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
+    });
+
+    it('stops the countdown once upterm confirms a guest connected', async () => {
+      // The branch that decides whether an attached developer's session survives
+      // the wait-timeout. guestCount >= 1 with live detail latches
+      // anyoneConnected, which both freezes the countdown and switches the log
+      // to "Waiting for session to end".
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        return readySession({guestCount: 1});
+      });
+      // A 1-minute timeout expires after 12 completed waits, so run past that.
+      mockFs.existsSync.mockImplementation(() => polls >= 18);
+      // The loop reports progress through console.log, not core.*; collect the
+      // lines as they are written, since mockRestore() would discard them.
+      const lines: string[] = [];
+      const log = jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+        lines.push(String(args[0]));
+      });
+
+      try {
+        await run();
+      } finally {
+        log.mockRestore();
+      }
+
+      expect(polls).toBeGreaterThanOrEqual(18);
+      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
+      expect(lines.some(l => l.startsWith('Waiting for session to end'))).toBe(true);
+      expect(lines.some(l => l.includes('Waiting for client to connect'))).toBe(false);
+    });
+
     it('still counts down when upterm confirms nobody has connected', async () => {
       postState();
       when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
@@ -1009,6 +1080,10 @@ describe('upterm GitHub integration', () => {
       const killIndex = mockedExecShellCommand.mock.calls.findIndex(c => c[0].includes('kill-server'));
       expect(killIndex).toBeGreaterThanOrEqual(0);
       expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-runtime-abc', {recursive: true, force: true});
+      // Post must RESTORE main's directories, never mint its own: fresh ones
+      // would point nowhere, and teardown would then remove the wrong paths
+      // while the real session's files survive.
+      expect(mockFs.mkdtempSync).not.toHaveBeenCalled();
       // The runtime dir holds the live sockets; removing it first would unlink
       // them out from under a still-running host.
       expect(mockedExecShellCommand.mock.invocationCallOrder[killIndex]).toBeLessThan(mockFs.rmSync.mock.invocationCallOrder[0]);
@@ -1148,8 +1223,25 @@ describe('upterm GitHub integration', () => {
 
       // session info resolves the record through XDG_STATE_HOME; if the action's
       // own shell disagrees with the host, a live session reports as missing.
-      expect(process.env.XDG_STATE_HOME).toContain('upterm-action-');
-      expect(process.env.XDG_RUNTIME_DIR).toContain('upterm-runtime-');
+      // Assert the EXACT values: state and config both live under the base dir,
+      // so a substring match on 'upterm-action-' cannot tell them apart - and
+      // would not notice the two being swapped, or config never being set.
+      expect(process.env.XDG_STATE_HOME).toBe(path.join(UPTERM_DATA_DIR, 'state'));
+      expect(process.env.XDG_CONFIG_HOME).toBe(path.join(UPTERM_DATA_DIR, 'config'));
+      expect(process.env.XDG_RUNTIME_DIR).toBe(UPTERM_RUNTIME_DIR);
+    });
+
+    it('writes the same XDG values into tmux.conf that it exported', async () => {
+      await run();
+
+      // The host publishes its record under the tmux.conf XDG_STATE_HOME; every
+      // later `session info` resolves it through the exported one. They are
+      // derived from a single conversion for exactly this reason - two copies
+      // would agree only by coincidence, and diverge on one platform only.
+      const tmuxConf = (mockFs.writeFileSync as jest.Mock).mock.calls.find(c => String(c[0]).endsWith('tmux.conf'))?.[1] as string;
+      expect(tmuxConf).toContain(`set-environment -g XDG_STATE_HOME "${process.env.XDG_STATE_HOME}"`);
+      expect(tmuxConf).toContain(`set-environment -g XDG_CONFIG_HOME "${process.env.XDG_CONFIG_HOME}"`);
+      expect(tmuxConf).toContain(`set-environment -g XDG_RUNTIME_DIR "${process.env.XDG_RUNTIME_DIR}"`);
     });
 
     it('saves the directories for the post process', async () => {

@@ -10,9 +10,17 @@ import {generateSessionName, getSession, isTerminal, isUptermVersionSupported, p
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
-const UPTERM_SOCKET_POLL_INTERVAL = 1000;
-const UPTERM_READY_MAX_RETRIES = 10;
+const UPTERM_READY_POLL_INTERVAL = 1000;
+// Readiness now requires upterm's second, unlocked admin round-trip to have
+// succeeded - strictly harder than the old "does a socket inode exist" check,
+// and a slow first attempt costs a whole retry. A wider budget costs nothing on
+// the happy path (the loop returns on its first success) and the alternative is
+// a hard failure on a session that was about to be fine.
+const UPTERM_READY_MAX_RETRIES = 30;
 const SESSION_STATUS_POLL_INTERVAL = 5000;
+// Consecutive failed lookups between warnings, ~1 minute at the 5s poll
+// interval. The first failure always warns.
+const UNKNOWN_POLL_WARN_INTERVAL = 12;
 const SUPPORTED_UPTERM_ARCHITECTURES = ['amd64', 'arm64'] as const;
 const TMUX_DIMENSIONS = {width: 132, height: 43};
 // Delay (in milliseconds) to allow upterm sufficient time to initialize before proceeding.
@@ -111,22 +119,45 @@ function getSessionName(): string {
   return sessionNameCache;
 }
 
+/** The XDG values in the form upterm and the shell expect them. */
+interface XdgPaths {
+  runtime: string;
+  state: string;
+  config: string;
+}
+
 /**
  * Export XDG_* to this process so the action's own `upterm session info` calls
- * resolve the same session record the host published to.
+ * resolve the same session record the host published to, and return the
+ * converted values for anyone who needs to write them somewhere else.
  *
  * upterm finds a session's record through XDG_STATE_HOME
  * (cmd/upterm/command/session.go:425). Until now the action only set these
  * inside tmux.conf, because every query passed --admin-socket explicitly.
  * execShellCommand inherits process.env on both platforms (helpers.ts:26-34),
  * so one assignment covers every call site, in main and in post alike.
+ *
+ * The conversion lives here and only here. XDG_STATE_HOME must agree exactly
+ * between the host process (which publishes the record) and every query (which
+ * resolves it); a second copy of `win32 ? toMsys2Path : toShellPath` elsewhere
+ * would agree only by coincidence, and diverge silently - on one platform only
+ * - the first time either copy is edited.
  */
-function exportXdgEnvironment(): void {
+function exportXdgEnvironment(): XdgPaths {
   const dirs = getUptermDirs();
+  // On Windows, upterm.exe expects POSIX-style paths in XDG vars (e.g., /c/Users/... not C:/Users/...)
   const convert = process.platform === 'win32' ? toMsys2Path : toShellPath;
-  process.env.XDG_RUNTIME_DIR = convert(dirs.runtime);
-  process.env.XDG_STATE_HOME = convert(dirs.state);
-  process.env.XDG_CONFIG_HOME = convert(dirs.config);
+  const xdg: XdgPaths = {
+    runtime: convert(dirs.runtime),
+    state: convert(dirs.state),
+    config: convert(dirs.config)
+  };
+
+  process.env.XDG_RUNTIME_DIR = xdg.runtime;
+  process.env.XDG_STATE_HOME = xdg.state;
+  process.env.XDG_CONFIG_HOME = xdg.config;
+
+  return xdg;
 }
 
 // Utility Functions
@@ -464,7 +495,10 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
   fs.mkdirSync(dirs.runtime, {recursive: true});
   fs.mkdirSync(dirs.state, {recursive: true});
   fs.mkdirSync(dirs.config, {recursive: true});
-  exportXdgEnvironment();
+  // The same triple that goes into this process's environment goes into
+  // tmux.conf below: the host and every later query must agree on XDG_STATE_HOME
+  // or the session record cannot be resolved.
+  const xdg = exportXdgEnvironment();
   core.debug(`Created upterm directories under ${dirs.base}`);
 
   // Remove any stale timeout flag left in a reused temp directory (e.g. on a
@@ -473,21 +507,17 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
   // timeout for this fresh session before its timer has even been armed.
   fs.rmSync(dirs.timeoutFlag, {force: true});
 
-  // On Windows, upterm.exe expects POSIX-style paths in XDG vars (e.g., /c/Users/... not C:/Users/...)
-  const xdgPathConverter = process.platform === 'win32' ? toMsys2Path : toShellPath;
-  const xdgRuntimeDir = xdgPathConverter(dirs.runtime);
-  const xdgStateHome = xdgPathConverter(dirs.state);
-  const xdgConfigHome = xdgPathConverter(dirs.config);
-
   // Create custom tmux config that sets XDG environment variables globally
   // Using a custom config file ensures both outer and inner tmux sessions get the same config
   const tmuxConf = `# Set XDG directories for upterm
-set-environment -g XDG_RUNTIME_DIR "${xdgRuntimeDir}"
-set-environment -g XDG_STATE_HOME "${xdgStateHome}"
-set-environment -g XDG_CONFIG_HOME "${xdgConfigHome}"
+set-environment -g XDG_RUNTIME_DIR "${xdg.runtime}"
+set-environment -g XDG_STATE_HOME "${xdg.state}"
+set-environment -g XDG_CONFIG_HOME "${xdg.config}"
 
-# Allow UPTERM_ADMIN_SOCKET to be inherited from client environment
-# This enables 'upterm session current' to work without --admin-socket flag
+# Allow UPTERM_ADMIN_SOCKET to be inherited from client environment.
+# The action itself no longer runs 'upterm session current' - it addresses the
+# session by name - but a human who runs it from a shell inside the session
+# still needs the variable to reach their tmux client.
 set-option -ga update-environment " UPTERM_ADMIN_SOCKET"
 
 # Enable aggressive window resizing for better multi-client support
@@ -507,6 +537,10 @@ setw -g aggressive-resize on
   const tmuxConfFlagInner = `-f ${tmuxConfPathPosix}`;
 
   try {
+    // getSessionName() is interpolated raw, unlike every other value here:
+    // generateSessionName() produces `gha-` + 8 hex chars and nothing else, so
+    // it is shell-safe by construction. Any change that lets a name carry
+    // user input must wrap it in shellEscape(), as session.ts already does.
     const tmuxCmd = `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --name ${getSessionName()} --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -f read-only -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`;
 
     // Evidence for the post step that process teardown is warranted. isPost is
@@ -693,12 +727,32 @@ function guestPresence(session: SessionInfo | null): boolean | null {
  */
 type PollResult = {kind: 'session'; session: SessionInfo} | {kind: 'gone'} | {kind: 'unknown'};
 
+/**
+ * Consecutive failed lookups, reset by the first success.
+ *
+ * 'unknown' deliberately exits nothing and spends no countdown, so a lookup
+ * that fails on EVERY iteration leaves a loop with no exit and a log that
+ * repeats the same unchanging number. Warning makes that visible to a human who
+ * can act on it; the deferral itself is not negotiable, because spending the
+ * countdown on an unknown can shut down a session a developer is attached to.
+ */
+let consecutiveUnknownPolls = 0;
+
 async function pollSession(): Promise<PollResult> {
   try {
     const session = await getSession(getSessionName());
+    consecutiveUnknownPolls = 0;
     return session ? {kind: 'session', session} : {kind: 'gone'};
   } catch (error) {
-    core.debug(`Session lookup failed, treating as unknown: ${error}`);
+    consecutiveUnknownPolls++;
+    // Warn on the first failure, then roughly once a minute. core.debug alone is
+    // invisible at default verbosity, which is how this failure mode stayed
+    // silent.
+    if (consecutiveUnknownPolls === 1 || consecutiveUnknownPolls % UNKNOWN_POLL_WARN_INTERVAL === 0) {
+      core.warning(`Could not query the upterm session (attempt ${consecutiveUnknownPolls}): ${error}. Still waiting; the session may still be live.`);
+    } else {
+      core.debug(`Session lookup failed, treating as unknown: ${error}`);
+    }
     return {kind: 'unknown'};
   }
 }
@@ -728,7 +782,7 @@ async function waitForUptermReady(): Promise<SessionInfo> {
     // one hiccup abandon the remaining retries and fail the job - and would
     // skip collectDiagnostics(), the report written for precisely this case.
 
-    await sleep(UPTERM_SOCKET_POLL_INTERVAL);
+    await sleep(UPTERM_READY_POLL_INTERVAL);
   }
 
   throw new Error(await collectDiagnostics());

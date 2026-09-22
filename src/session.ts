@@ -51,8 +51,33 @@ export function isTerminal(status: SessionStatus): boolean {
   return TERMINAL_STATUSES.includes(status);
 }
 
+/**
+ * Parse `upterm session info -o json` output.
+ *
+ * execShellCommand resolves with EVERYTHING written to stdout, so the JSON can
+ * arrive with company: an upterm notice, or the /etc/profile chatter the
+ * Windows `bash -lc` *login* shell emits. Slice to the object rather than
+ * letting a stray line fail the parse.
+ *
+ * When it still cannot be parsed, say so and quote the output. A bare
+ * SyntaxError gets swallowed into 'unknown' by the caller's poll loop or burns
+ * the readiness retries, leaving no clue in the log about what upterm actually
+ * printed.
+ */
 export function parseSessionInfo(raw: string): SessionInfo {
-  const parsed = JSON.parse(raw);
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start === -1 || end < start) {
+    throw new Error(`Could not parse upterm session info output (no JSON object found): ${raw}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.slice(start, end + 1));
+  } catch (error) {
+    throw new Error(`Could not parse upterm session info output: ${error}\nOutput was: ${raw}`);
+  }
+
   return {
     ...parsed,
     // sshCommand is the marker: upterm only publishes it from a successful

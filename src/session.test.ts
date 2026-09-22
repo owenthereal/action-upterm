@@ -69,6 +69,28 @@ describe('parseSessionInfo', () => {
     expect(info.signal).toBe('SIGKILL');
     expect(info.hasLiveDetail).toBe(false);
   });
+
+  it('tolerates output printed around the JSON', () => {
+    // execShellCommand resolves with everything on stdout. On Windows the
+    // `bash -lc` login shell re-sources /etc/profile, whose output lands in
+    // front of the JSON; upterm can print notices too.
+    const info = parseSessionInfo(`/etc/profile: sourcing /etc/profile.d/msys2.sh\n${READY_WITH_DETAIL}\n`);
+    expect(info.status).toBe('ready');
+    expect(info.hasLiveDetail).toBe(true);
+    expect(info.sshCommand).toBe('ssh token@uptermd.upterm.dev');
+  });
+
+  it('names the problem and quotes the output when there is no JSON at all', () => {
+    // A bare SyntaxError here gets swallowed into 'unknown' by the poll loop or
+    // burns every readiness retry, with nothing in the log to explain it.
+    expect(() => parseSessionInfo('bash: upterm: command not found\n')).toThrow(/Could not parse upterm session info output/);
+    expect(() => parseSessionInfo('bash: upterm: command not found\n')).toThrow(/bash: upterm: command not found/);
+  });
+
+  it('names the problem and quotes the output when the JSON is malformed', () => {
+    expect(() => parseSessionInfo('{"name": "gha-3f9a1c05", }')).toThrow(/Could not parse upterm session info output/);
+    expect(() => parseSessionInfo('{"name": "gha-3f9a1c05", }')).toThrow(/"name": "gha-3f9a1c05"/);
+  });
 });
 
 describe('isTerminal', () => {
