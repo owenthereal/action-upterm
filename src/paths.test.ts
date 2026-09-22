@@ -5,6 +5,8 @@
  * platforms and execution contexts (bash, native executables, MSYS2 utilities).
  */
 
+import {shellEscape} from './helpers';
+
 describe('Path handling', () => {
   const originalPlatform = process.platform;
 
@@ -113,11 +115,9 @@ describe('Path handling', () => {
     });
   });
 
+  // The real export from ./helpers, not a copy: a local re-implementation can
+  // only ever test itself, and would keep passing after the shipped one broke.
   describe('shellEscape', () => {
-    const shellEscape = (value: string): string => {
-      return `'${value.replace(/'/g, "'\\''")}'`;
-    };
-
     it('should wrap strings in single quotes', () => {
       expect(shellEscape('hello world')).toBe("'hello world'");
       expect(shellEscape('file.txt')).toBe("'file.txt'");
@@ -163,11 +163,11 @@ describe('Path handling', () => {
         configurable: true
       });
 
-      const runtimeDir = 'C:/Users/foo/AppData/Local/Temp/upterm-data/runtime';
+      const runtimeDir = 'C:/Users/foo/AppData/Local/Temp/upterm-runtime-XXXXXX';
       let result = runtimeDir.replace(/\\/g, '/');
       result = result.replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`);
 
-      expect(result).toBe('/c/Users/foo/AppData/Local/Temp/upterm-data/runtime');
+      expect(result).toBe('/c/Users/foo/AppData/Local/Temp/upterm-runtime-XXXXXX');
     });
 
     it('should use toMsys2Path for shell redirects on Windows', () => {
@@ -176,17 +176,17 @@ describe('Path handling', () => {
         configurable: true
       });
 
-      const logPath = 'C:/temp/upterm-data/state/upterm-command.log';
+      const logPath = 'C:/temp/upterm-action-XXXXXX/state/upterm-command.log';
       let result = logPath.replace(/\\/g, '/');
       result = result.replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`);
 
-      expect(result).toBe('/c/temp/upterm-data/state/upterm-command.log');
+      expect(result).toBe('/c/temp/upterm-action-XXXXXX/state/upterm-command.log');
     });
 
     it('should preserve toShellPath format for tmux config when invoked from bash', () => {
-      const tmuxConfPath = 'C:/temp/upterm-data/tmux.conf';
+      const tmuxConfPath = 'C:/temp/upterm-action-XXXXXX/tmux.conf';
       const shellPath = tmuxConfPath.replace(/\\/g, '/');
-      expect(shellPath).toBe('C:/temp/upterm-data/tmux.conf');
+      expect(shellPath).toBe('C:/temp/upterm-action-XXXXXX/tmux.conf');
     });
   });
 });

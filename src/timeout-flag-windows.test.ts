@@ -12,8 +12,6 @@
 // has no drive letter, so toMsys2Path() is a no-op there and cannot reproduce
 // the bug.
 
-import {when} from 'jest-when';
-
 jest.mock('@actions/core');
 
 jest.mock('@actions/tool-cache', () => ({
@@ -98,15 +96,6 @@ function loadAction(): void {
   ({run} = require('.'));
 }
 
-function baselineInputs(): void {
-  when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
-  when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-  when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-  when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-  when(core.getInput).calledWith('upterm-version').mockReturnValue('');
-  when(core.getInput).calledWith('detached').mockReturnValue('false');
-}
-
 /**
  * Default shell responses. `upterm version` must satisfy the gate, and
  * `session info` must return JSON - a bare 'foobar' would make getSession()
@@ -121,26 +110,6 @@ function baselineShell(...sessionResponses: string[]): void {
     if (cmd.includes('upterm version')) return 'Upterm version v0.30.0\n';
     if (cmd.includes('session info')) return queue.length > 1 ? (queue.shift() as string) : queue[0];
     return 'foobar';
-  });
-}
-
-/**
- * Filesystem baseline for LIFECYCLE tests.
- *
- * The default existsSync returns true for everything but SSH keys, which makes
- * continueFileExists() true on the first poll - so a lifecycle test would exit
- * with "'/continue' file was created" before ever consuming its session
- * response. Any test asserting on ready/ended/disconnected must use this.
- */
-function fsWithoutExitFiles(): void {
-  mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
-    const p = filePath.toString();
-    if (p.includes('id_rsa') || p.includes('id_ed25519')) return false;
-    // CONTINUE_FILE_PATHS: '/continue' (unix), 'C:/msys64/continue' (win32),
-    // plus $GITHUB_WORKSPACE/continue.
-    if (p.endsWith('continue')) return false;
-    if (p.includes('timeout-flag')) return false;
-    return true;
   });
 }
 
@@ -159,10 +128,12 @@ describe('isTimeoutReached on Windows', () => {
     mockedLaunchOutsideJobObject.mockReturnValue(undefined);
     mockedSleep.mockResolvedValue(undefined);
 
-    baselineInputs();
     baselineShell();
-    fsWithoutExitFiles();
 
+    // Both tests below install their own existsSync implementation, so there is
+    // deliberately no shared filesystem baseline here. This getInput
+    // implementation replaces the mock wholesale, so a jest-when baseline would
+    // be discarded and only look live.
     (core.getInput as jest.Mock).mockImplementation((name: string) => {
       switch (name) {
         case 'upterm-server':
