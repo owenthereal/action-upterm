@@ -997,6 +997,11 @@ describe('upterm GitHub integration', () => {
 
     it('stops the session before removing its directories', async () => {
       postState();
+      // Without this, the shared beforeEach's existsSync makes continueFileExists()
+      // true on the first poll, and the loop would exit via the continue file
+      // before ever reaching the terminal-status check below - so the 'ended'
+      // response would not be what actually ends the loop.
+      fsWithoutExitFiles();
       mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('session info') ? JSON.stringify({name: 'gha-3f9a1c05', status: 'ended'}) : ''));
 
       await run();
@@ -1009,7 +1014,10 @@ describe('upterm GitHub integration', () => {
       expect(mockedExecShellCommand.mock.invocationCallOrder[killIndex]).toBeLessThan(mockFs.rmSync.mock.invocationCallOrder[0]);
     });
 
-    it('tears down even when the post-step lookup throws', async () => {
+    it('reaches teardown via the normal exit when the post-step lookup keeps failing', async () => {
+      // pollSession() swallows the lookup failure into 'unknown', so this loop
+      // exits normally (via the continue file), not via an exception. It does
+      // NOT exercise the finally - see the next test for that.
       postState();
       let polls = 0;
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
@@ -1024,6 +1032,24 @@ describe('upterm GitHub integration', () => {
       await run();
 
       expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
+    });
+
+    it('tears down even when the post-step lookup throws', async () => {
+      // Unlike pollSession(), which swallows a lookup failure into 'unknown',
+      // continueFileExists() calls fs.existsSync unguarded - a real fs error
+      // there (e.g. an intermittent read failure) escapes the try untouched.
+      // This is the case the try/finally exists for: without it, deleting the
+      // finally and simply appending finalizeSession() after the loop would
+      // never run, because the loop itself never returns normally.
+      postState();
+      mockFs.existsSync.mockImplementation(() => {
+        throw new Error("EIO: i/o error, stat '/continue'");
+      });
+
+      await run();
+
+      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
+      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-runtime-abc', {recursive: true, force: true});
     });
 
     it('does not fail the job when cleanup cannot remove a directory', async () => {
