@@ -99,19 +99,22 @@ export function shellEscape(value: string): string {
  *
  * @param cmd - The bash command to execute
  * @param env - Environment variables to pass to the command (PATH, etc.)
+ * @param scriptDir - Directory to write the launch script into
  * @throws Error if WMI launch fails
  */
-export function launchOutsideJobObject(cmd: string, env?: Record<string, string>): void {
+export function launchOutsideJobObject(cmd: string, env?: Record<string, string>, scriptDir?: string): void {
   core.debug(`Launching outside Job Object: [${cmd}]`);
 
   if (process.platform !== 'win32') {
     throw new Error('launchOutsideJobObject is only supported on Windows');
   }
 
-  // Write the command to a script file to avoid quoting hell
-  const scriptDir = path.join(os.tmpdir(), 'upterm-data');
-  fs.mkdirSync(scriptDir, {recursive: true});
-  const scriptPath = path.join(scriptDir, 'wmi-launch.sh');
+  // Private per-run directory, not a shared fixed one: two concurrent Windows
+  // invocations would otherwise race on a single wmi-launch.sh holding the
+  // expanded --github-user allow-list.
+  const dir = scriptDir || path.join(os.tmpdir(), 'upterm-data');
+  fs.mkdirSync(dir, {recursive: true});
+  const scriptPath = path.join(dir, 'wmi-launch.sh');
 
   // Build environment export lines.  On Windows, paths must be converted
   // from Windows format (backslashes, semicolons) to POSIX format

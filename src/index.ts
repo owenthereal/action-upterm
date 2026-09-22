@@ -528,10 +528,14 @@ setw -g aggressive-resize on
       // MSYSTEM and CHERE_INVOKING are set by the launch script itself
       // (the WMI-spawned process has a minimal environment), so we only
       // need to forward PATH and HOME here.
-      launchOutsideJobObject(tmuxCmd, {
-        PATH: process.env.PATH || '',
-        HOME: process.env.USERPROFILE || os.homedir()
-      });
+      launchOutsideJobObject(
+        tmuxCmd,
+        {
+          PATH: process.env.PATH || '',
+          HOME: process.env.USERPROFILE || os.homedir()
+        },
+        getUptermDirs().base
+      );
     } else {
       await execShellCommand(tmuxCmd);
     }
@@ -662,6 +666,22 @@ async function collectDiagnostics(): Promise<string> {
 
   diagnostics += '\nPlease report this issue with the above diagnostics at: https://github.com/owenthereal/action-upterm/issues';
   return diagnostics;
+}
+
+/**
+ * Report whether a guest has joined: true, false, or null for UNKNOWN.
+ *
+ * Null means upterm answered without the live detail that carries the counts.
+ * A missing guestCount must never be read as zero - that would shut down a
+ * session a developer is actively attached to.
+ *
+ * Takes the session rather than fetching one: the post loop already needs a
+ * lookup for its terminal check, and two lookups per poll would double the
+ * shell-outs and could disagree with each other within a single iteration.
+ */
+function guestPresence(session: SessionInfo | null): boolean | null {
+  if (!session?.hasLiveDetail) return null;
+  return (session.guestCount ?? 0) > 0;
 }
 
 /**
@@ -831,76 +851,119 @@ async function runDetachedMode(session: SessionInfo): Promise<void> {
   core.info('Detached mode: workflow will continue while upterm session is active');
 }
 
-async function hasAnyoneConnectedYet(): Promise<boolean> {
-  try {
-    // The upterm host's tmux client is marked read-only (via `-f read-only`
-    // on `tmux new -s upterm`), so filtering for non-read-only clients
-    // gives us exactly the user SSH connections.
-    const result = await execShellCommand("tmux list-clients -t upterm -f '#{?client_readonly,,1}'");
-    return result.trim() !== '';
-  } catch {
-    return false;
+/**
+ * Remove this run's private directories.
+ *
+ * Guarded: rmSync(force) suppresses only ENOENT and defaults to maxRetries 0,
+ * so on Windows - where the tee redirects still hold state/*.log open - an
+ * unguarded EBUSY would fail a job whose debug session succeeded.
+ */
+function cleanupUptermData(): void {
+  for (const key of ['uptermBaseDir', 'uptermRuntimeDir']) {
+    const dir = core.getState(key);
+    if (!dir) continue;
+    try {
+      fs.rmSync(dir, {recursive: true, force: true});
+    } catch (error) {
+      core.debug(`Could not remove ${dir}: ${error}`);
+    }
   }
 }
 
-async function runPost(): Promise<void> {
-  const message = core.getState('message');
-  if (!message) {
-    // Not in detached mode or session wasn't started properly
-    return;
-  }
-  exportXdgEnvironment();
-
-  const shutdown = () => {
-    core.error('Got signal');
+/**
+ * Stop the session this run started, then remove its directories.
+ *
+ * Order matters: the runtime directory holds the live admin/attach sockets, so
+ * removing it under a running host unlinks them out from under it. Nothing in
+ * the non-detached path stops the host - monitorSession() merely breaks - so
+ * the post step is where teardown happens, for every mode.
+ *
+ * Process teardown is GUARDED; directory cleanup is not. run() saves isPost
+ * before installDependencies(), and post-if is "!cancelled()", so a failed
+ * download or a rejected upterm version reaches this function having started
+ * nothing. Killing the shared default tmux server there would destroy
+ * unrelated sessions - a developer's own, on a self-hosted runner. The
+ * directories are ours in every case, so removing them stays unconditional.
+ */
+async function finalizeSession(): Promise<void> {
+  if (core.getState('sessionStarted') === 'true') {
     try {
-      execSync('tmux kill-server');
-    } catch {
-      /* Ignore errors during shutdown */
+      await execShellCommand('tmux kill-server 2>/dev/null || true');
+    } catch (error) {
+      core.debug(`Could not stop tmux: ${error}`);
     }
-    process.exit(1);
-  };
-
-  // Support canceling the post-job Action
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-
-  core.debug('Waiting for session to end');
-
-  let waitTimeoutSeconds = parseInt(core.getInput('wait-timeout-minutes') || '10', 10) * 60;
-  if (isNaN(waitTimeoutSeconds) || waitTimeoutSeconds <= 0) {
-    waitTimeoutSeconds = 10 * 60; // Default 10 minutes
   }
+  cleanupUptermData();
+}
 
-  let anyoneConnected = false;
-
-  for (let seconds = waitTimeoutSeconds; seconds > 0; ) {
-    const connected = await hasAnyoneConnectedYet();
-    if (connected) anyoneConnected = true;
-
-    console.log(`${anyoneConnected ? 'Waiting for session to end' : `Waiting for client to connect (at most ${seconds} more second(s))`}\n${message}`);
-
-    if (continueFileExists()) {
-      core.info("Exiting debugging session because '/continue' file was created");
-      break;
-    }
-
-    const session = await getSession(getSessionName());
-    if (!session || isTerminal(session.status)) {
-      if (session) logSessionEnded(session);
-      else core.info("Exiting debugging session: 'upterm' quit");
-      break;
-    }
-
-    await sleep(5000);
-    if (!anyoneConnected) seconds -= 5;
-    if (seconds <= 0) core.warning(`Timed out waiting for client to connect (after ${waitTimeoutSeconds})`);
-  }
-
-  // Clean up
+async function runPost(): Promise<void> {
   try {
-    await execShellCommand('tmux kill-server 2>/dev/null || true');
-  } catch {
-    // Ignore cleanup errors
+    const message = core.getState('message');
+    // Non-detached runs save no message: there is nothing to wait for, but the
+    // session and its directories still need tearing down in the finally.
+    if (!message) return;
+
+    exportXdgEnvironment();
+
+    const shutdown = () => {
+      core.error('Got signal');
+      try {
+        execSync('tmux kill-server');
+      } catch {
+        /* Ignore errors during shutdown */
+      }
+      process.exit(1);
+    };
+
+    // Support canceling the post-job Action
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+
+    core.debug('Waiting for session to end');
+
+    let waitTimeoutSeconds = parseInt(core.getInput('wait-timeout-minutes') || '10', 10) * 60;
+    if (isNaN(waitTimeoutSeconds) || waitTimeoutSeconds <= 0) {
+      waitTimeoutSeconds = 10 * 60; // Default 10 minutes
+    }
+
+    let anyoneConnected = false;
+
+    for (let seconds = waitTimeoutSeconds; seconds > 0; ) {
+      const poll = await pollSession();
+      const connected = poll.kind === 'session' ? guestPresence(poll.session) : null;
+      if (connected === true) anyoneConnected = true;
+
+      // Prove, in the log, that this fresh post process resolved the SAME named
+      // session that main published - the only visible evidence that XDG state
+      // was restored across the process boundary.
+      if (poll.kind === 'session') core.info(`Session ${poll.session.name} (${poll.session.status})`);
+
+      console.log(`${anyoneConnected ? 'Waiting for session to end' : `Waiting for client to connect (at most ${seconds} more second(s))`}\n${message}`);
+
+      if (continueFileExists()) {
+        core.info("Exiting debugging session because '/continue' file was created");
+        break;
+      }
+
+      if (poll.kind === 'gone') {
+        core.info("Exiting debugging session: 'upterm' quit");
+        break;
+      }
+      if (poll.kind === 'session' && isTerminal(poll.session.status)) {
+        logSessionEnded(poll.session);
+        break;
+      }
+      // poll.kind === 'unknown' falls through: a failed lookup is not a
+      // finished session.
+
+      await sleep(5000);
+      // Only spend the countdown on a CONFIRMED "nobody here". `null` means
+      // upterm could not tell us, and treating that as "nobody" would shut down
+      // a session someone is attached to.
+      if (!anyoneConnected && connected === false) seconds -= 5;
+      if (seconds <= 0) core.warning(`Timed out waiting for client to connect (after ${waitTimeoutSeconds})`);
+    }
+  } finally {
+    await finalizeSession();
   }
 }

@@ -280,8 +280,8 @@ describe('upterm GitHub integration', () => {
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('ssh-keygen -q -t rsa'));
 
     // Check upterm session creation via WMI on Windows
-    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}));
-    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining(`${UPTERM_DATA_DIR}/tmux.conf`), expect.objectContaining({PATH: expect.any(String)}));
+    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}), UPTERM_DATA_DIR);
+    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining(`${UPTERM_DATA_DIR}/tmux.conf`), expect.objectContaining({PATH: expect.any(String)}), UPTERM_DATA_DIR);
 
     // Check that tmux config file was written
     expect(mockFs.writeFileSync).toHaveBeenCalledWith(path.join(UPTERM_DATA_DIR, 'tmux.conf'), expect.stringContaining('set-environment -g XDG_RUNTIME_DIR'));
@@ -440,7 +440,7 @@ describe('upterm GitHub integration', () => {
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('ssh-keygen -q -t rsa'));
 
     // Check upterm session creation via WMI on Windows
-    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}));
+    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}), UPTERM_DATA_DIR);
 
     expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
     expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/10)');
@@ -906,6 +906,16 @@ describe('upterm GitHub integration', () => {
   });
 
   describe('POST action', () => {
+    const postState = (overrides: Record<string, string> = {}) => {
+      when(core.getState).calledWith('isPost').mockReturnValue('true');
+      when(core.getState).calledWith('message').mockReturnValue('SSH: ssh user@session.upterm.dev');
+      when(core.getState).calledWith('sessionName').mockReturnValue('gha-3f9a1c05');
+      when(core.getState).calledWith('uptermBaseDir').mockReturnValue('/runner/_temp/upterm-action-abc');
+      when(core.getState).calledWith('uptermRuntimeDir').mockReturnValue('/runner/_temp/upterm-runtime-abc');
+      when(core.getState).calledWith('sessionStarted').mockReturnValue('true');
+      for (const [k, v] of Object.entries(overrides)) when(core.getState).calledWith(k).mockReturnValue(v);
+    };
+
     beforeEach(() => {
       Object.defineProperty(process, 'platform', {
         value: 'linux'
@@ -913,6 +923,120 @@ describe('upterm GitHub integration', () => {
       Object.defineProperty(process, 'arch', {
         value: 'x64'
       });
+    });
+
+    it('does not kill tmux when this run never started a session', async () => {
+      // isPost is saved before installDependencies(), and post-if is
+      // "!cancelled()", so a failed download or a rejected upterm version lands
+      // here having started nothing. Killing the shared default tmux server would
+      // destroy a developer's unrelated sessions on a self-hosted runner.
+      postState({sessionStarted: '', message: ''});
+
+      await run();
+
+      expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('kill-server'));
+      // Directories are still ours, so they are still removed.
+      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
+    });
+
+    it('keeps waiting when a lookup throws instead of reporting the session gone', async () => {
+      // 'unknown' must not collapse into 'gone': a transient registry hiccup
+      // ending a live debugging session is the failure this change removes.
+      postState();
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        throw new Error('Command failed with exit code 2\nStderr: registry unavailable');
+      });
+      mockFs.existsSync.mockImplementation(() => polls >= 5);
+
+      await run();
+
+      expect(core.info).not.toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+    });
+
+    it('defers the wait-timeout countdown while guest status is unknown', async () => {
+      // A ready session whose admin query failed. Spending the countdown here
+      // would shut down a session someone may be attached to.
+      //
+      // The loop MUST run past the point where the buggy implementation would have
+      // expired, or this test passes against the bug it exists to catch: a 1-minute
+      // timeout at 5s per wait expires after 12 completed waits, so stop at 18.
+      // Count the session-info calls (exactly one per iteration) rather than
+      // existsSync calls - continueFileExists() makes TWO reads per unsuccessful
+      // poll, so counting those would cut the run in half and let the bug through.
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        return noDetail;
+      });
+      mockFs.existsSync.mockImplementation(() => polls >= 18);
+
+      await run();
+
+      // Proves the loop really got past expiry rather than exiting early.
+      expect(polls).toBeGreaterThanOrEqual(18);
+      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
+    });
+
+    it('still counts down when upterm confirms nobody has connected', async () => {
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('session info') ? readySession({guestCount: 0}) : ''));
+      mockFs.existsSync.mockReturnValue(false);
+
+      await run();
+
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
+    });
+
+    it('stops the session before removing its directories', async () => {
+      postState();
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('session info') ? JSON.stringify({name: 'gha-3f9a1c05', status: 'ended'}) : ''));
+
+      await run();
+
+      const killIndex = mockedExecShellCommand.mock.calls.findIndex(c => c[0].includes('kill-server'));
+      expect(killIndex).toBeGreaterThanOrEqual(0);
+      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-runtime-abc', {recursive: true, force: true});
+      // The runtime dir holds the live sockets; removing it first would unlink
+      // them out from under a still-running host.
+      expect(mockedExecShellCommand.mock.invocationCallOrder[killIndex]).toBeLessThan(mockFs.rmSync.mock.invocationCallOrder[0]);
+    });
+
+    it('tears down even when the post-step lookup throws', async () => {
+      postState();
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        throw new Error('Command failed with exit code 2\nStderr: registry unavailable');
+      });
+      // A thrown lookup is UNKNOWN, which defers the countdown - so the loop needs
+      // the continue file to end, or this test would never return.
+      mockFs.existsSync.mockImplementation(() => polls >= 3);
+
+      await run();
+
+      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
+    });
+
+    it('does not fail the job when cleanup cannot remove a directory', async () => {
+      // Windows holds state/*.log open via tee; rmSync defaults to maxRetries 0,
+      // so EBUSY must not turn a successful debug session into a failed job.
+      postState();
+      mockFs.rmSync.mockImplementation(() => {
+        throw new Error('EBUSY: resource busy or locked');
+      });
+
+      await run();
+
+      expect(core.setFailed).not.toHaveBeenCalled();
     });
 
     it('should wait for session and exit when the session ends', async () => {
