@@ -45,13 +45,27 @@ import fs from 'fs';
 const DOWNLOAD_PATH = '/tmp/upterm.tar.gz';
 const EXTRACT_DIR = '/tmp/upterm-unique-a1b2c3d4';
 
-// Helper to get expected paths. Both dirs come from the mocked mkdtempSync,
-// which appends 'abc123' to whatever prefix it was given.
-const UPTERM_DATA_DIR = '/runner/_temp/upterm-action-abc123';
-const UPTERM_RUNTIME_DIR = '/runner/_temp/upterm-runtime-abc123';
-const TIMEOUT_FLAG_PATH = path.join(UPTERM_DATA_DIR, 'timeout-flag');
+const RUNNER_TEMP = '/runner/_temp';
 
-process.env.RUNNER_TEMP = '/runner/_temp';
+// Helper to get expected paths. Both dirs come from the mocked mkdtempSync,
+// which appends 'abc123' to whatever prefix path.join() gave it. Built with
+// path.join() rather than a hardcoded forward-slash literal: Node's path
+// module uses the REAL host's separators regardless of any mocked
+// process.platform, so on an actual Windows runner path.join() yields
+// backslashes here too - matching the raw value production derives the same
+// way (RUNNER_TEMP has no drive letter, so this is the ONLY shape difference
+// to worry about for these two).
+const UPTERM_DATA_DIR = path.join(RUNNER_TEMP, 'upterm-action-') + 'abc123';
+const UPTERM_RUNTIME_DIR = path.join(RUNNER_TEMP, 'upterm-runtime-') + 'abc123';
+// Raw (Shape A), matching getUptermDirs().timeoutFlag exactly - both computed
+// via the same path.join() on the same base. Use TIMEOUT_FLAG_SHELL_PATH
+// below instead for anything asserting on a shell command string, since those
+// values go through toMsys2Path() (forward slashes only) before upterm's
+// shell ever sees them.
+const TIMEOUT_FLAG_PATH = path.join(UPTERM_DATA_DIR, 'timeout-flag');
+const TIMEOUT_FLAG_SHELL_PATH = TIMEOUT_FLAG_PATH.replace(/\\/g, '/');
+
+process.env.RUNNER_TEMP = RUNNER_TEMP;
 
 const READY_SESSION = {name: 'gha-3f9a1c05', status: 'ready', sessionId: 's1', sshCommand: 'ssh user@session123.upterm.dev', guestCount: 0};
 
@@ -281,7 +295,9 @@ describe('upterm GitHub integration', () => {
 
     // Check upterm session creation via WMI on Windows
     expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}), UPTERM_DATA_DIR);
-    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining(`${UPTERM_DATA_DIR}/tmux.conf`), expect.objectContaining({PATH: expect.any(String)}), UPTERM_DATA_DIR);
+    // The outer tmux flag is built with toShellPath() (forward slashes only) -
+    // Shape B, unlike the raw scriptDir argument checked above.
+    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining(`${UPTERM_DATA_DIR.replace(/\\/g, '/')}/tmux.conf`), expect.objectContaining({PATH: expect.any(String)}), UPTERM_DATA_DIR);
 
     // Check that tmux config file was written
     expect(mockFs.writeFileSync).toHaveBeenCalledWith(path.join(UPTERM_DATA_DIR, 'tmux.conf'), expect.stringContaining('set-environment -g XDG_RUNTIME_DIR'));
@@ -622,9 +638,11 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
-    // Mock fs.existsSync to handle different paths correctly
-    // Note: Even on Windows, RUNNER_TEMP here ('/runner/_temp') has no drive letter, so
-    // toMsys2Path() is a no-op and the timeout flag path matches TIMEOUT_FLAG_PATH verbatim.
+    // Mock fs.existsSync to handle different paths correctly.
+    // isTimeoutReached() checks the raw native path (Shape A: whatever
+    // path.join() produced on this host, backslashes on a real Windows
+    // runner), so the mock must match TIMEOUT_FLAG_PATH - not the
+    // forward-slash form the shell command below uses.
     let monitoringLoopCalls = 0;
     mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
       const pathStr = filePath.toString();
@@ -641,8 +659,9 @@ describe('upterm GitHub integration', () => {
 
     await run();
 
-    // Verify the timeout flag path is now rooted at the private per-run directory
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining(TIMEOUT_FLAG_PATH));
+    // The shell script writes the flag via the MSYS-converted (forward-slash
+    // only) path, not the raw native one - Shape B.
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining(TIMEOUT_FLAG_SHELL_PATH));
     expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 5 minutes for someone to connect, otherwise shut down');
     expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
     expect(core.info).toHaveBeenCalledWith('The session was automatically shut down to prevent unnecessary resource usage');
@@ -1204,8 +1223,10 @@ describe('upterm GitHub integration', () => {
 
     // Check that timeout script was created with correct timeout value
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('sleep $(( 10 * 60 ))'));
-    // Timeout flag path is now rooted at the private per-run directory
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining(`echo "UPTERM_TIMEOUT_REACHED" > '${TIMEOUT_FLAG_PATH}'`));
+    // Timeout flag path is now rooted at the private per-run directory. The
+    // shell script embeds the MSYS-converted (forward-slash only) form -
+    // Shape B - not the raw native path.
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining(`echo "UPTERM_TIMEOUT_REACHED" > '${TIMEOUT_FLAG_SHELL_PATH}'`));
     expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 10 minutes for someone to connect, otherwise shut down');
   });
 
@@ -1226,9 +1247,13 @@ describe('upterm GitHub integration', () => {
       // Assert the EXACT values: state and config both live under the base dir,
       // so a substring match on 'upterm-action-' cannot tell them apart - and
       // would not notice the two being swapped, or config never being set.
-      expect(process.env.XDG_STATE_HOME).toBe(path.join(UPTERM_DATA_DIR, 'state'));
-      expect(process.env.XDG_CONFIG_HOME).toBe(path.join(UPTERM_DATA_DIR, 'config'));
-      expect(process.env.XDG_RUNTIME_DIR).toBe(UPTERM_RUNTIME_DIR);
+      //
+      // exportXdgEnvironment() always converts through toShellPath/toMsys2Path
+      // before assigning these - Shape B, forward slashes only - unlike the raw
+      // UPTERM_DATA_DIR/UPTERM_RUNTIME_DIR constants, which are Shape A.
+      expect(process.env.XDG_STATE_HOME).toBe(path.join(UPTERM_DATA_DIR, 'state').replace(/\\/g, '/'));
+      expect(process.env.XDG_CONFIG_HOME).toBe(path.join(UPTERM_DATA_DIR, 'config').replace(/\\/g, '/'));
+      expect(process.env.XDG_RUNTIME_DIR).toBe(UPTERM_RUNTIME_DIR.replace(/\\/g, '/'));
     });
 
     it('writes the same XDG values into tmux.conf that it exported', async () => {
