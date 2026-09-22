@@ -27,7 +27,7 @@ inputs:
     required: false
     default: ""
   upterm-version:
-    description: "Upterm version/tag to install (e.g., v0.20.0). Works on all platforms. Defaults to latest when unset."
+    description: "Upterm version/tag to install (e.g., v0.30.0). Requires v0.30.0 or newer. Defaults to latest when unset."
     required: false
   detached:
     description: "In detached mode, the workflow job will continue while the upterm session is active"

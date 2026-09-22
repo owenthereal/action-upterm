@@ -97,7 +97,7 @@ export function generateSessionName(): string {
   return `gha-${crypto.randomBytes(4).toString('hex')}`;
 }
 
-/** Parse `upterm version`, whose first line is "Upterm version v0.30.0". */
+/** Parse `upterm version`, whose first line is "upterm version v0.30.0". */
 export function parseUptermVersion(output: string): UptermVersion | null {
   const match = output.match(/version\s+v?(\d+)\.(\d+)\.(\d+)/i);
   if (!match) return null;

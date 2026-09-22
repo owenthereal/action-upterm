@@ -74,7 +74,7 @@ jobs:
 
 ## Pin a Specific Upterm Version
 
-By default, the action downloads the latest Upterm release directly from GitHub. To pin a specific release (for example, `v0.20.0`), provide the optional `upterm-version` input:
+By default, the action downloads the latest Upterm release directly from GitHub. To pin a specific release (for example, `v0.30.0`), provide the optional `upterm-version` input:
 
 ```yaml
 name: CI
@@ -87,11 +87,12 @@ jobs:
     - name: Setup upterm session
       uses: owenthereal/action-upterm@v1
       with:
-        upterm-version: v0.20.0
+        upterm-version: v0.30.0
 ```
 
 - Works on all platforms (Linux, macOS, and Windows).
 - On macOS, Upterm is installed from the GitHub release tarball (Homebrew is still used for installing `tmux` only).
+- **Upterm versions below `v0.30.0` are not supported.** This action addresses its session by name via `upterm session info`, an API that does not exist before `v0.30.0`; the action fails fast at startup if it detects an older version. If you need an older Upterm, pin `owenthereal/action-upterm@v1.15.0` instead of `@v1` — that release predates this requirement.
 
 ## Shut Down the Server if No User Connects
 
