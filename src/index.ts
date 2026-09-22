@@ -5,7 +5,7 @@ import path from 'path';
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
-import {execShellCommand, launchOutsideJobObject, sleep} from './helpers';
+import {execShellCommand, launchOutsideJobObject, shellEscape, sleep} from './helpers';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
@@ -116,27 +116,6 @@ function toMsys2Path(filePath: string): string {
     result = result.replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`);
   }
   return result;
-}
-
-/**
- * Escape a string for safe use in single-quoted shell arguments.
- * Handles paths that may contain single quotes by using the '\'' escape pattern.
- *
- * Use this for:
- * - User-provided strings (server URLs, GitHub usernames)
- * - File paths in shell commands
- * - Any value passed through nested command layers
- *
- * @example
- * shellEscape("hello world")           // => "'hello world'"
- * shellEscape("user's file")           // => "'user'\''s file'"
- * shellEscape("ssh://server:22")       // => "'ssh://server:22'"
- *
- * @param value - The string to escape
- * @returns Single-quoted string safe for shell use
- */
-function shellEscape(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 function getUptermTimeoutFlagPath(): string {

@@ -29,7 +29,15 @@ jest.mock('os', () => ({
 }));
 
 import {execShellCommand, launchOutsideJobObject, sleep} from './helpers';
-jest.mock('./helpers');
+// Partial mock: shellEscape is a pure string function that the assertions
+// below depend on producing real output. Automocking it would make every
+// command string contain "undefined".
+jest.mock('./helpers', () => ({
+  ...jest.requireActual('./helpers'),
+  execShellCommand: jest.fn(),
+  launchOutsideJobObject: jest.fn(),
+  sleep: jest.fn()
+}));
 const mockedExecShellCommand = jest.mocked(execShellCommand);
 const mockedLaunchOutsideJobObject = jest.mocked(launchOutsideJobObject);
 const mockedSleep = jest.mocked(sleep);
