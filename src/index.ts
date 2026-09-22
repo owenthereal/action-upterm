@@ -305,7 +305,13 @@ async function installDependencies(): Promise<void> {
  * later with a socket that was never going to be found.
  */
 async function assertSupportedUptermVersion(): Promise<void> {
-  const output = await execShellCommand('upterm version');
+  let output: string;
+  try {
+    output = await execShellCommand('upterm version');
+  } catch (error) {
+    throw new Error(`Failed to check the installed upterm version: ${error}\n\nEnsure upterm was installed successfully and is executable on PATH.`);
+  }
+
   const version = parseUptermVersion(output);
 
   if (!version) {

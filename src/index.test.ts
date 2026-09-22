@@ -225,7 +225,20 @@ describe('upterm GitHub integration', () => {
       await run();
 
       expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Could not determine the installed upterm version'));
-      expect(core.setFailed).not.toHaveBeenCalledWith(expect.stringContaining('requires upterm'));
+      expect(core.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('fails with a contextual message when the version check itself cannot run', async () => {
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) {
+          throw new Error('Command failed with exit code 127: upterm version\nStderr: bash: upterm: command not found');
+        }
+        return '';
+      });
+
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Failed to check the installed upterm version'));
     });
   });
 
