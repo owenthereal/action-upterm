@@ -282,7 +282,10 @@ setw -g aggressive-resize on
      upterm's admin query fails, it can return the record's view with status
      still `ready` but no `sshCommand`, which is not something anyone can
      connect to
-   - Maximum 10 retries with 1 second intervals
+   - Maximum 30 retries with 1 second intervals. Wider than the old socket-file
+     check needed, because readiness now waits on upterm's second, unlocked
+     admin round-trip; the loop returns on its first success, so the budget only
+     costs anything on a run that was going to be slow
    - Collects diagnostics on failure
 
 3. **SSH Command Output** (`outputSshCommand()`)
@@ -315,7 +318,7 @@ When `wait-timeout-minutes` is specified:
 # Background process that enforces timeout
 (
   sleep $(( TIMEOUT * 60 ));
-  if ! pgrep -f '^tmux attach ' &>/dev/null; then
+  if [ -z "$(tmux list-clients -t upterm -f '#{?client_readonly,,1}')" ]; then
     echo "UPTERM_TIMEOUT_REACHED" > {flag-file};
     tmux kill-server;
   fi
@@ -324,8 +327,12 @@ When `wait-timeout-minutes` is specified:
 
 **Logic:**
 - Sleeps for specified duration
-- Checks if any client is connected (`pgrep -f '^tmux attach '`)
-- If no client, writes flag file and kills tmux
+- Asks tmux itself whether the `upterm` session has any writable client
+  (`tmux list-clients -t upterm -f '#{?client_readonly,,1}'`). The filter drops
+  read-only clients, which is what the action's own inner `tmux new -f
+  read-only` attaches as - so the action does not count as somebody having
+  connected
+- If no such client, writes flag file and kills tmux
 - Monitoring loop detects flag and exits gracefully
 
 ### Diagnostics Collection
@@ -354,7 +361,7 @@ The main and post invocations are separate Node processes; `core.saveState()` /
 |-----|---------|
 | `isPost` | Set before any fallible setup so a failure always routes to the post (cleanup) path instead of re-entering main. |
 | `sessionName` | The `gha-<8 hex>` name minted once in main, so post addresses the same session. |
-| `sessionStarted` | Set only once `tmux new` has actually launched; guards `tmux kill-server` in post so a failed download or rejected upterm version doesn't kill the shared tmux server. |
+| `sessionStarted` | Saved immediately *before* the `tmux new` launch is attempted, so a launch that fails part-way is still torn down; guards `tmux kill-server` in post so a failed download or rejected upterm version - neither of which reaches session creation - doesn't kill the shared tmux server. |
 | `uptermBaseDir` | Path to the per-run `upterm-action-XXXXXX` directory, so post restores rather than mints new directories. |
 | `uptermRuntimeDir` | Path to the per-run `upterm-runtime-XXXXXX` directory (`XDG_RUNTIME_DIR`). |
 | `message` | The SSH connection message, saved only in detached mode; its absence tells post there is nothing to wait on. |
