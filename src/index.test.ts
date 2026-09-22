@@ -45,8 +45,10 @@ import fs from 'fs';
 const DOWNLOAD_PATH = '/tmp/upterm.tar.gz';
 const EXTRACT_DIR = '/tmp/upterm-unique-a1b2c3d4';
 
-// Helper to get expected paths based on mocked os.tmpdir()
-const UPTERM_DATA_DIR = '/mock-tmp/upterm-data';
+// Helper to get expected paths. Both dirs come from the mocked mkdtempSync,
+// which appends 'abc123' to whatever prefix it was given.
+const UPTERM_DATA_DIR = '/runner/_temp/upterm-action-abc123';
+const UPTERM_RUNTIME_DIR = '/runner/_temp/upterm-runtime-abc123';
 const TIMEOUT_FLAG_PATH = path.join(UPTERM_DATA_DIR, 'timeout-flag');
 
 process.env.RUNNER_TEMP = '/runner/_temp';
@@ -277,7 +279,7 @@ describe('upterm GitHub integration', () => {
 
     // Check upterm session creation via WMI on Windows
     expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}));
-    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('/mock-tmp/upterm-data/tmux.conf'), expect.objectContaining({PATH: expect.any(String)}));
+    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining(`${UPTERM_DATA_DIR}/tmux.conf`), expect.objectContaining({PATH: expect.any(String)}));
 
     // Check that tmux config file was written
     expect(mockFs.writeFileSync).toHaveBeenCalledWith(path.join(UPTERM_DATA_DIR, 'tmux.conf'), expect.stringContaining('set-environment -g XDG_RUNTIME_DIR'));
@@ -657,7 +659,8 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
     // Mock fs.existsSync to handle different paths correctly
-    // Note: Even on Windows, the timeout flag path uses os.tmpdir() which is mocked to /mock-tmp
+    // Note: Even on Windows, RUNNER_TEMP here ('/runner/_temp') has no drive letter, so
+    // toMsys2Path() is a no-op and the timeout flag path matches TIMEOUT_FLAG_PATH verbatim.
     let monitoringLoopCalls = 0;
     mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
       const pathStr = filePath.toString();
@@ -680,8 +683,8 @@ describe('upterm GitHub integration', () => {
     });
     await run();
 
-    // Verify the timeout flag path is now based on os.tmpdir()
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('/mock-tmp/upterm-data/timeout-flag'));
+    // Verify the timeout flag path is now rooted at the private per-run directory
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining(TIMEOUT_FLAG_PATH));
     expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 5 minutes for someone to connect, otherwise shut down');
     expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
     expect(core.info).toHaveBeenCalledWith('The session was automatically shut down to prevent unnecessary resource usage');
@@ -953,8 +956,34 @@ describe('upterm GitHub integration', () => {
 
     // Check that timeout script was created with correct timeout value
     expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('sleep $(( 10 * 60 ))'));
-    // Timeout flag path now uses os.tmpdir() which is mocked to /mock-tmp
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('echo "UPTERM_TIMEOUT_REACHED" > \'/mock-tmp/upterm-data/timeout-flag\''));
+    // Timeout flag path is now rooted at the private per-run directory
+    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining(`echo "UPTERM_TIMEOUT_REACHED" > '${TIMEOUT_FLAG_PATH}'`));
     expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 10 minutes for someone to connect, otherwise shut down');
+  });
+
+  describe('private per-run directories', () => {
+    it('creates private per-run directories rooted at RUNNER_TEMP', async () => {
+      await run();
+
+      expect(mockFs.mkdtempSync).toHaveBeenCalledWith(path.join('/runner/_temp', 'upterm-action-'));
+      expect(mockFs.mkdtempSync).toHaveBeenCalledWith(path.join('/runner/_temp', 'upterm-runtime-'));
+      expect(mockFs.chmodSync).toHaveBeenCalledWith(expect.stringContaining('upterm-runtime-'), 0o700);
+    });
+
+    it('exports XDG_STATE_HOME so session lookups find the record', async () => {
+      await run();
+
+      // session info resolves the record through XDG_STATE_HOME; if the action's
+      // own shell disagrees with the host, a live session reports as missing.
+      expect(process.env.XDG_STATE_HOME).toContain('upterm-action-');
+      expect(process.env.XDG_RUNTIME_DIR).toContain('upterm-runtime-');
+    });
+
+    it('saves the directories for the post process', async () => {
+      await run();
+
+      expect(core.saveState).toHaveBeenCalledWith('uptermBaseDir', UPTERM_DATA_DIR);
+      expect(core.saveState).toHaveBeenCalledWith('uptermRuntimeDir', UPTERM_RUNTIME_DIR);
+    });
   });
 });

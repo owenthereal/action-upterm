@@ -44,18 +44,45 @@ interface UptermDirs {
 // Cache for getUptermDirs() to avoid repeated path computation
 let uptermDirsCache: UptermDirs | null = null;
 
+/**
+ * Root for this run's temporary directories.
+ *
+ * RUNNER_TEMP is short enough for upterm's 103-byte socket budget AND is reaped
+ * by the runner per job. A hardcoded /tmp is neither - never cleaned, and
+ * unwritable on hardened or containerized runners.
+ */
+function tempRoot(): string {
+  return process.env.RUNNER_TEMP || os.tmpdir();
+}
+
+function createPrivateDir(prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(tempRoot(), prefix));
+  fs.chmodSync(dir, 0o700);
+  return dir;
+}
+
 function getUptermDirs(): UptermDirs {
   if (uptermDirsCache) {
     return uptermDirsCache;
   }
 
-  const base = path.join(os.tmpdir(), 'upterm-data');
+  // The post process is a separate Node process: it restores what main saved
+  // rather than minting fresh directories that would point nowhere.
+  const savedBase = core.getState('uptermBaseDir');
+  const savedRuntime = core.getState('uptermRuntimeDir');
+
+  const base = savedBase || createPrivateDir('upterm-action-');
+  const runtime = savedRuntime || createPrivateDir('upterm-runtime-');
+
+  if (!savedBase) core.saveState('uptermBaseDir', base);
+  if (!savedRuntime) core.saveState('uptermRuntimeDir', runtime);
+
   const state = path.join(base, 'state');
   uptermDirsCache = {
     base,
-    runtime: path.join(base, 'runtime'), // XDG_RUNTIME_DIR - for sockets
-    state, // XDG_STATE_HOME - for upterm's internal logs
-    config: path.join(base, 'config'), // XDG_CONFIG_HOME - for config files
+    runtime, // XDG_RUNTIME_DIR - for sockets
+    state, // XDG_STATE_HOME - for upterm's session records and logs
+    config: path.join(base, 'config'), // XDG_CONFIG_HOME
     logs: {
       uptermCommand: path.join(state, 'upterm-command.log'), // Our action's log of upterm stdout/stderr
       tmuxError: path.join(state, 'tmux-error.log') // Our action's log of tmux stderr
@@ -63,6 +90,24 @@ function getUptermDirs(): UptermDirs {
     timeoutFlag: path.join(base, 'timeout-flag') // Flag file for timeout detection
   };
   return uptermDirsCache;
+}
+
+/**
+ * Export XDG_* to this process so the action's own `upterm session info` calls
+ * resolve the same session record the host published to.
+ *
+ * upterm finds a session's record through XDG_STATE_HOME
+ * (cmd/upterm/command/session.go:425). Until now the action only set these
+ * inside tmux.conf, because every query passed --admin-socket explicitly.
+ * execShellCommand inherits process.env on both platforms (helpers.ts:26-34),
+ * so one assignment covers every call site, in main and in post alike.
+ */
+function exportXdgEnvironment(): void {
+  const dirs = getUptermDirs();
+  const convert = process.platform === 'win32' ? toMsys2Path : toShellPath;
+  process.env.XDG_RUNTIME_DIR = convert(dirs.runtime);
+  process.env.XDG_STATE_HOME = convert(dirs.state);
+  process.env.XDG_CONFIG_HOME = convert(dirs.config);
 }
 
 // Utility Functions
@@ -401,6 +446,7 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
   fs.mkdirSync(dirs.runtime, {recursive: true});
   fs.mkdirSync(dirs.state, {recursive: true});
   fs.mkdirSync(dirs.config, {recursive: true});
+  exportXdgEnvironment();
   core.debug(`Created upterm directories under ${dirs.base}`);
 
   // Remove any stale timeout flag left in a reused temp directory (e.g. on a
