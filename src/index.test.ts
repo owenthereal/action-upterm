@@ -57,13 +57,6 @@ const RUNNER_TEMP = '/runner/_temp';
 // to worry about for these two).
 const UPTERM_DATA_DIR = path.join(RUNNER_TEMP, 'upterm-action-') + 'abc123';
 const UPTERM_RUNTIME_DIR = path.join(RUNNER_TEMP, 'upterm-rt-') + 'abc123';
-// Raw (Shape A), matching getUptermDirs().timeoutFlag exactly - both computed
-// via the same path.join() on the same base. Use TIMEOUT_FLAG_SHELL_PATH
-// below instead for anything asserting on a shell command string, since those
-// values go through toMsys2Path() (forward slashes only) before upterm's
-// shell ever sees them.
-const TIMEOUT_FLAG_PATH = path.join(UPTERM_DATA_DIR, 'timeout-flag');
-const TIMEOUT_FLAG_SHELL_PATH = TIMEOUT_FLAG_PATH.replace(/\\/g, '/');
 
 process.env.RUNNER_TEMP = RUNNER_TEMP;
 
@@ -125,7 +118,7 @@ function baselineInputs(): void {
  * throw a JSON parse error rather than exercise the path under test.
  *
  * Responses are consumed one per lookup; the last one repeats forever, so a
- * sequence ending in a terminal status keeps monitorSession() bounded.
+ * sequence ending in a terminal status keeps waitForSession() bounded.
  */
 function baselineShell(...sessionResponses: string[]): void {
   const queue = sessionResponses.length ? [...sessionResponses] : [readySession()];
@@ -156,6 +149,21 @@ function fsWithoutExitFiles(): void {
     if (p.includes('timeout-flag')) return false;
     return true;
   });
+}
+
+/**
+ * State the POST action needs to see itself as the post half of a run main
+ * already started. Shared by the POST action tests and the countdown tests,
+ * both of which exercise runPost().
+ */
+function postState(overrides: Record<string, string> = {}): void {
+  when(core.getState).calledWith('isPost').mockReturnValue('true');
+  when(core.getState).calledWith('message').mockReturnValue('SSH: ssh user@session.upterm.dev');
+  when(core.getState).calledWith('sessionName').mockReturnValue('gha-3f9a1c05');
+  when(core.getState).calledWith('uptermBaseDir').mockReturnValue('/runner/_temp/upterm-action-abc');
+  when(core.getState).calledWith('uptermRuntimeDir').mockReturnValue('/runner/_temp/upterm-rt-abc');
+  when(core.getState).calledWith('sessionStarted').mockReturnValue('true');
+  for (const [k, v] of Object.entries(overrides)) when(core.getState).calledWith(k).mockReturnValue(v);
 }
 
 describe('upterm GitHub integration', () => {
@@ -586,137 +594,6 @@ describe('upterm GitHub integration', () => {
     expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Failed to install dependencies on linux: Error: Installation failed'));
   });
 
-  it('should handle timeout with timeout flag detection', async () => {
-    Object.defineProperty(process, 'platform', {
-      value: 'linux'
-    });
-    Object.defineProperty(process, 'arch', {
-      value: 'x64'
-    });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
-
-    // Mock fs.existsSync to handle different paths correctly
-    let monitoringLoopCalls = 0;
-    mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
-      const pathStr = filePath.toString();
-      if (pathStr === TIMEOUT_FLAG_PATH) {
-        monitoringLoopCalls++;
-        // Return true on second call (first call is in monitoring loop)
-        return monitoringLoopCalls >= 2;
-      }
-      if (pathStr === '/continue' || pathStr.includes('continue')) {
-        return false; // Don't exit via continue file
-      }
-      return true; // Default for other paths (SSH keys, .upterm dir, etc.)
-    });
-
-    await run();
-
-    expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 5 minutes for someone to connect, otherwise shut down');
-    expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
-    expect(core.info).toHaveBeenCalledWith('The session was automatically shut down to prevent unnecessary resource usage');
-  }, 10000);
-
-  it('should handle timeout with timeout flag detection on windows', async () => {
-    Object.defineProperty(process, 'platform', {
-      value: 'win32'
-    });
-    Object.defineProperty(process, 'arch', {
-      value: 'x64'
-    });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
-
-    // Mock fs.existsSync to handle different paths correctly.
-    // isTimeoutReached() checks the raw native path (Shape A: whatever
-    // path.join() produced on this host, backslashes on a real Windows
-    // runner), so the mock must match TIMEOUT_FLAG_PATH - not the
-    // forward-slash form the shell command below uses.
-    let monitoringLoopCalls = 0;
-    mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
-      const pathStr = filePath.toString();
-      if (pathStr === TIMEOUT_FLAG_PATH) {
-        monitoringLoopCalls++;
-        // Return true on second call (first call is in monitoring loop)
-        return monitoringLoopCalls >= 2;
-      }
-      if (pathStr === 'C:/msys64/continue' || pathStr.includes('continue')) {
-        return false; // Don't exit via continue file
-      }
-      return true; // Default for other paths (SSH keys, .upterm dir, etc.)
-    });
-
-    await run();
-
-    // The shell script writes the flag via the MSYS-converted (forward-slash
-    // only) path, not the raw native one - Shape B.
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining(TIMEOUT_FLAG_SHELL_PATH));
-    expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 5 minutes for someone to connect, otherwise shut down');
-    expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
-    expect(core.info).toHaveBeenCalledWith('The session was automatically shut down to prevent unnecessary resource usage');
-  }, 10000);
-
-  it('should handle connection refused error during session monitoring with timeout detection', async () => {
-    Object.defineProperty(process, 'platform', {
-      value: 'linux'
-    });
-    Object.defineProperty(process, 'arch', {
-      value: 'x64'
-    });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
-
-    // Mock the session lookup.
-    // First call is from waitForUptermReady() - should succeed
-    // Second call is from monitorSession() - should fail with connection refused
-    let sessionInfoCallCount = 0;
-    mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.31.0\n');
-      if (cmd.includes('session info')) {
-        sessionInfoCallCount++;
-        if (sessionInfoCallCount === 2) {
-          // Second call from monitorSession - fail with connection refused
-          return Promise.reject(
-            new Error(
-              "Command failed with exit code 1: upterm session info\nStderr: rpc error: code = Unavailable desc = connection error: desc = 'transport: Error while dialing: dial unix /home/runner/.upterm/sessions/gha-3f9a1c05/admin.sock: connect: connection refused'"
-            )
-          );
-        }
-        return Promise.resolve(readySession());
-      }
-      return Promise.resolve('success');
-    });
-
-    // Mock fs.existsSync to handle different paths correctly
-    let timeoutCheckCount = 0;
-    mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
-      const pathStr = filePath.toString();
-      if (pathStr === TIMEOUT_FLAG_PATH) {
-        timeoutCheckCount++;
-        // Return true after first check (after connection error) to simulate timeout
-        return timeoutCheckCount > 1;
-      }
-      if (pathStr === '/continue' || pathStr.includes('continue')) {
-        return false; // Don't exit via continue file
-      }
-      return true; // Default for other paths
-    });
-
-    await run();
-
-    // The failed lookup is UNKNOWN, so the loop keeps going; the next
-    // iteration's timeout check is what ends it.
-    expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
-    expect(core.info).toHaveBeenCalledWith('The session was automatically shut down to prevent unnecessary resource usage');
-  });
-
   it('keeps polling when the session lookup keeps failing instead of ending the session', async () => {
     // A lookup that throws is UNKNOWN, not "gone". Ending the session here
     // would let a transient registry hiccup kill a live debugging session -
@@ -785,7 +662,7 @@ describe('upterm GitHub integration', () => {
       //
       // The sequence MUST end in a terminal status. fsWithoutExitFiles() removes
       // both exit files and `detached` defaults to false, so run() proceeds into
-      // monitorSession() - a sequence that stayed `ready` would never return.
+      // waitForSession() - a sequence that stayed `ready` would never return.
       fsWithoutExitFiles();
       baselineShell(noDetail, noDetail, readySession(), endedResponse);
 
@@ -847,8 +724,7 @@ describe('upterm GitHub integration', () => {
       expect(core.setFailed).not.toHaveBeenCalled();
       expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
       expect(core.info).toHaveBeenCalledWith('SSH command available as output: ssh user@session123.upterm.dev');
-      // Monitoring was reached (and ended via the default continue file).
-      expect(core.debug).toHaveBeenCalledWith('Entering main loop');
+      // Monitoring (waitForSession()) was reached and ended via the default continue file.
       expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
     });
 
@@ -1001,16 +877,6 @@ describe('upterm GitHub integration', () => {
   });
 
   describe('POST action', () => {
-    const postState = (overrides: Record<string, string> = {}) => {
-      when(core.getState).calledWith('isPost').mockReturnValue('true');
-      when(core.getState).calledWith('message').mockReturnValue('SSH: ssh user@session.upterm.dev');
-      when(core.getState).calledWith('sessionName').mockReturnValue('gha-3f9a1c05');
-      when(core.getState).calledWith('uptermBaseDir').mockReturnValue('/runner/_temp/upterm-action-abc');
-      when(core.getState).calledWith('uptermRuntimeDir').mockReturnValue('/runner/_temp/upterm-rt-abc');
-      when(core.getState).calledWith('sessionStarted').mockReturnValue('true');
-      for (const [k, v] of Object.entries(overrides)) when(core.getState).calledWith(k).mockReturnValue(v);
-    };
-
     beforeEach(() => {
       Object.defineProperty(process, 'platform', {
         value: 'linux'
@@ -1054,34 +920,6 @@ describe('upterm GitHub integration', () => {
       expect(core.info).not.toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
     });
 
-    it('defers the wait-timeout countdown while guest status is unknown', async () => {
-      // A ready session whose admin query failed. Spending the countdown here
-      // would shut down a session someone may be attached to.
-      //
-      // The loop MUST run past the point where the buggy implementation would have
-      // expired, or this test passes against the bug it exists to catch: a 1-minute
-      // timeout at 5s per wait expires after 12 completed waits, so stop at 18.
-      // Count the session-info calls (exactly one per iteration) rather than
-      // existsSync calls - continueFileExists() makes TWO reads per unsuccessful
-      // poll, so counting those would cut the run in half and let the bug through.
-      postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        return noDetail;
-      });
-      mockFs.existsSync.mockImplementation(() => polls >= 18);
-
-      await run();
-
-      // Proves the loop really got past expiry rather than exiting early.
-      expect(polls).toBeGreaterThanOrEqual(18);
-      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
-    });
-
     it('warns about a persistently failing lookup without spending the countdown', async () => {
       // 'unknown' skips every break AND the countdown, so a lookup that fails on
       // every iteration leaves the loop with no exit at all. core.debug is
@@ -1116,52 +954,6 @@ describe('upterm GitHub integration', () => {
       expect(lookupWarnings.length).toBeLessThan(polls);
       // The countdown still does NOT advance on an unknown.
       expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
-    });
-
-    it('stops the countdown once upterm confirms a guest connected', async () => {
-      // The branch that decides whether an attached developer's session survives
-      // the wait-timeout. guestCount >= 1 with live detail latches
-      // anyoneConnected, which both freezes the countdown and switches the log
-      // to "Waiting for session to end".
-      postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        return readySession({guestCount: 1});
-      });
-      // A 1-minute timeout expires after 12 completed waits, so run past that.
-      mockFs.existsSync.mockImplementation(() => polls >= 18);
-      // The loop reports progress through console.log, not core.*; collect the
-      // lines as they are written, since mockRestore() would discard them.
-      const lines: string[] = [];
-      const log = jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
-        lines.push(String(args[0]));
-      });
-
-      try {
-        await run();
-      } finally {
-        log.mockRestore();
-      }
-
-      expect(polls).toBeGreaterThanOrEqual(18);
-      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
-      expect(lines.some(l => l.startsWith('Waiting for session to end'))).toBe(true);
-      expect(lines.some(l => l.includes('Waiting for client to connect'))).toBe(false);
-    });
-
-    it('still counts down when upterm confirms nobody has connected', async () => {
-      postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('session info') ? readySession({guestCount: 0}) : ''));
-      mockFs.existsSync.mockReturnValue(false);
-
-      await run();
-
-      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
     });
 
     it('stops the session before removing its directories', async () => {
@@ -1303,29 +1095,178 @@ describe('upterm GitHub integration', () => {
     });
   });
 
-  it('should create timeout script when wait-timeout-minutes is specified', async () => {
-    Object.defineProperty(process, 'platform', {
-      value: 'linux'
-    });
-    Object.defineProperty(process, 'arch', {
-      value: 'x64'
-    });
-    when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
-    when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
-    when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('10');
-    when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
-    when(core.getInput).calledWith('detached').mockReturnValue('false');
-    when(core.getState).calledWith('isPost').mockReturnValue('');
+  describe('countdown (both modes)', () => {
+    const sessionStops = () => mockedExecShellCommand.mock.calls.filter(c => c[0].includes('session stop')).length;
 
-    await run();
+    // Collect console.log lines: the loop reports progress there, not via core.*.
+    function captureLog(): {lines: string[]; restore: () => void} {
+      const lines: string[] = [];
+      const spy = jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+        lines.push(String(args[0]));
+      });
+      return {lines, restore: () => spy.mockRestore()};
+    }
 
-    // Check that timeout script was created with correct timeout value
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('sleep $(( 10 * 60 ))'));
-    // Timeout flag path is now rooted at the private per-run directory. The
-    // shell script embeds the MSYS-converted (forward-slash only) form -
-    // Shape B - not the raw native path.
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining(`echo "UPTERM_TIMEOUT_REACHED" > '${TIMEOUT_FLAG_SHELL_PATH}'`));
-    expect(core.info).toHaveBeenCalledWith('wait-timeout-minutes set - will wait for 10 minutes for someone to connect, otherwise shut down');
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      Object.defineProperty(process, 'arch', {value: 'x64'});
+      fsWithoutExitFiles();
+    });
+
+    it('detached: with nobody ever joining, stops the session when the countdown runs out', async () => {
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('session info') ? readySession() : ''));
+
+      await run();
+
+      expect(sessionStops()).toBeGreaterThanOrEqual(1);
+      expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('upterm session stop gha-3f9a1c05'), expect.anything());
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
+    });
+
+    it('detached: a join published before the post step disarms the countdown for good', async () => {
+      // A guest joined during the build and left before the post step: guestCount
+      // is 0 now, but upterm recorded the join.
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        // Far past the 12 waits a 1-minute countdown would need, then end.
+        return polls < 30 ? readySession({guestCount: 0, firstGuestJoinedAt: '2026-09-23T04:12:15Z'}) : endedResponse;
+      });
+      const log = captureLog();
+      try {
+        await run();
+      } finally {
+        log.restore();
+      }
+
+      expect(polls).toBeGreaterThanOrEqual(30);
+      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
+      expect(log.lines.some(l => l.startsWith('Waiting for session to end'))).toBe(true);
+      expect(log.lines.some(l => l.includes('Waiting for client to connect'))).toBe(false);
+    });
+
+    it('detached: a guest who came and went between two polls still disarms it', async () => {
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        if (polls <= 3) return readySession({guestCount: 0});
+        // Never observed present (guestCount 0 on every poll), only recorded.
+        if (polls < 40) return readySession({guestCount: 0, firstGuestJoinedAt: '2026-09-23T04:12:15Z'});
+        return endedResponse;
+      });
+
+      await run();
+
+      expect(polls).toBeGreaterThanOrEqual(40);
+      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
+      expect(core.info).toHaveBeenCalledWith(expect.stringContaining('A guest joined'));
+    });
+
+    it('never treats guestCount as a join', async () => {
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+      // Forwarding-only presence: counted, never a qualifying join.
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('session info') ? readySession({guestCount: 1}) : ''));
+
+      await run();
+
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
+    });
+
+    it('re-checks right before stopping, and does not stop a session a guest just joined', async () => {
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        // 12 no-guest polls spend the minute; the 13th regular poll still sees
+        // nobody and finds the countdown at zero; the 14th lookup is the final
+        // re-check, and it is the one that sees the join. (Were the 13th to see
+        // it, the ordinary poll would disarm and this would not test the re-check.)
+        if (polls <= 13) return readySession();
+        if (polls < 20) return readySession({firstGuestJoinedAt: '2026-09-23T04:13:00Z'});
+        return endedResponse;
+      });
+
+      await run();
+
+      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
+      expect(polls).toBeGreaterThanOrEqual(20);
+    });
+
+    it('does not spend the countdown on lookups that fail', async () => {
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        if (polls < 30) throw new Error('Command failed with exit code 2\nStderr: registry unavailable');
+        return endedResponse;
+      });
+
+      await run();
+
+      expect(polls).toBeGreaterThanOrEqual(30);
+      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
+    });
+
+    it('detached: defaults to 10 minutes when wait-timeout-minutes is unset', async () => {
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        return readySession();
+      });
+
+      await run();
+
+      // 120 polls spend 10 minutes at 5 s each; the 121st finds the countdown
+      // at zero; the 122nd is the final re-check before stopping.
+      expect(polls).toBe(122);
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
+    });
+
+    it('attached: counts down from readiness only when wait-timeout-minutes is set', async () => {
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('session info')) return readySession();
+        return '';
+      });
+
+      await run();
+
+      expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('upterm session stop gha-'), expect.anything());
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
+    });
+
+    it('attached: without wait-timeout-minutes, waits for the session to end and never stops it itself', async () => {
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        return polls < 200 ? readySession() : endedResponse;
+      });
+
+      await run();
+
+      expect(polls).toBe(200);
+      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
+    });
   });
 
   describe('private per-run directories', () => {

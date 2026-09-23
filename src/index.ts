@@ -6,7 +6,7 @@ import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
 import {execShellCommand, launchOutsideJobObject, shellEscape, sleep} from './helpers';
-import {generateSessionName, getSession, isTerminal, isUptermVersionSupported, parseUptermVersion, SessionInfo, formatVersion, UPTERM_MIN_VERSION} from './session';
+import {generateSessionName, getSession, hasGuestJoined, isTerminal, isUptermVersionSupported, parseUptermVersion, SessionInfo, formatVersion, UPTERM_MIN_VERSION} from './session';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
@@ -46,7 +46,6 @@ interface UptermDirs {
   state: string;
   config: string;
   logs: {uptermCommand: string; tmuxError: string};
-  timeoutFlag: string;
 }
 
 // Cache for getUptermDirs() to avoid repeated path computation
@@ -157,8 +156,7 @@ function getUptermDirs(): UptermDirs {
     logs: {
       uptermCommand: path.join(state, 'upterm-command.log'), // Our action's log of upterm stdout/stderr
       tmuxError: path.join(state, 'tmux-error.log') // Our action's log of tmux stderr
-    },
-    timeoutFlag: path.join(base, 'timeout-flag') // Flag file for timeout detection
+    }
   };
   return uptermDirsCache;
 }
@@ -277,10 +275,6 @@ function toMsys2Path(filePath: string): string {
   return result;
 }
 
-function getUptermTimeoutFlagPath(): string {
-  return toMsys2Path(getUptermDirs().timeoutFlag);
-}
-
 function getUptermCommandLogPath(): string {
   return toMsys2Path(getUptermDirs().logs.uptermCommand);
 }
@@ -369,7 +363,7 @@ export async function run() {
       return;
     }
 
-    await monitorSession();
+    await waitForSession(attachedTimeoutSeconds(), `SSH: ${session.sshCommand}`);
   } catch (error: unknown) {
     if (error instanceof Error) {
       core.setFailed(error.message);
@@ -566,12 +560,6 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
   const xdg = exportXdgEnvironment();
   core.debug(`Created upterm directories under ${dirs.base}`);
 
-  // Remove any stale timeout flag left in a reused temp directory (e.g. on a
-  // self-hosted runner, or a second invocation in the same job). Otherwise
-  // monitorSession() would read the old flag via the native path and report a
-  // timeout for this fresh session before its timer has even been armed.
-  fs.rmSync(dirs.timeoutFlag, {force: true});
-
   // Create custom tmux config that sets XDG environment variables globally
   // Using a custom config file ensures both outer and inner tmux sessions get the same config
   const tmuxConf = `# Set XDG directories for upterm
@@ -664,28 +652,6 @@ Troubleshooting:
 
 For help, see: https://github.com/owenthereal/action-upterm/issues`;
     throw new Error(errorMsg);
-  }
-}
-
-async function setupSessionTimeout(waitTimeoutMinutes: string): Promise<void> {
-  const timeout = parseInt(waitTimeoutMinutes, 10);
-  const timeoutFlagPath = getUptermTimeoutFlagPath();
-
-  const timeoutScript = `
-    (
-      sleep $(( ${timeout} * 60 ));
-      if [ -z "$(tmux list-clients -t upterm -f '#{?client_readonly,,1}')" ]; then
-        echo "UPTERM_TIMEOUT_REACHED" > ${shellEscape(timeoutFlagPath)};
-        tmux kill-server;
-      fi
-    ) & disown
-  `;
-
-  try {
-    await execShellCommand(timeoutScript);
-    core.info(`wait-timeout-minutes set - will wait for ${waitTimeoutMinutes} minutes for someone to connect, otherwise shut down`);
-  } catch (error) {
-    throw new Error(`Failed to setup timeout: ${error}`);
   }
 }
 
@@ -795,22 +761,6 @@ async function collectDiagnostics(observed?: SessionInfo): Promise<string> {
 }
 
 /**
- * Report whether a guest has joined: true, false, or null for UNKNOWN.
- *
- * Null means upterm answered without the live detail that carries the counts.
- * A missing guestCount must never be read as zero - that would shut down a
- * session a developer is actively attached to.
- *
- * Takes the session rather than fetching one: the post loop already needs a
- * lookup for its terminal check, and two lookups per poll would double the
- * shell-outs and could disagree with each other within a single iteration.
- */
-function guestPresence(session: SessionInfo | null): boolean | null {
-  if (!session?.hasLiveDetail) return null;
-  return (session.guestCount ?? 0) > 0;
-}
-
-/**
  * One lookup per poll.
  *
  * Three outcomes, deliberately distinct. Collapsing 'unknown' into 'gone'
@@ -908,14 +858,9 @@ async function startUptermSession(): Promise<SessionInfo> {
   const allowedUsers = getAllowedUsers();
   const authorizedKeysParameter = buildAuthorizedKeysParameter(allowedUsers);
   const uptermServer = core.getInput('upterm-server');
-  const waitTimeoutMinutes = core.getInput('wait-timeout-minutes');
 
   await createUptermSession(uptermServer, authorizedKeysParameter);
   await sleep(UPTERM_INIT_DELAY);
-
-  if (waitTimeoutMinutes && core.getInput('detached') !== 'true') {
-    await setupSessionTimeout(waitTimeoutMinutes);
-  }
 
   const session = await waitForUptermReady();
   await outputSshCommand(session);
@@ -936,57 +881,107 @@ function logSessionEnded(session: SessionInfo): void {
   if (session.signal) core.info(`Signal: ${session.signal}`);
 }
 
-async function monitorSession(): Promise<void> {
-  core.debug('Entering main loop');
-  // Main loop: wait for /continue file or upterm exit
-  /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
-  while (true) {
-    if (continueFileExists()) {
-      core.info("Exiting debugging session because '/continue' file was created");
-      break;
-    }
-
-    // Check if timeout was reached before looking the session up
-    if (isTimeoutReached()) {
-      logTimeoutMessage();
-      break;
-    }
-
-    const poll = await pollSession();
-    if (poll.kind === 'gone') {
-      core.info("Exiting debugging session: 'upterm' quit");
-      break;
-    }
-    if (poll.kind === 'session') {
-      if (isTerminal(poll.session.status)) {
-        logSessionEnded(poll.session);
-        break;
-      }
-      if (poll.session.sshCommand) core.info(`Session ${poll.session.name} (${poll.session.status}): ${poll.session.sshCommand}`);
-    }
-    // poll.kind === 'unknown' falls through: a lookup that failed is not a
-    // session that ended. The checks at the top of the loop remain the exits.
-
-    await sleep(SESSION_STATUS_POLL_INTERVAL);
-  }
-}
-
 function continueFileExists(): boolean {
   const continuePath = process.platform === 'win32' ? CONTINUE_FILE_PATHS.win32 : CONTINUE_FILE_PATHS.unix;
   return fs.existsSync(continuePath) || fs.existsSync(path.join(process.env.GITHUB_WORKSPACE ?? '/', 'continue'));
 }
 
-function isTimeoutReached(): boolean {
-  // This is a Node fs check, so it must use the native filesystem path.
-  // getUptermTimeoutFlagPath() returns the MSYS "/c/..." form used by the bash
-  // writer in setupSessionTimeout(); Node cannot resolve that on Windows (it
-  // maps to C:\c\...), so check the native path the flag actually lives at.
-  return fs.existsSync(getUptermDirs().timeoutFlag);
+/**
+ * Ask upterm to end this run's session. Never throws: it is called from the
+ * countdown, from teardown and from a signal handler, and in none of them may a
+ * session that is already gone - `session stop` reports that and exits 0 - or a
+ * transient failure fail the job.
+ */
+async function stopSession(): Promise<void> {
+  const name = getSessionName();
+  try {
+    // Unescaped, as in the launch: generateSessionName() yields gha- + 8 hex
+    // characters, shell-safe by construction.
+    await execShellCommand(`upterm session stop ${name}`, {quiet: true});
+  } catch (error) {
+    core.warning(`Could not stop upterm session ${name}: ${error}`);
+  }
 }
 
-function logTimeoutMessage(): void {
-  core.info('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
-  core.info('The session was automatically shut down to prevent unnecessary resource usage');
+/** wait-timeout-minutes in attached mode: null when unset, so the wait is unbounded. */
+function attachedTimeoutSeconds(): number | null {
+  const input = core.getInput('wait-timeout-minutes');
+  return input ? parseInt(input, 10) * 60 : null;
+}
+
+/** wait-timeout-minutes in detached mode's post step: 10 minutes when unset, as in v1. */
+function detachedTimeoutSeconds(): number {
+  const minutes = parseInt(core.getInput('wait-timeout-minutes') || '10', 10);
+  return (isNaN(minutes) || minutes <= 0 ? 10 : minutes) * 60;
+}
+
+type WaitEnd = 'continue' | 'ended' | 'timeout';
+
+/**
+ * Wait for this run's session to end, for the continue file, or - while no guest
+ * has ever joined - for the countdown to run out, in which case the session is
+ * stopped.
+ *
+ * "Has a guest ever joined" is upterm's firstGuestJoinedAt, never guestCount:
+ * the daemon records it from its own join events, so a guest who came and went
+ * between two polls, or during the build before the post step began, is not
+ * missed, and forwarding-only connections - which guestCount includes - do not
+ * count. Once seen, the countdown is disarmed for the rest of the session.
+ *
+ * Only a lookup that succeeded spends the countdown. A failed one ('unknown')
+ * says nothing about who is there, and spending time on it could stop a session
+ * somebody is in.
+ */
+async function waitForSession(timeoutSeconds: number | null, message: string): Promise<WaitEnd> {
+  let remaining = timeoutSeconds;
+  let joined = false;
+  const noteJoin = (session: SessionInfo) => {
+    if (joined || !hasGuestJoined(session)) return;
+    joined = true;
+    core.info(`A guest joined at ${session.firstGuestJoinedAt}; the session stays up until it ends`);
+  };
+
+  /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
+  while (true) {
+    if (continueFileExists()) {
+      core.info("Exiting debugging session because '/continue' file was created");
+      return 'continue';
+    }
+
+    const poll = await pollSession();
+    if (poll.kind === 'gone') {
+      core.info("Exiting debugging session: 'upterm' quit");
+      return 'ended';
+    }
+    if (poll.kind === 'session') {
+      if (isTerminal(poll.session.status)) {
+        logSessionEnded(poll.session);
+        return 'ended';
+      }
+      noteJoin(poll.session);
+      // Evidence in the log that this process resolved the session main published.
+      core.info(`Session ${poll.session.name} (${poll.session.status})`);
+    }
+
+    const counting = remaining !== null && !joined;
+    console.log(`${counting ? `Waiting for client to connect (at most ${remaining} more second(s))` : 'Waiting for session to end'}\n${message}`);
+
+    if (counting && (remaining as number) <= 0) {
+      // A last look before acting: a guest may have joined since the poll above.
+      const last = await pollSession();
+      if (last.kind === 'session') noteJoin(last.session);
+      if (!joined) {
+        core.warning(`Timed out waiting for client to connect (after ${timeoutSeconds} seconds)`);
+        core.info('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
+        await stopSession();
+        return 'timeout';
+      }
+      continue;
+    }
+
+    await sleep(SESSION_STATUS_POLL_INTERVAL);
+    if (counting && poll.kind === 'session') remaining = (remaining as number) - SESSION_STATUS_POLL_INTERVAL / 1000;
+  }
 }
 
 async function runDetachedMode(session: SessionInfo): Promise<void> {
@@ -1032,7 +1027,7 @@ function cleanupUptermData(): void {
  *
  * Order matters: the runtime directory holds the live admin/attach sockets, so
  * removing it under a running host unlinks them out from under it. Nothing in
- * the non-detached path stops the host - monitorSession() merely breaks - so
+ * the non-detached path stops the host - waitForSession() merely returns - so
  * the post step is where teardown happens, for every mode.
  *
  * Process teardown is SCOPED: it kills only the two sessions this action
@@ -1088,48 +1083,7 @@ async function runPost(): Promise<void> {
 
     core.debug('Waiting for session to end');
 
-    let waitTimeoutSeconds = parseInt(core.getInput('wait-timeout-minutes') || '10', 10) * 60;
-    if (isNaN(waitTimeoutSeconds) || waitTimeoutSeconds <= 0) {
-      waitTimeoutSeconds = 10 * 60; // Default 10 minutes
-    }
-
-    let anyoneConnected = false;
-
-    for (let seconds = waitTimeoutSeconds; seconds > 0; ) {
-      const poll = await pollSession();
-      const connected = poll.kind === 'session' ? guestPresence(poll.session) : null;
-      if (connected === true) anyoneConnected = true;
-
-      // Prove, in the log, that this fresh post process resolved the SAME named
-      // session that main published - the only visible evidence that XDG state
-      // was restored across the process boundary.
-      if (poll.kind === 'session') core.info(`Session ${poll.session.name} (${poll.session.status})`);
-
-      console.log(`${anyoneConnected ? 'Waiting for session to end' : `Waiting for client to connect (at most ${seconds} more second(s))`}\n${message}`);
-
-      if (continueFileExists()) {
-        core.info("Exiting debugging session because '/continue' file was created");
-        break;
-      }
-
-      if (poll.kind === 'gone') {
-        core.info("Exiting debugging session: 'upterm' quit");
-        break;
-      }
-      if (poll.kind === 'session' && isTerminal(poll.session.status)) {
-        logSessionEnded(poll.session);
-        break;
-      }
-      // poll.kind === 'unknown' falls through: a failed lookup is not a
-      // finished session.
-
-      await sleep(5000);
-      // Only spend the countdown on a CONFIRMED "nobody here". `null` means
-      // upterm could not tell us, and treating that as "nobody" would shut down
-      // a session someone is attached to.
-      if (!anyoneConnected && connected === false) seconds -= 5;
-      if (seconds <= 0) core.warning(`Timed out waiting for client to connect (after ${waitTimeoutSeconds})`);
-    }
+    await waitForSession(detachedTimeoutSeconds(), message);
   } finally {
     await finalizeSession();
   }
