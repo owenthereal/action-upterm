@@ -130,7 +130,7 @@ function baselineInputs(): void {
 function baselineShell(...sessionResponses: string[]): void {
   const queue = sessionResponses.length ? [...sessionResponses] : [readySession()];
   mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-    if (cmd.includes('upterm version')) return 'Upterm version v0.30.0\n';
+    if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
     if (cmd.includes('session info')) return queue.length > 1 ? (queue.shift() as string) : queue[0];
     return 'foobar';
   });
@@ -229,28 +229,22 @@ describe('upterm GitHub integration', () => {
 
   describe('upterm version gate', () => {
     it('fails with an actionable message when the pinned upterm is too old', async () => {
-      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.20.0');
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('upterm version') ? 'Upterm version v0.20.0\n' : ''));
+      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.30.0');
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('upterm version') ? 'Upterm version 0.30.0\n' : ''));
 
       await run();
 
-      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('requires upterm >= v0.30.0'));
-      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('v1.15.0'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('requires upterm >= v0.31.0'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('owenthereal/action-upterm@v1'));
     });
 
-    it('proceeds with a warning when the version string is unrecognized', async () => {
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('upterm version')) return 'Upterm version dev\n';
-        // The run must actually proceed past the gate, so the session lookup
-        // has to answer with real JSON rather than an empty string.
-        if (cmd.includes('session info')) return readySession();
-        return '';
-      });
+    it('refuses a version string it cannot read instead of guessing', async () => {
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('upterm version') ? 'upterm dev build\n' : ''));
 
       await run();
 
-      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Could not determine the installed upterm version'));
-      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Could not determine the installed upterm version'));
+      expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('upterm host'));
     });
 
     it('fails with a contextual message when the version check itself cannot run', async () => {
@@ -684,7 +678,7 @@ describe('upterm GitHub integration', () => {
     // Second call is from monitorSession() - should fail with connection refused
     let sessionInfoCallCount = 0;
     mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.30.0\n');
+      if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.31.0\n');
       if (cmd.includes('session info')) {
         sessionInfoCallCount++;
         if (sessionInfoCallCount === 2) {
@@ -742,7 +736,7 @@ describe('upterm GitHub integration', () => {
     // First lookup (readiness) succeeds; every one after it fails.
     let polls = 0;
     mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.30.0\n');
+      if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.31.0\n');
       if (cmd.includes('session info')) {
         polls++;
         if (polls === 1) return Promise.resolve(readySession());
@@ -915,7 +909,7 @@ describe('upterm GitHub integration', () => {
       // collectDiagnostics(), the report written for exactly this case.
       let polls = 0;
       mockedExecShellCommand.mockImplementation((cmd: string) => {
-        if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.30.0\n');
+        if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.31.0\n');
         if (cmd.includes('session info')) {
           polls++;
           if (polls === 1) return Promise.reject(new Error('Command failed with exit code 1: connection refused'));

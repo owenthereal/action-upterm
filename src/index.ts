@@ -6,7 +6,7 @@ import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
 import {execShellCommand, launchOutsideJobObject, shellEscape, sleep} from './helpers';
-import {generateSessionName, getSession, isTerminal, isUptermVersionSupported, parseUptermVersion, SessionInfo} from './session';
+import {generateSessionName, getSession, isTerminal, isUptermVersionSupported, parseUptermVersion, SessionInfo, formatVersion, UPTERM_MIN_VERSION} from './session';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
@@ -455,11 +455,13 @@ async function installDependencies(): Promise<void> {
 }
 
 /**
- * Refuse to run against an upterm older than 0.30.
+ * Refuse to run against an upterm older than v0.31.0.
  *
- * The action addresses its session with `--name` and `upterm session info NAME
- * -o json`, neither of which exists before 0.30. Failing here beats failing
- * later with a socket that was never going to be found.
+ * v0.31.0 is the first upterm that publishes firstGuestJoinedAt. v2 decides
+ * whether to stop an unanswered session from this field, and an older upterm
+ * always omits it, which would read as "nobody joined" and stop a session
+ * somebody is in. Older versions are refused, not guessed at - including a
+ * version string that cannot be parsed, which v1 only warned about.
  */
 async function assertSupportedUptermVersion(): Promise<void> {
   let output: string;
@@ -470,17 +472,17 @@ async function assertSupportedUptermVersion(): Promise<void> {
   }
 
   const version = parseUptermVersion(output);
+  const floor = formatVersion(UPTERM_MIN_VERSION);
 
+  // Refused, not warned about: v2 decides whether to stop a session from a
+  // field older upterms never publish, and an unknown version is an unknown
+  // answer to "can this upterm say whether anyone joined?".
   if (!version) {
-    core.warning(`Could not determine the installed upterm version from: ${output.trim()}. Continuing, but this action requires upterm >= v0.30.0.`);
-    return;
+    throw new Error(`Could not determine the installed upterm version from: ${output.trim()}. action-upterm v2 requires upterm >= ${floor}.`);
   }
 
   if (!isUptermVersionSupported(version)) {
-    throw new Error(
-      `action-upterm requires upterm >= v0.30.0 (found v${version.major}.${version.minor}.${version.patch}). ` +
-        `Remove the upterm-version input to use the latest release, or pin owenthereal/action-upterm@v1.15.0 to keep using an older upterm.`
-    );
+    throw new Error(`action-upterm v2 requires upterm >= ${floor} (found ${formatVersion(version)}). ` + `Remove the upterm-version input to use the latest release, or pin owenthereal/action-upterm@v1 to keep using an older upterm.`);
   }
 }
 
