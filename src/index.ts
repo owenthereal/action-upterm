@@ -5,13 +5,22 @@ import path from 'path';
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
-import {execShellCommand, launchOutsideJobObject, sleep} from './helpers';
+import {execShellCommand, launchOutsideJobObject, shellEscape, sleep} from './helpers';
+import {generateSessionName, getSession, isTerminal, isUptermVersionSupported, parseUptermVersion, SessionInfo} from './session';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
-const UPTERM_SOCKET_POLL_INTERVAL = 1000;
-const UPTERM_READY_MAX_RETRIES = 10;
+const UPTERM_READY_POLL_INTERVAL = 1000;
+// Readiness now requires upterm's second, unlocked admin round-trip to have
+// succeeded - strictly harder than the old "does a socket inode exist" check,
+// and a slow first attempt costs a whole retry. A wider budget costs nothing on
+// the happy path (the loop returns on its first success) and the alternative is
+// a hard failure on a session that was about to be fine.
+const UPTERM_READY_MAX_RETRIES = 30;
 const SESSION_STATUS_POLL_INTERVAL = 5000;
+// Consecutive failed lookups between warnings, ~1 minute at the 5s poll
+// interval. The first failure always warns.
+const UNKNOWN_POLL_WARN_INTERVAL = 12;
 const SUPPORTED_UPTERM_ARCHITECTURES = ['amd64', 'arm64'] as const;
 const TMUX_DIMENSIONS = {width: 132, height: 43};
 // Delay (in milliseconds) to allow upterm sufficient time to initialize before proceeding.
@@ -43,18 +52,108 @@ interface UptermDirs {
 // Cache for getUptermDirs() to avoid repeated path computation
 let uptermDirsCache: UptermDirs | null = null;
 
+// upterm refuses any socket path longer than this many bytes, on every platform
+// (host/sessiondir/sessiondir.go:87, `maxSocketPath = 103`). The path it
+// measures is $XDG_RUNTIME_DIR/upterm/sessions/<name>/attach.sock
+// (utils/utils.go:43,84-86 append `upterm`; sessiondir.go:154-160
+// CheckSocketPath), and it measures it while validating `upterm host --name`
+// (cmd/upterm/command/host.go:320-331) - so an over-long root makes
+// `upterm host` exit immediately, before any session record exists.
+const UPTERM_MAX_SOCKET_PATH = 103;
+// Kept short on purpose: every byte here comes out of the socket budget above.
+const RUNTIME_DIR_PREFIX = 'upterm-rt-';
+// fs.mkdtempSync appends exactly six characters to its prefix.
+const MKDTEMP_SUFFIX_PLACEHOLDER = 'XXXXXX';
+
+/**
+ * Root for this run's base directory (tmux.conf, state, config, timeout flag).
+ *
+ * The base directory holds no sockets, so its length does not matter.
+ * RUNNER_TEMP is reaped by the runner per job.
+ */
+function tempRoot(): string {
+  return process.env.RUNNER_TEMP || os.tmpdir();
+}
+
+/** The attach socket path upterm will measure if the runtime dir is created under `root`. */
+function runtimeSocketPath(root: string, sessionName: string): string {
+  return path.join(root, `${RUNTIME_DIR_PREFIX}${MKDTEMP_SUFFIX_PLACEHOLDER}`, 'upterm', 'sessions', sessionName, 'attach.sock');
+}
+
+/**
+ * Root for this run's runtime directory (XDG_RUNTIME_DIR, which holds upterm's
+ * sockets): the first candidate whose socket path fits upterm's budget.
+ *
+ * This deliberately departs from the design spec, which said no action-side
+ * length check was needed because upterm's own check reports it better. That
+ * reasoning assumed the user picks the root. The action does: it overrides
+ * XDG_RUNTIME_DIR, so a runner whose RUNNER_TEMP is too long - GitHub's default
+ * self-hosted layout, ~/actions-runner/_work/_temp, under a long user name -
+ * could never start a session, and the user could not fix it.
+ *
+ * /tmp is the last resort, non-Windows only. It is reached only when both
+ * preferred roots are too long. Unlike RUNNER_TEMP it is not reaped by the
+ * runner, so the directory is removed only if the post step runs - a cancelled
+ * job leaves it behind. If /tmp is unwritable, mkdtempSync fails with a clear
+ * error.
+ */
+function runtimeRoot(sessionName: string): string {
+  const runnerTemp = process.env.RUNNER_TEMP;
+  const candidates = [...new Set([runnerTemp, os.tmpdir(), ...(process.platform === 'win32' ? [] : ['/tmp'])].filter((c): c is string => !!c))];
+  const tooLong: string[] = [];
+
+  for (const candidate of candidates) {
+    const socketPath = runtimeSocketPath(candidate, sessionName);
+    // Bytes, not characters: upterm compares len() of a Go string.
+    const bytes = Buffer.byteLength(socketPath);
+    if (bytes > UPTERM_MAX_SOCKET_PATH) {
+      tooLong.push(`${socketPath} is ${bytes} bytes`);
+      continue;
+    }
+    if (candidate !== runnerTemp) {
+      const why = tooLong.length ? `${tooLong.join('; ')}, over upterm's ${UPTERM_MAX_SOCKET_PATH}-byte socket path limit` : 'RUNNER_TEMP is not set';
+      core.info(`Using ${candidate} for upterm's runtime directory: ${why}`);
+    }
+    return candidate;
+  }
+
+  throw new Error(
+    `Cannot create upterm's runtime directory: every candidate gives a socket path over upterm's ${UPTERM_MAX_SOCKET_PATH}-byte limit (${tooLong.join('; ')}). ` +
+      'Use a shorter runner work folder (it contains RUNNER_TEMP), or on Windows point TMP/TEMP at a shorter directory.'
+  );
+}
+
+function createPrivateDir(root: string, prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(root, prefix));
+  fs.chmodSync(dir, 0o700);
+  return dir;
+}
+
 function getUptermDirs(): UptermDirs {
   if (uptermDirsCache) {
     return uptermDirsCache;
   }
 
-  const base = path.join(os.tmpdir(), 'upterm-data');
+  // The post process is a separate Node process: it restores what main saved
+  // rather than minting fresh directories that would point nowhere.
+  const savedBase = core.getState('uptermBaseDir');
+  const savedRuntime = core.getState('uptermRuntimeDir');
+
+  // Each directory is saved as soon as it exists: runtimeRoot() can throw, and
+  // the post step can only remove a base directory it was told about.
+  const base = savedBase || createPrivateDir(tempRoot(), 'upterm-action-');
+  if (!savedBase) core.saveState('uptermBaseDir', base);
+  // getSessionName() is memoized, so the name measured here is the one passed
+  // to `upterm host --name`.
+  const runtime = savedRuntime || createPrivateDir(runtimeRoot(getSessionName()), RUNTIME_DIR_PREFIX);
+  if (!savedRuntime) core.saveState('uptermRuntimeDir', runtime);
+
   const state = path.join(base, 'state');
   uptermDirsCache = {
     base,
-    runtime: path.join(base, 'runtime'), // XDG_RUNTIME_DIR - for sockets
-    state, // XDG_STATE_HOME - for upterm's internal logs
-    config: path.join(base, 'config'), // XDG_CONFIG_HOME - for config files
+    runtime, // XDG_RUNTIME_DIR - for sockets
+    state, // XDG_STATE_HOME - for upterm's session records and logs
+    config: path.join(base, 'config'), // XDG_CONFIG_HOME
     logs: {
       uptermCommand: path.join(state, 'upterm-command.log'), // Our action's log of upterm stdout/stderr
       tmuxError: path.join(state, 'tmux-error.log') // Our action's log of tmux stderr
@@ -62,6 +161,66 @@ function getUptermDirs(): UptermDirs {
     timeoutFlag: path.join(base, 'timeout-flag') // Flag file for timeout detection
   };
   return uptermDirsCache;
+}
+
+// Cache for getSessionName(); the name must be identical for every call within
+// a process, and identical across main and post.
+let sessionNameCache: string | null = null;
+
+/**
+ * This run's session name.
+ *
+ * Minted once in main and saved as state, so the post process - a separate Node
+ * process - addresses the same session rather than inventing a new name that
+ * matches nothing.
+ */
+function getSessionName(): string {
+  if (sessionNameCache) return sessionNameCache;
+  const saved = core.getState('sessionName');
+  sessionNameCache = saved || generateSessionName();
+  if (!saved) core.saveState('sessionName', sessionNameCache);
+  return sessionNameCache;
+}
+
+/** The XDG values in the form upterm and the shell expect them. */
+interface XdgPaths {
+  runtime: string;
+  state: string;
+  config: string;
+}
+
+/**
+ * Export XDG_* to this process so the action's own `upterm session info` calls
+ * resolve the same session record the host published to, and return the
+ * converted values for anyone who needs to write them somewhere else.
+ *
+ * upterm finds a session's record through XDG_STATE_HOME
+ * (cmd/upterm/command/session.go:425). Until now the action only set these
+ * inside tmux.conf, because every query passed --admin-socket explicitly.
+ * execShellCommand inherits process.env on both platforms (see its spawn call),
+ * so one assignment covers every call site, in main and in post alike.
+ *
+ * The conversion lives here and only here. XDG_STATE_HOME must agree exactly
+ * between the host process (which publishes the record) and every query (which
+ * resolves it); a second copy of `win32 ? toMsys2Path : toShellPath` elsewhere
+ * would agree only by coincidence, and diverge silently - on one platform only
+ * - the first time either copy is edited.
+ */
+function exportXdgEnvironment(): XdgPaths {
+  const dirs = getUptermDirs();
+  // On Windows, upterm.exe expects POSIX-style paths in XDG vars (e.g., /c/Users/... not C:/Users/...)
+  const convert = process.platform === 'win32' ? toMsys2Path : toShellPath;
+  const xdg: XdgPaths = {
+    runtime: convert(dirs.runtime),
+    state: convert(dirs.state),
+    config: convert(dirs.config)
+  };
+
+  process.env.XDG_RUNTIME_DIR = xdg.runtime;
+  process.env.XDG_STATE_HOME = xdg.state;
+  process.env.XDG_CONFIG_HOME = xdg.config;
+
+  return xdg;
 }
 
 // Utility Functions
@@ -116,27 +275,6 @@ function toMsys2Path(filePath: string): string {
     result = result.replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`);
   }
   return result;
-}
-
-/**
- * Escape a string for safe use in single-quoted shell arguments.
- * Handles paths that may contain single quotes by using the '\'' escape pattern.
- *
- * Use this for:
- * - User-provided strings (server URLs, GitHub usernames)
- * - File paths in shell commands
- * - Any value passed through nested command layers
- *
- * @example
- * shellEscape("hello world")           // => "'hello world'"
- * shellEscape("user's file")           // => "'user'\''s file'"
- * shellEscape("ssh://server:22")       // => "'ssh://server:22'"
- *
- * @param value - The string to escape
- * @returns Single-quoted string safe for shell use
- */
-function shellEscape(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 function getUptermTimeoutFlagPath(): string {
@@ -222,12 +360,12 @@ export async function run() {
     core.saveState('isPost', 'true');
 
     await installDependencies();
+    await assertSupportedUptermVersion();
     await setupSSH();
-    await startUptermSession();
+    const session = await startUptermSession();
 
-    const detached = core.getInput('detached');
-    if (detached === 'true') {
-      await runDetachedMode();
+    if (core.getInput('detached') === 'true') {
+      await runDetachedMode(session);
       return;
     }
 
@@ -316,6 +454,36 @@ async function installDependencies(): Promise<void> {
   }
 }
 
+/**
+ * Refuse to run against an upterm older than 0.30.
+ *
+ * The action addresses its session with `--name` and `upterm session info NAME
+ * -o json`, neither of which exists before 0.30. Failing here beats failing
+ * later with a socket that was never going to be found.
+ */
+async function assertSupportedUptermVersion(): Promise<void> {
+  let output: string;
+  try {
+    output = await execShellCommand('upterm version');
+  } catch (error) {
+    throw new Error(`Failed to check the installed upterm version: ${error}\n\nEnsure upterm was installed successfully and is executable on PATH.`);
+  }
+
+  const version = parseUptermVersion(output);
+
+  if (!version) {
+    core.warning(`Could not determine the installed upterm version from: ${output.trim()}. Continuing, but this action requires upterm >= v0.30.0.`);
+    return;
+  }
+
+  if (!isUptermVersionSupported(version)) {
+    throw new Error(
+      `action-upterm requires upterm >= v0.30.0 (found v${version.major}.${version.minor}.${version.patch}). ` +
+        `Remove the upterm-version input to use the latest release, or pin owenthereal/action-upterm@v1.15.0 to keep using an older upterm.`
+    );
+  }
+}
+
 async function generateSSHKeys(sshPath: string): Promise<void> {
   const idRsaPath = path.join(sshPath, 'id_rsa');
   const idEd25519Path = path.join(sshPath, 'id_ed25519');
@@ -390,6 +558,10 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
   fs.mkdirSync(dirs.runtime, {recursive: true});
   fs.mkdirSync(dirs.state, {recursive: true});
   fs.mkdirSync(dirs.config, {recursive: true});
+  // The same triple that goes into this process's environment goes into
+  // tmux.conf below: the host and every later query must agree on XDG_STATE_HOME
+  // or the session record cannot be resolved.
+  const xdg = exportXdgEnvironment();
   core.debug(`Created upterm directories under ${dirs.base}`);
 
   // Remove any stale timeout flag left in a reused temp directory (e.g. on a
@@ -398,21 +570,17 @@ async function createUptermSession(uptermServer: string, authorizedKeysParameter
   // timeout for this fresh session before its timer has even been armed.
   fs.rmSync(dirs.timeoutFlag, {force: true});
 
-  // On Windows, upterm.exe expects POSIX-style paths in XDG vars (e.g., /c/Users/... not C:/Users/...)
-  const xdgPathConverter = process.platform === 'win32' ? toMsys2Path : toShellPath;
-  const xdgRuntimeDir = xdgPathConverter(dirs.runtime);
-  const xdgStateHome = xdgPathConverter(dirs.state);
-  const xdgConfigHome = xdgPathConverter(dirs.config);
-
   // Create custom tmux config that sets XDG environment variables globally
   // Using a custom config file ensures both outer and inner tmux sessions get the same config
   const tmuxConf = `# Set XDG directories for upterm
-set-environment -g XDG_RUNTIME_DIR "${xdgRuntimeDir}"
-set-environment -g XDG_STATE_HOME "${xdgStateHome}"
-set-environment -g XDG_CONFIG_HOME "${xdgConfigHome}"
+set-environment -g XDG_RUNTIME_DIR "${xdg.runtime}"
+set-environment -g XDG_STATE_HOME "${xdg.state}"
+set-environment -g XDG_CONFIG_HOME "${xdg.config}"
 
-# Allow UPTERM_ADMIN_SOCKET to be inherited from client environment
-# This enables 'upterm session current' to work without --admin-socket flag
+# Allow UPTERM_ADMIN_SOCKET to be inherited from client environment.
+# The action itself no longer runs 'upterm session current' - it addresses the
+# session by name - but a human who runs it from a shell inside the session
+# still needs the variable to reach their tmux client.
 set-option -ga update-environment " UPTERM_ADMIN_SOCKET"
 
 # Enable aggressive window resizing for better multi-client support
@@ -432,7 +600,17 @@ setw -g aggressive-resize on
   const tmuxConfFlagInner = `-f ${tmuxConfPathPosix}`;
 
   try {
-    const tmuxCmd = `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -f read-only -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`;
+    // getSessionName() is interpolated raw, unlike every other value here:
+    // generateSessionName() produces `gha-` + 8 hex chars and nothing else, so
+    // it is shell-safe by construction. Any change that lets a name carry
+    // user input must wrap it in shellEscape(), as session.ts already does.
+    const tmuxCmd = `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --name ${getSessionName()} --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -f read-only -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`;
+
+    // Evidence for the post step that process teardown is warranted. isPost is
+    // saved before installDependencies(), so without this a failed download or
+    // a rejected upterm version would reach finalizeSession() and kill tmux
+    // sessions named upterm-wrapper/upterm that this run never created.
+    core.saveState('sessionStarted', 'true');
 
     if (process.platform === 'win32') {
       // On Windows, launch the tmux/upterm process tree outside the
@@ -447,10 +625,14 @@ setw -g aggressive-resize on
       // MSYSTEM and CHERE_INVOKING are set by the launch script itself
       // (the WMI-spawned process has a minimal environment), so we only
       // need to forward PATH and HOME here.
-      launchOutsideJobObject(tmuxCmd, {
-        PATH: process.env.PATH || '',
-        HOME: process.env.USERPROFILE || os.homedir()
-      });
+      launchOutsideJobObject(
+        tmuxCmd,
+        {
+          PATH: process.env.PATH || '',
+          HOME: process.env.USERPROFILE || os.homedir()
+        },
+        getUptermDirs().base
+      );
     } else {
       await execShellCommand(tmuxCmd);
     }
@@ -505,29 +687,54 @@ async function setupSessionTimeout(waitTimeoutMinutes: string): Promise<void> {
   }
 }
 
-async function collectDiagnostics(): Promise<string> {
+/**
+ * Build the readiness-failure report.
+ *
+ * Takes the session readiness last observed, when its last poll saw one: a
+ * second lookup could disagree with the one that decided to give up. Falls
+ * back to a fresh lookup otherwise.
+ */
+async function collectDiagnostics(observed?: SessionInfo): Promise<string> {
   const dirs = getUptermDirs();
-  const uptermDir = getUptermSocketDir();
-  let diagnostics = 'Failed to start upterm - socket not found after maximum retries.\n\nDiagnostics:\n';
+  const name = getSessionName();
+
+  let lookupFailure = '';
+  const session =
+    observed ??
+    (await getSession(name).catch(error => {
+      lookupFailure = `- Session lookup failed: ${error}\n`;
+      return null;
+    }));
+
+  // A session that ended is not one that was slow: a misconfigured
+  // upterm-server ends it on the first poll, with retries to spare.
+  const headline = session && isTerminal(session.status) ? `Upterm session ended before it became ready (status: ${session.status}).` : 'Upterm did not become ready after maximum retries.';
+  let diagnostics = `${headline}\n\nDiagnostics:\n`;
 
   diagnostics += `- Upterm data directory: ${dirs.base}\n`;
-  diagnostics += `- Expected socket directory: ${uptermDir}\n`;
+  diagnostics += `- Session name: ${name}\n`;
+  diagnostics += lookupFailure;
 
-  if (fs.existsSync(uptermDir)) {
-    const files = fs.readdirSync(uptermDir);
-    diagnostics += `- Socket directory contains: ${files.join(', ')}\n`;
+  diagnostics += `- Session status: ${session ? session.status : 'no session record found'}\n`;
+  // Only meaningful for a session that should still be answering: a terminal
+  // one has no admin socket left to query, so the absence of live detail there
+  // is expected, not a failure.
+  if (session && !isTerminal(session.status) && !session.hasLiveDetail) diagnostics += '- Upterm answered from its record only; its admin query did not succeed\n';
+  if (session?.reason) diagnostics += `- Reason: ${session.reason}\n`;
+  if (session?.exitCode !== undefined) diagnostics += `- Exit code: ${session.exitCode}\n`;
+  if (session?.signal) diagnostics += `- Signal: ${session.signal}\n`;
 
-    const logPath = path.join(uptermDir, 'upterm.log');
-    if (fs.existsSync(logPath)) {
-      try {
-        const logContent = fs.readFileSync(logPath, 'utf8');
-        diagnostics += `- Upterm log:\n${logContent}\n`;
-      } catch (error) {
-        diagnostics += `- Could not read upterm.log: ${error}\n`;
-      }
+  // upterm writes its log under XDG_STATE_HOME, not the runtime dir - the old
+  // path never existed, so this section was always silently omitted.
+  //
+  // Guarded: an unreadable log must cost only its own section. Unguarded, the
+  // error escapes this function and replaces the entire report.
+  if (session?.logPath && fs.existsSync(session.logPath)) {
+    try {
+      diagnostics += `- Upterm log:\n${fs.readFileSync(session.logPath, 'utf8')}\n`;
+    } catch (error) {
+      diagnostics += `- Could not read upterm log (${session.logPath}): ${error}\n`;
     }
-  } else {
-    diagnostics += '- Socket directory does not exist\n';
   }
 
   // Check tmux sessions
@@ -585,48 +792,117 @@ async function collectDiagnostics(): Promise<string> {
   return diagnostics;
 }
 
-async function waitForUptermReady(): Promise<void> {
+/**
+ * Report whether a guest has joined: true, false, or null for UNKNOWN.
+ *
+ * Null means upterm answered without the live detail that carries the counts.
+ * A missing guestCount must never be read as zero - that would shut down a
+ * session a developer is actively attached to.
+ *
+ * Takes the session rather than fetching one: the post loop already needs a
+ * lookup for its terminal check, and two lookups per poll would double the
+ * shell-outs and could disagree with each other within a single iteration.
+ */
+function guestPresence(session: SessionInfo | null): boolean | null {
+  if (!session?.hasLiveDetail) return null;
+  return (session.guestCount ?? 0) > 0;
+}
+
+/**
+ * One lookup per poll.
+ *
+ * Three outcomes, deliberately distinct. Collapsing 'unknown' into 'gone'
+ * would make a transient registry hiccup end a live debugging session - the
+ * exact failure this whole change exists to remove.
+ */
+type PollResult = {kind: 'session'; session: SessionInfo} | {kind: 'gone'} | {kind: 'unknown'};
+
+/**
+ * Consecutive failed lookups, reset by the first success.
+ *
+ * 'unknown' deliberately exits nothing and spends no countdown, so a lookup
+ * that fails on EVERY iteration leaves a loop with no exit and a log that
+ * repeats the same unchanging number. Warning makes that visible to a human who
+ * can act on it; the deferral itself is not negotiable, because spending the
+ * countdown on an unknown can shut down a session a developer is attached to.
+ */
+let consecutiveUnknownPolls = 0;
+
+async function pollSession(): Promise<PollResult> {
+  try {
+    const session = await getSession(getSessionName());
+    consecutiveUnknownPolls = 0;
+    return session ? {kind: 'session', session} : {kind: 'gone'};
+  } catch (error) {
+    consecutiveUnknownPolls++;
+    // Warn on the first failure, then roughly once a minute. core.debug alone is
+    // invisible at default verbosity, which is how this failure mode stayed
+    // silent.
+    if (consecutiveUnknownPolls === 1 || consecutiveUnknownPolls % UNKNOWN_POLL_WARN_INTERVAL === 0) {
+      core.warning(`Could not query the upterm session (attempt ${consecutiveUnknownPolls}): ${error}. Still waiting; the session may still be live.`);
+    } else {
+      core.debug(`Session lookup failed, treating as unknown: ${error}`);
+    }
+    return {kind: 'unknown'};
+  }
+}
+
+/**
+ * Wait until the session is genuinely usable.
+ *
+ * Readiness requires BOTH status === 'ready' AND live detail. upterm returns
+ * "ready" from the record alone when its admin query fails
+ * (cmd/upterm/command/session.go:485-488), and a "ready" session with no
+ * sshCommand is one nobody can connect to.
+ */
+async function waitForUptermReady(): Promise<SessionInfo> {
   let tries = UPTERM_READY_MAX_RETRIES;
+  // What the LAST poll saw, if it saw a session - handed to the diagnostics so
+  // the report describes the state that ended the wait.
+  let lastObserved: SessionInfo | undefined;
+
   while (tries-- > 0) {
     core.info(`Waiting for upterm to be ready... (${UPTERM_READY_MAX_RETRIES - tries}/${UPTERM_READY_MAX_RETRIES})`);
-    if (uptermSocketExists()) return;
-    await sleep(UPTERM_SOCKET_POLL_INTERVAL);
+    const poll = await pollSession();
+    lastObserved = poll.kind === 'session' ? poll.session : undefined;
+
+    if (poll.kind === 'session') {
+      if (poll.session.status === 'ready' && poll.session.hasLiveDetail) return poll.session;
+      if (isTerminal(poll.session.status)) break;
+    }
+    // 'gone' (the record is not published this early) and 'unknown' (the lookup
+    // itself failed) both mean "not ready YET", never "failed": burn a retry,
+    // exactly as a `starting` status does. An unguarded lookup here would let
+    // one hiccup abandon the remaining retries and fail the job - and would
+    // skip collectDiagnostics(), the report written for precisely this case.
+
+    await sleep(UPTERM_READY_POLL_INTERVAL);
   }
 
-  // Socket not found after retries, collect diagnostics
-  const diagnostics = await collectDiagnostics();
-  throw new Error(diagnostics);
+  throw new Error(await collectDiagnostics(lastObserved));
 }
 
-async function outputSshCommand(): Promise<string | null> {
+async function outputSshCommand(session: SessionInfo): Promise<string | null> {
+  const sshCommand = session.sshCommand;
+  if (!sshCommand) {
+    core.warning('Upterm reported a session without an SSH command');
+    return null;
+  }
+
+  core.setOutput('ssh-command', sshCommand);
+  core.info(`SSH command available as output: ${sshCommand}`);
+  // The job summary is a convenience. write() throws when GITHUB_STEP_SUMMARY
+  // is unset (older GHES, some runner setups), and that must not fail a
+  // session that is already up.
   try {
-    const socketPath = findUptermSocket();
-    if (!socketPath) {
-      core.warning('Could not find upterm socket to retrieve SSH command');
-      return null;
-    }
-
-    const sessionInfo = await execShellCommand(`upterm session current --admin-socket "${socketPath}"`);
-
-    // Parse SSH command from session info
-    const sshMatch = sessionInfo.match(/ssh\s+(\S+@\S+)/i);
-    if (sshMatch) {
-      const sshCommand = `ssh ${sshMatch[1]}`;
-      core.setOutput('ssh-command', sshCommand);
-
-      // Also write to job summary for easy retrieval via API
-      await core.summary.addHeading('Upterm SSH Connection').addCodeBlock(sshCommand, 'bash').addRaw(`\n\nConnect with: <code>${sshCommand}</code>`).write();
-
-      core.info(`SSH command available as output: ${sshCommand}`);
-      return sshCommand;
-    }
+    await core.summary.addHeading('Upterm SSH Connection').addCodeBlock(sshCommand, 'bash').addRaw(`\n\nConnect with: <code>${sshCommand}</code>`).write();
   } catch (error) {
-    core.debug(`Failed to extract SSH command: ${error}`);
+    core.debug(`Could not write the job summary: ${error}`);
   }
-  return null;
+  return sshCommand;
 }
 
-async function startUptermSession(): Promise<void> {
+async function startUptermSession(): Promise<SessionInfo> {
   const allowedUsers = getAllowedUsers();
   const authorizedKeysParameter = buildAuthorizedKeysParameter(allowedUsers);
   const uptermServer = core.getInput('upterm-server');
@@ -639,8 +915,23 @@ async function startUptermSession(): Promise<void> {
     await setupSessionTimeout(waitTimeoutMinutes);
   }
 
-  await waitForUptermReady();
-  await outputSshCommand();
+  const session = await waitForUptermReady();
+  await outputSshCommand(session);
+  return session;
+}
+
+/** Log the end of a session, distinguishing an unreachable one from an exit. */
+function logSessionEnded(session: SessionInfo): void {
+  if (session.status === 'disconnected') {
+    // Unrecoverable in 0.30: the host keeps running but its connect string
+    // cannot connect (cmd/upterm/command/session.go:469-476).
+    core.warning('upterm lost its connection to the server; this session can no longer be reached');
+    return;
+  }
+  core.info("Exiting debugging session: 'upterm' quit");
+  if (session.reason && session.reason !== 'unknown') core.info(`Reason: ${session.reason}`);
+  if (session.exitCode !== undefined) core.info(`Exit code: ${session.exitCode}`);
+  if (session.signal) core.info(`Signal: ${session.signal}`);
 }
 
 async function monitorSession(): Promise<void> {
@@ -653,63 +944,29 @@ async function monitorSession(): Promise<void> {
       break;
     }
 
-    // Check if timeout was reached before checking socket
+    // Check if timeout was reached before looking the session up
     if (isTimeoutReached()) {
       logTimeoutMessage();
       break;
     }
 
-    if (!uptermSocketExists()) {
+    const poll = await pollSession();
+    if (poll.kind === 'gone') {
       core.info("Exiting debugging session: 'upterm' quit");
       break;
     }
-
-    try {
-      const socketPath = findUptermSocket();
-      if (!socketPath) {
-        throw new Error('Socket file not found');
-      }
-      core.info(await execShellCommand(`upterm session current --admin-socket "${socketPath}"`));
-    } catch (error) {
-      // Check if this error is due to timeout before throwing
-      if (isTimeoutReached()) {
-        logTimeoutMessage();
+    if (poll.kind === 'session') {
+      if (isTerminal(poll.session.status)) {
+        logSessionEnded(poll.session);
         break;
       }
-      // For other connection issues, provide more context
-      const errorMessage = String(error);
-      if (errorMessage.includes('connection refused') || errorMessage.includes('No such file or directory')) {
-        core.error('Upterm session appears to have ended unexpectedly');
-        core.error(`Connection error: ${errorMessage}`);
-        core.info('This may indicate the upterm process crashed or was terminated externally');
-        break;
-      }
-      throw new Error(`Failed to get upterm session status: ${error}`);
+      if (poll.session.sshCommand) core.info(`Session ${poll.session.name} (${poll.session.status}): ${poll.session.sshCommand}`);
     }
+    // poll.kind === 'unknown' falls through: a lookup that failed is not a
+    // session that ended. The checks at the top of the loop remain the exits.
+
     await sleep(SESSION_STATUS_POLL_INTERVAL);
   }
-}
-
-function getUptermSocketDir(): string {
-  // We set XDG_RUNTIME_DIR to a deterministic path in createUptermSession()
-  // to ensure upterm creates sockets in a predictable, writable location
-  // across all platforms. This avoids issues where platform defaults
-  // (e.g., /run/user/<uid> on Linux) don't exist in CI environments.
-  return path.join(getUptermDirs().runtime, 'upterm');
-}
-
-function findUptermSocket(): string | null {
-  const uptermDir = getUptermSocketDir();
-  if (!fs.existsSync(uptermDir)) return null;
-
-  const socketFile = fs.readdirSync(uptermDir).find(file => file.endsWith('.sock'));
-  if (!socketFile) return null;
-
-  return toShellPath(path.join(uptermDir, socketFile));
-}
-
-function uptermSocketExists(): boolean {
-  return findUptermSocket() !== null;
 }
 
 function continueFileExists(): boolean {
@@ -721,8 +978,7 @@ function isTimeoutReached(): boolean {
   // This is a Node fs check, so it must use the native filesystem path.
   // getUptermTimeoutFlagPath() returns the MSYS "/c/..." form used by the bash
   // writer in setupSessionTimeout(); Node cannot resolve that on Windows (it
-  // maps to C:\c\...), so check the native path the flag actually lives at -
-  // mirroring how findUptermSocket() reads the upterm socket.
+  // maps to C:\c\...), so check the native path the flag actually lives at.
   return fs.existsSync(getUptermDirs().timeoutFlag);
 }
 
@@ -731,100 +987,148 @@ function logTimeoutMessage(): void {
   core.info('The session was automatically shut down to prevent unnecessary resource usage');
 }
 
-async function runDetachedMode(): Promise<void> {
+async function runDetachedMode(session: SessionInfo): Promise<void> {
   core.debug('Entering detached mode');
 
-  let sshCommand = await outputSshCommand();
-  for (let i = 0; !sshCommand && i < 12; i++) {
-    await sleep(SESSION_STATUS_POLL_INTERVAL);
-    sshCommand = await outputSshCommand();
-  }
-  if (!sshCommand) {
-    throw new Error('Failed to get upterm session information');
-  }
-
+  // waitForUptermReady() already proved this session has a usable connect
+  // string. Re-querying here would let a transient admin-query failure fail a
+  // healthy session moments after startup succeeded.
+  //
   // Emit the notice once; use plain text for the post-action loop
-  // to avoid creating duplicate annotations in the GitHub Actions UI
-  const message = `SSH: ${sshCommand}`;
+  // to avoid creating duplicate annotations in the GitHub Actions UI.
+  const message = `SSH: ${session.sshCommand}`;
   core.notice(message);
 
   // Save state for the POST action
   core.saveState('message', message);
-  core.saveState('socketPath', findUptermSocket() || '');
 
   console.log(message);
   core.info('Detached mode: workflow will continue while upterm session is active');
 }
 
-async function hasAnyoneConnectedYet(): Promise<boolean> {
-  try {
-    // The upterm host's tmux client is marked read-only (via `-f read-only`
-    // on `tmux new -s upterm`), so filtering for non-read-only clients
-    // gives us exactly the user SSH connections.
-    const result = await execShellCommand("tmux list-clients -t upterm -f '#{?client_readonly,,1}'");
-    return result.trim() !== '';
-  } catch {
-    return false;
+/**
+ * Remove this run's private directories.
+ *
+ * Guarded: rmSync(force) suppresses only ENOENT and defaults to maxRetries 0,
+ * so on Windows - where the tee redirects still hold state/*.log open - an
+ * unguarded EBUSY would fail a job whose debug session succeeded.
+ */
+function cleanupUptermData(): void {
+  for (const key of ['uptermBaseDir', 'uptermRuntimeDir']) {
+    const dir = core.getState(key);
+    if (!dir) continue;
+    try {
+      fs.rmSync(dir, {recursive: true, force: true});
+    } catch (error) {
+      core.debug(`Could not remove ${dir}: ${error}`);
+    }
   }
 }
 
-async function runPost(): Promise<void> {
-  const message = core.getState('message');
-  const socketPath = core.getState('socketPath');
-
-  if (!message || !socketPath) {
-    // Not in detached mode or session wasn't started properly
-    return;
-  }
-
-  const shutdown = () => {
-    core.error('Got signal');
+/**
+ * Stop the session this run started, then remove its directories.
+ *
+ * Order matters: the runtime directory holds the live admin/attach sockets, so
+ * removing it under a running host unlinks them out from under it. Nothing in
+ * the non-detached path stops the host - monitorSession() merely breaks - so
+ * the post step is where teardown happens, for every mode.
+ *
+ * Process teardown is SCOPED: it kills only the two sessions this action
+ * creates, by exact name, never the whole server. The launch uses the default
+ * tmux server, which on a self-hosted runner can be one the job did not start -
+ * a runner launched with ./run.sh inside tmux, or a developer's machine - and
+ * `kill-server` there would take the runner offline mid-job or destroy
+ * unrelated sessions. The `=` prefix makes tmux match the name exactly, so a
+ * session such as `upterm-dev` is never prefix-matched. Killing a session
+ * closes its panes, which delivers the same SIGHUP to `upterm host` that
+ * kill-server would.
+ *
+ * Process teardown is also GUARDED; directory cleanup is not. run() saves
+ * isPost before installDependencies(), and post-if is "!cancelled()", so a
+ * failed download or a rejected upterm version reaches this function having
+ * started nothing - and a session named `upterm` it finds then is not ours.
+ * The directories are ours in every case, so removing them stays
+ * unconditional.
+ */
+async function finalizeSession(): Promise<void> {
+  if (core.getState('sessionStarted') === 'true') {
     try {
-      execSync('tmux kill-server');
-    } catch {
-      /* Ignore errors during shutdown */
+      await execShellCommand("tmux kill-session -t '=upterm-wrapper' 2>/dev/null; tmux kill-session -t '=upterm' 2>/dev/null; true");
+    } catch (error) {
+      core.debug(`Could not stop tmux: ${error}`);
     }
-    process.exit(1);
-  };
-
-  // Support canceling the post-job Action
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-
-  core.debug('Waiting for session to end');
-
-  let waitTimeoutSeconds = parseInt(core.getInput('wait-timeout-minutes') || '10', 10) * 60;
-  if (isNaN(waitTimeoutSeconds) || waitTimeoutSeconds <= 0) {
-    waitTimeoutSeconds = 10 * 60; // Default 10 minutes
   }
+  cleanupUptermData();
+}
 
-  let anyoneConnected = false;
-
-  for (let seconds = waitTimeoutSeconds; seconds > 0; ) {
-    const connected = await hasAnyoneConnectedYet();
-    if (connected) anyoneConnected = true;
-
-    console.log(`${anyoneConnected ? 'Waiting for session to end' : `Waiting for client to connect (at most ${seconds} more second(s))`}\n${message}`);
-
-    if (continueFileExists()) {
-      core.info("Exiting debugging session because '/continue' file was created");
-      break;
-    }
-
-    if (!uptermSocketExists()) {
-      core.info("Exiting debugging session: 'upterm' quit");
-      break;
-    }
-
-    await sleep(5000);
-    if (!anyoneConnected) seconds -= 5;
-    if (seconds <= 0) core.warning(`Timed out waiting for client to connect (after ${waitTimeoutSeconds})`);
-  }
-
-  // Clean up
+async function runPost(): Promise<void> {
   try {
-    await execShellCommand('tmux kill-server 2>/dev/null || true');
-  } catch {
-    // Ignore cleanup errors
+    const message = core.getState('message');
+    // Non-detached runs save no message: there is nothing to wait for, but the
+    // session and its directories still need tearing down in the finally.
+    if (!message) return;
+
+    exportXdgEnvironment();
+
+    const shutdown = () => {
+      core.error('Got signal');
+      try {
+        execSync('tmux kill-server');
+      } catch {
+        /* Ignore errors during shutdown */
+      }
+      process.exit(1);
+    };
+
+    // Support canceling the post-job Action
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+
+    core.debug('Waiting for session to end');
+
+    let waitTimeoutSeconds = parseInt(core.getInput('wait-timeout-minutes') || '10', 10) * 60;
+    if (isNaN(waitTimeoutSeconds) || waitTimeoutSeconds <= 0) {
+      waitTimeoutSeconds = 10 * 60; // Default 10 minutes
+    }
+
+    let anyoneConnected = false;
+
+    for (let seconds = waitTimeoutSeconds; seconds > 0; ) {
+      const poll = await pollSession();
+      const connected = poll.kind === 'session' ? guestPresence(poll.session) : null;
+      if (connected === true) anyoneConnected = true;
+
+      // Prove, in the log, that this fresh post process resolved the SAME named
+      // session that main published - the only visible evidence that XDG state
+      // was restored across the process boundary.
+      if (poll.kind === 'session') core.info(`Session ${poll.session.name} (${poll.session.status})`);
+
+      console.log(`${anyoneConnected ? 'Waiting for session to end' : `Waiting for client to connect (at most ${seconds} more second(s))`}\n${message}`);
+
+      if (continueFileExists()) {
+        core.info("Exiting debugging session because '/continue' file was created");
+        break;
+      }
+
+      if (poll.kind === 'gone') {
+        core.info("Exiting debugging session: 'upterm' quit");
+        break;
+      }
+      if (poll.kind === 'session' && isTerminal(poll.session.status)) {
+        logSessionEnded(poll.session);
+        break;
+      }
+      // poll.kind === 'unknown' falls through: a failed lookup is not a
+      // finished session.
+
+      await sleep(5000);
+      // Only spend the countdown on a CONFIRMED "nobody here". `null` means
+      // upterm could not tell us, and treating that as "nobody" would shut down
+      // a session someone is attached to.
+      if (!anyoneConnected && connected === false) seconds -= 5;
+      if (seconds <= 0) core.warning(`Timed out waiting for client to connect (after ${waitTimeoutSeconds})`);
+    }
+  } finally {
+    await finalizeSession();
   }
 }

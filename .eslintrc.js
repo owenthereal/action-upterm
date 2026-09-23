@@ -19,6 +19,12 @@ module.exports = {
       extends: ['plugin:jest/recommended'],
       env: {
         jest: true
+      },
+      rules: {
+        // loadAction() re-acquires mocked modules after jest.resetModules().
+        // Static imports cannot do this: the whole point is to re-resolve the
+        // bindings AFTER the registry reset.
+        '@typescript-eslint/no-var-requires': 'off'
       }
     },
     {

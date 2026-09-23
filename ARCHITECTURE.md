@@ -170,7 +170,7 @@ Need to convert a path?
 **Characteristics:**
 - Native POSIX paths
 - tmux and SSH tools readily available
-- Standard `/tmp` directory for sockets
+- Sockets live under the per-run runtime directory, rooted at `RUNNER_TEMP` whenever that fits upterm's socket path limit (see [File Structure](#file-structure))
 
 **Installation:**
 - Downloads pre-built upterm binary
@@ -228,21 +228,22 @@ action-upterm follows the [XDG Base Directory Specification](https://specificati
 
 | Variable | Purpose | Example (Unix) | Example (Windows) |
 |----------|---------|----------------|-------------------|
-| `XDG_RUNTIME_DIR` | Runtime files, sockets | `/tmp/upterm-data/runtime` | `/c/Users/runner/AppData/Local/Temp/upterm-data/runtime` |
-| `XDG_STATE_HOME` | State data, logs | `/tmp/upterm-data/state` | `/c/Users/runner/AppData/Local/Temp/upterm-data/state` |
-| `XDG_CONFIG_HOME` | Configuration files | `/tmp/upterm-data/config` | `/c/Users/runner/AppData/Local/Temp/upterm-data/config` |
+| `XDG_RUNTIME_DIR` | Runtime files, sockets | `{RUNNER_TEMP}/upterm-rt-XXXXXX` (root chosen by socket budget - see [File Structure](#file-structure)) | `/c/.../Temp/upterm-rt-XXXXXX` |
+| `XDG_STATE_HOME` | State data, logs | `{RUNNER_TEMP}/upterm-action-XXXXXX/state` | `/c/.../Temp/upterm-action-XXXXXX/state` |
+| `XDG_CONFIG_HOME` | Configuration files | `{RUNNER_TEMP}/upterm-action-XXXXXX/config` | `/c/.../Temp/upterm-action-XXXXXX/config` |
 
 **Why XDG Variables:**
 - Platform defaults may not exist in CI environments
 - Ensures consistent, writable locations
-- upterm uses XDG_RUNTIME_DIR for socket placement
+- upterm uses XDG_RUNTIME_DIR for socket placement and XDG_STATE_HOME to locate a session's record - main and post must agree on both, or a healthy session reports as missing to post
 - Logs go to XDG_STATE_HOME for easy diagnostics
+- Exported to the action's own Node process (`process.env`), not just into tmux.conf - the action's own `upterm session info` calls need to resolve the same session record the host published to
 
 ### Tmux Configuration
 
 A custom tmux configuration file is generated at runtime:
 
-**Location:** `{tmpdir}/upterm-data/tmux.conf`
+**Location:** `{RUNNER_TEMP}/upterm-action-XXXXXX/tmux.conf`
 
 **Contents:**
 ```tmux
@@ -275,14 +276,22 @@ setw -g aggressive-resize on
    - Wait for upterm to initialize (2 second delay)
 
 2. **Readiness Check** (`waitForUptermReady()`)
-   - Polls for socket file existence
-   - Maximum 10 retries with 1 second intervals
+   - Polls `upterm session info <name> -o json`, addressing the session by the
+     `--name` passed to `upterm host` (no filesystem discovery)
+   - Ready requires BOTH `status === 'ready'` AND a usable `sshCommand`: when
+     upterm's admin query fails, it can return the record's view with status
+     still `ready` but no `sshCommand`, which is not something anyone can
+     connect to
+   - Maximum 30 retries with 1 second intervals. Wider than the old socket-file
+     check needed, because readiness now waits on upterm's second, unlocked
+     admin round-trip; the loop returns on its first success, so the budget only
+     costs anything on a run that was going to be slow
    - Collects diagnostics on failure
 
 3. **SSH Command Output** (`outputSshCommand()`)
    - Retrieves SSH connection string
-   - Sets GitHub Actions output
-   - Writes to job summary
+   - Sets GitHub Actions output and logs the SSH command
+   - Writes to job summary - best effort: if the write fails (e.g. `GITHUB_STEP_SUMMARY` is unset), the error is logged at debug level and the action carries on
 
 4. **Monitoring** (`monitorSession()`)
    - Polls session status every 5 seconds
@@ -296,6 +305,12 @@ setw -g aggressive-resize on
    - Session exits naturally
    - External termination (error case)
 
+6. **Post-Step Teardown** (`finalizeSession()`, run inside a `finally` in `runPost()`)
+   - Stops the session by killing only this action's two tmux sessions, by exact name: `tmux kill-session -t '=upterm-wrapper'` then `-t '=upterm'` (the `=` prevents prefix-matching a user's `upterm-dev`). Never `kill-server`: the launch uses the default tmux server, which on a self-hosted runner may not be the job's - a runner started with `./run.sh` inside tmux would go offline mid-job. Killing the session closes its panes, which sends `upterm host` the same SIGHUP
+   - That kill is guarded on the `sessionStarted` state key, so a run that never started a session (e.g. a failed download or a rejected upterm version) doesn't kill `upterm-wrapper`/`upterm` sessions it never created
+   - Removes this run's private directories (`uptermBaseDir`, `uptermRuntimeDir`) unconditionally - they are always safe to remove, whether or not a session ever started
+   - Runs on both success and failure paths, since `post-if` is `!cancelled()`
+
 ### Timeout Mechanism
 
 When `wait-timeout-minutes` is specified:
@@ -304,7 +319,7 @@ When `wait-timeout-minutes` is specified:
 # Background process that enforces timeout
 (
   sleep $(( TIMEOUT * 60 ));
-  if ! pgrep -f '^tmux attach ' &>/dev/null; then
+  if [ -z "$(tmux list-clients -t upterm -f '#{?client_readonly,,1}')" ]; then
     echo "UPTERM_TIMEOUT_REACHED" > {flag-file};
     tmux kill-server;
   fi
@@ -313,39 +328,107 @@ When `wait-timeout-minutes` is specified:
 
 **Logic:**
 - Sleeps for specified duration
-- Checks if any client is connected (`pgrep -f '^tmux attach '`)
-- If no client, writes flag file and kills tmux
+- Asks tmux itself whether the `upterm` session has any writable client
+  (`tmux list-clients -t upterm -f '#{?client_readonly,,1}'`). The filter drops
+  read-only clients, which is what the action's own inner `tmux new -f
+  read-only` attaches as - so the action does not count as somebody having
+  connected
+- If no such client, writes flag file and kills the tmux server (`kill-server` - unlike post-step teardown; see [Concurrency](#concurrency))
 - Monitoring loop detects flag and exits gracefully
 
 ### Diagnostics Collection
 
 On startup failure, comprehensive diagnostics are collected:
 
-- Socket directory contents
-- Upterm logs
+- A headline saying which failure it was: "Upterm session ended before it became ready" when the session reached a terminal status (`ended`, `ending`, `disconnected`), otherwise "Upterm did not become ready after maximum retries"
+- The run's private base directory and session name
+- The session's status, taken from the last readiness poll when it saw a session, otherwise from a fresh `upterm session info` (or the lookup failure, if that query itself failed)
+- For a non-terminal session, whether upterm answered from its record only (no live detail) rather than a successful admin query
+- The session's `Reason`, `Exit code` and `Signal`, when present
+- Upterm's own log, read from `session.logPath` (`{XDG_STATE_HOME}/upterm/upterm.log`) when present; if it cannot be read, the error is recorded in its place and the rest of the report is still produced
 - Tmux session list
-- Tmux error logs
-- Upterm command output
-- Binary availability check
-- Environment variables
+- Tmux error log
+- Upterm command output log
+- Binary availability check (`upterm version`)
+- XDG_RUNTIME_DIR and other environment variables
 - Platform information
 
 This information helps users report issues with full context.
 
+### State Handed From Main to Post
+
+The main and post invocations are separate Node processes; `core.saveState()` /
+`core.getState()` is the only channel between them. Keys used:
+
+| Key | Purpose |
+|-----|---------|
+| `isPost` | Set before any fallible setup so a failure always routes to the post (cleanup) path instead of re-entering main. |
+| `sessionName` | The `gha-<8 hex>` name minted once in main, so post addresses the same session. |
+| `sessionStarted` | Saved immediately *before* the `tmux new` launch is attempted, so a launch that fails part-way is still torn down; guards the post step's `tmux kill-session` teardown so a failed download or rejected upterm version - neither of which reaches session creation - doesn't kill `upterm-wrapper`/`upterm` sessions this run never created. |
+| `uptermBaseDir` | Path to the per-run `upterm-action-XXXXXX` directory, so post restores rather than mints new directories. |
+| `uptermRuntimeDir` | Path to the per-run `upterm-rt-XXXXXX` directory (`XDG_RUNTIME_DIR`), wherever its root was chosen - post restores and removes it from here. |
+| `message` | The SSH connection message, saved only in detached mode; its absence tells post there is nothing to wait on. |
+
+There is no `socketPath` key - sessions are addressed by name, not by a socket path discovered on disk.
+
+### Concurrency
+
+Multiple concurrent `action-upterm` invocations on the same runner remain
+**unsupported**. The tmux layer uses the shared default server (no `-L`/`-S`)
+with fixed session names (`upterm-wrapper`, `upterm`). `finalizeSession()`
+kills only those two sessions by exact name, but because the names are fixed,
+two runs would still kill each other's; and the wait-timeout script and the
+post step's SIGINT/SIGTERM handler still run an unscoped `tmux kill-server`
+that stops every session on that server, not just this run's. The per-run
+private directories (`upterm-action-XXXXXX`, `upterm-rt-XXXXXX`) and the
+per-run upterm session name (`gha-<8 hex>`)
+avoid collisions in *those* two places only - they do not make it safe to run
+two instances of this action in the same job.
+
 ## File Structure
 
+Each run creates two private directories, each `mkdtempSync`'d with mode
+`0700`. The base dir goes under `RUNNER_TEMP` (falling back to `os.tmpdir()` if
+`RUNNER_TEMP` is unset); the runtime dir's root is chosen by socket budget
+(below), so the two are usually siblings but need not be:
+
 ```
-{tmpdir}/upterm-data/
-├── runtime/              # XDG_RUNTIME_DIR
-│   └── upterm/
-│       └── {session}.sock  # Unix socket for upterm
-├── state/               # XDG_STATE_HOME
-│   ├── upterm-command.log  # Upterm stdout/stderr
+{RUNNER_TEMP}/upterm-action-XXXXXX/    # base dir
+├── tmux.conf             # Custom tmux configuration
+├── state/                # XDG_STATE_HOME
+│   ├── upterm/
+│   │   └── upterm.log      # upterm's own log (read via session.logPath in diagnostics)
+│   ├── upterm-command.log  # Our tee of the upterm host process's stdout/stderr
 │   └── tmux-error.log      # Tmux stderr
-├── config/              # XDG_CONFIG_HOME
-├── tmux.conf            # Custom tmux configuration
-└── timeout-flag         # Created when timeout is reached
+├── config/               # XDG_CONFIG_HOME
+└── timeout-flag          # Created when timeout is reached
+
+{runtime root}/upterm-rt-XXXXXX/       # XDG_RUNTIME_DIR
+└── upterm/
+    └── sessions/
+        └── {session-name}/    # e.g. gha-3f9a1c05
+            ├── admin.sock     # upterm's admin socket
+            └── attach.sock    # upterm's attach socket
 ```
+
+The two directories are split - rather than one parent with subdirectories -
+so upterm's own hard limit of `maxSocketPath = 103` bytes on **every**
+platform stays reachable: the runtime dir is a short, dedicated mkdtemp path
+with nothing else competing for its budget. This is also why the session name
+minted for `--name` (`gha-<8 hex>`) and the `upterm-rt-` prefix are
+deliberately short rather than descriptive.
+
+upterm measures `$XDG_RUNTIME_DIR/upterm/sessions/<name>/attach.sock` and
+refuses an over-long one while validating `upterm host --name`, so the host
+exits before any session exists. The runtime root is therefore the first of
+these whose socket path fits in 103 bytes: `RUNNER_TEMP`, `os.tmpdir()`, then
+`/tmp` (not on Windows). With the `upterm-rt-` prefix that path is
+`len(root) + 58` bytes, so `RUNNER_TEMP` fits up to 45 bytes - hosted runners,
+and the default self-hosted `~/actions-runner/_work/_temp` for user names up to
+12 characters on Linux (11 on macOS). A fallback is announced with one
+`core.info` line naming the root used and the too-long path; if nothing fits
+(in practice only on Windows, which has no `/tmp` fallback), the run fails with
+the measured paths and how to shorten them.
 
 ## Error Handling
 
@@ -360,11 +443,12 @@ This information helps users report issues with full context.
 2. **Session Creation Errors**
    - Tmux not available
    - Upterm not available
+   - Unsupported upterm version (`< v0.30.0`), caught by `assertSupportedUptermVersion()` before a session is even attempted
    - Network connectivity to upterm server
    - Permission issues
 
 3. **Runtime Errors**
-   - Socket not created after retries
+   - Session never reaches a ready state with a usable `sshCommand` after retries
    - Connection refused (unexpected termination)
    - Timeout reached
 

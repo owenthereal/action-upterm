@@ -10,10 +10,14 @@ export const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, 
  * Executes a shell command and returns the output as a Promise.
  *
  * @param cmd - The shell command to execute
+ * @param options.quiet - Send the command's output to core.debug instead of the
+ *   job log. For commands polled on a timer, whose output would otherwise fill
+ *   the log. Only where the output goes changes: stdout is still returned, and
+ *   stderr is still included in the rejection.
  * @returns Promise that resolves with the command's stdout output
  * @throws Error if the command fails or if cmd is empty
  */
-export function execShellCommand(cmd: string): Promise<string> {
+export function execShellCommand(cmd: string, options: {quiet?: boolean} = {}): Promise<string> {
   core.debug(`Executing shell command: [${cmd}]`);
 
   if (!cmd.trim()) {
@@ -34,16 +38,18 @@ export function execShellCommand(cmd: string): Promise<string> {
           });
     let stdout = '';
     let stderr = '';
+    const logStdout = options.quiet ? core.debug : console.log;
+    const logStderr = options.quiet ? core.debug : console.error;
 
     proc.stdout.on('data', data => {
       const output = data.toString();
-      console.log(output);
+      logStdout(output);
       stdout += output;
     });
 
     proc.stderr.on('data', data => {
       const output = data.toString();
-      console.error(output);
+      logStderr(output);
       stderr += output;
     });
 
@@ -64,6 +70,27 @@ export function execShellCommand(cmd: string): Promise<string> {
 }
 
 /**
+ * Escape a string for safe use in single-quoted shell arguments.
+ * Handles paths that may contain single quotes by using the '\'' escape pattern.
+ *
+ * Use this for:
+ * - User-provided strings (server URLs, GitHub usernames)
+ * - File paths in shell commands
+ * - Any value passed through nested command layers
+ *
+ * @example
+ * shellEscape("hello world")           // => "'hello world'"
+ * shellEscape("user's file")           // => "'user'\''s file'"
+ * shellEscape("ssh://server:22")       // => "'ssh://server:22'"
+ *
+ * @param value - The string to escape
+ * @returns Single-quoted string safe for shell use
+ */
+export function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
  * Launches a shell command outside the current process's Windows Job Object
  * by using WMI's Win32_Process::Create.  The spawned process is parented by
  * WmiPrvSE.exe (a system service), so it is not affected when the runner
@@ -78,19 +105,22 @@ export function execShellCommand(cmd: string): Promise<string> {
  *
  * @param cmd - The bash command to execute
  * @param env - Environment variables to pass to the command (PATH, etc.)
+ * @param scriptDir - Directory to write the launch script into
  * @throws Error if WMI launch fails
  */
-export function launchOutsideJobObject(cmd: string, env?: Record<string, string>): void {
+export function launchOutsideJobObject(cmd: string, env?: Record<string, string>, scriptDir?: string): void {
   core.debug(`Launching outside Job Object: [${cmd}]`);
 
   if (process.platform !== 'win32') {
     throw new Error('launchOutsideJobObject is only supported on Windows');
   }
 
-  // Write the command to a script file to avoid quoting hell
-  const scriptDir = path.join(os.tmpdir(), 'upterm-data');
-  fs.mkdirSync(scriptDir, {recursive: true});
-  const scriptPath = path.join(scriptDir, 'wmi-launch.sh');
+  // Private per-run directory, not a shared fixed one: two concurrent Windows
+  // invocations would otherwise race on a single wmi-launch.sh holding the
+  // expanded --github-user allow-list.
+  const dir = scriptDir || path.join(os.tmpdir(), 'upterm-data');
+  fs.mkdirSync(dir, {recursive: true});
+  const scriptPath = path.join(dir, 'wmi-launch.sh');
 
   // Build environment export lines.  On Windows, paths must be converted
   // from Windows format (backslashes, semicolons) to POSIX format
