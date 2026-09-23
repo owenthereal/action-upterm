@@ -12,7 +12,6 @@ jest.mock('fs', () => ({
   existsSync: jest.fn(() => true),
   appendFileSync: jest.fn(() => true),
   writeFileSync: jest.fn(() => true),
-  readdirSync: jest.fn(() => ['id_rsa', 'id_ed25519']),
   readFileSync: jest.fn(() => '{}'),
   rmSync: jest.fn(() => undefined),
   mkdtempSync: jest.fn((prefix: string) => `${prefix}abc123`),
@@ -35,7 +34,6 @@ jest.mock('os', () => ({
 jest.mock('./helpers', () => ({
   ...jest.requireActual('./helpers'),
   execShellCommand: jest.fn(),
-  launchOutsideJobObject: jest.fn(),
   sleep: jest.fn()
 }));
 
@@ -82,7 +80,6 @@ let core: jest.Mocked<typeof import('@actions/core')>;
 let mockFs: jest.Mocked<typeof import('fs')>;
 let mockedToolCache: jest.Mocked<typeof import('@actions/tool-cache')>;
 let mockedExecShellCommand: jest.MockedFunction<typeof import('./helpers').execShellCommand>;
-let mockedLaunchOutsideJobObject: jest.MockedFunction<typeof import('./helpers').launchOutsideJobObject>;
 let mockedSleep: jest.MockedFunction<typeof import('./helpers').sleep>;
 let run: typeof import('.').run;
 let getUptermArchitecture: typeof import('.').getUptermArchitecture;
@@ -97,7 +94,6 @@ function loadAction(): void {
 
   const helpers = require('./helpers');
   mockedExecShellCommand = helpers.execShellCommand;
-  mockedLaunchOutsideJobObject = helpers.launchOutsideJobObject;
   mockedSleep = helpers.sleep;
 
   ({run, getUptermArchitecture, getUptermDownloadUrl} = require('.'));
@@ -113,18 +109,20 @@ function baselineInputs(): void {
 }
 
 /**
- * Default shell responses. `upterm version` must satisfy the gate, and
- * `session info` must return JSON - a bare 'foobar' would make getSession()
- * throw a JSON parse error rather than exercise the path under test.
+ * Default shell responses. `upterm version` must satisfy the gate, and both
+ * `upterm host` (the launch itself) and `session info` must return JSON - a
+ * bare 'foobar' would make parseSessionInfo() throw rather than exercise the
+ * path under test.
  *
- * Responses are consumed one per lookup; the last one repeats forever, so a
- * sequence ending in a terminal status keeps waitForSession() bounded.
+ * Responses are consumed one per lookup, first by the launch and then by each
+ * monitoring poll; the last one repeats forever, so a sequence ending in a
+ * terminal status keeps waitForSession() bounded.
  */
 function baselineShell(...sessionResponses: string[]): void {
   const queue = sessionResponses.length ? [...sessionResponses] : [readySession()];
   mockedExecShellCommand.mockImplementation(async (cmd: string) => {
     if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
-    if (cmd.includes('session info')) return queue.length > 1 ? (queue.shift() as string) : queue[0];
+    if (cmd.includes('upterm host') || cmd.includes('session info')) return queue.length > 1 ? (queue.shift() as string) : queue[0];
     return 'foobar';
   });
 }
@@ -132,7 +130,7 @@ function baselineShell(...sessionResponses: string[]): void {
 /**
  * Filesystem baseline for LIFECYCLE tests.
  *
- * The default existsSync returns true for everything but SSH keys, which makes
+ * The default existsSync returns true for everything, which makes
  * continueFileExists() true on the first poll - so a lifecycle test would exit
  * with "'/continue' file was created" before ever consuming its session
  * response. Any test asserting on ready/ended/disconnected must use this.
@@ -142,7 +140,6 @@ function baselineShell(...sessionResponses: string[]): void {
 function fsWithoutExitFiles(): void {
   mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
     const p = filePath.toString();
-    if (p.includes('id_rsa') || p.includes('id_ed25519')) return false;
     // CONTINUE_FILE_PATHS: '/continue' (unix), 'C:/msys64/continue' (win32),
     // plus $GITHUB_WORKSPACE/continue.
     if (p.endsWith('continue')) return false;
@@ -182,17 +179,8 @@ describe('upterm GitHub integration', () => {
     mockedSleep.mockResolvedValue(undefined);
     mockedToolCache.downloadTool.mockResolvedValue(DOWNLOAD_PATH);
     mockedToolCache.extractTar.mockResolvedValue(EXTRACT_DIR);
-    // Reset fs mocks - by default return false for SSH key files to trigger generation
-    mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
-      const pathStr = filePath.toString();
-      // SSH key files don't exist initially, so they get generated
-      if (pathStr.includes('id_rsa') || pathStr.includes('id_ed25519')) {
-        return false;
-      }
-      // Everything else exists (directories, the /continue file, etc.)
-      return true;
-    });
-    (mockFs.readdirSync as jest.Mock).mockReturnValue(['id_rsa', 'id_ed25519']);
+    // Reset fs mocks - everything exists by default (directories, the /continue file, etc.)
+    mockFs.existsSync.mockImplementation(() => true);
 
     baselineInputs();
     baselineShell();
@@ -286,25 +274,10 @@ describe('upterm GitHub integration', () => {
     expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
     expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
 
-    // Check dependency installation: upterm is copied onto the MSYS2 PATH
-    // (/usr/bin) first, then tmux is installed.
+    // Check dependency installation: upterm is copied onto the MSYS2 PATH (/usr/bin).
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, `cp '${EXTRACT_DIR}/upterm.exe' /usr/bin/upterm.exe`);
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
-
-    // Check SSH key generation
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('ssh-keygen -q -t rsa'));
-
-    // Check upterm session creation via WMI on Windows
-    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}), UPTERM_DATA_DIR);
-    // The outer tmux flag is built with toShellPath() (forward slashes only) -
-    // Shape B, unlike the raw scriptDir argument checked above.
-    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining(`${UPTERM_DATA_DIR.replace(/\\/g, '/')}/tmux.conf`), expect.objectContaining({PATH: expect.any(String)}), UPTERM_DATA_DIR);
-
-    // Check that tmux config file was written
-    expect(mockFs.writeFileSync).toHaveBeenCalledWith(path.join(UPTERM_DATA_DIR, 'tmux.conf'), expect.stringContaining('set-environment -g XDG_RUNTIME_DIR'));
 
     expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/30)');
     expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
     expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
@@ -324,11 +297,11 @@ describe('upterm GitHub integration', () => {
     await run();
 
     // core.addPath(extractDir) only reaches the Node process and subsequent
-    // (non-MSYS2) steps via GITHUB_PATH. The interactive SSH/tmux login shells
-    // re-source /etc/profile with the default MSYS2_PATH_TYPE=minimal, which
-    // rebuilds PATH and drops the tool-cache dir. /usr/bin is always on the
-    // minimal MSYS2 PATH (it's where bash and the pacman-installed tmux live),
-    // so copying upterm.exe there keeps it reachable once the user connects.
+    // (non-MSYS2) steps via GITHUB_PATH. The interactive SSH session spawns bash
+    // login shells that re-source /etc/profile with the default
+    // MSYS2_PATH_TYPE=minimal, which rebuilds PATH and drops the tool-cache dir.
+    // /usr/bin is always on the minimal MSYS2 PATH (it's where bash lives), so
+    // copying upterm.exe there keeps it reachable once the user connects.
     expect(mockedExecShellCommand).toHaveBeenCalledWith(`cp '${EXTRACT_DIR}/upterm.exe' /usr/bin/upterm.exe`);
   });
 
@@ -350,16 +323,7 @@ describe('upterm GitHub integration', () => {
     expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
     expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
 
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
-
-    // Check SSH key generation
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('ssh-keygen -q -t rsa'));
-
-    // Check upterm session creation with tmux config
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('tmux -f'));
-
     expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/30)');
     expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
     expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
@@ -418,16 +382,7 @@ describe('upterm GitHub integration', () => {
     expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
     expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
 
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
-
-    // Check SSH key generation
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('ssh-keygen -q -t rsa'));
-
-    // Check upterm session creation with tmux config
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('tmux -f'));
-
     expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/30)');
     expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
     expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
@@ -451,16 +406,8 @@ describe('upterm GitHub integration', () => {
     expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
 
     expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, `cp '${EXTRACT_DIR}/upterm.exe' /usr/bin/upterm.exe`);
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(2, 'if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
-
-    // Check SSH key generation
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('ssh-keygen -q -t rsa'));
-
-    // Check upterm session creation via WMI on Windows
-    expect(mockedLaunchOutsideJobObject).toHaveBeenCalledWith(expect.stringContaining('tmux -f'), expect.objectContaining({PATH: expect.any(String)}), UPTERM_DATA_DIR);
 
     expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/30)');
     expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
     expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
@@ -518,15 +465,8 @@ describe('upterm GitHub integration', () => {
     expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/owenthereal/upterm/releases/latest/download/upterm_darwin_amd64.tar.gz');
     expect(mockedToolCache.extractTar).toHaveBeenCalledWith(DOWNLOAD_PATH);
     expect(core.addPath).toHaveBeenCalledWith(EXTRACT_DIR);
-    expect(mockedExecShellCommand).toHaveBeenNthCalledWith(1, 'brew install tmux');
 
-    // Check SSH key generation
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('ssh-keygen -q -t rsa'));
-
-    // Check upterm session creation with tmux config
-    expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('tmux -f'));
     expect(core.info).toHaveBeenCalledWith('Creating a new session. Connecting to upterm server ssh://myserver:22');
-    expect(core.info).toHaveBeenCalledWith('Waiting for upterm to be ready... (1/30)');
     expect(core.info).toHaveBeenCalledWith(expect.stringContaining('SSH command available as output'));
     expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
   });
@@ -577,8 +517,11 @@ describe('upterm GitHub integration', () => {
   });
 
   it('should handle shell command failures during installation', async () => {
+    // Only Windows still shells out during installDependencies (copying
+    // upterm.exe onto the MSYS2 PATH); linux/darwin install nothing else, so
+    // there is nothing left there for a shell command to fail.
     Object.defineProperty(process, 'platform', {
-      value: 'linux'
+      value: 'win32'
     });
     Object.defineProperty(process, 'arch', {
       value: 'x64'
@@ -590,7 +533,7 @@ describe('upterm GitHub integration', () => {
 
     await run();
 
-    expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Failed to install dependencies on linux: Error: Installation failed'));
+    expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Failed to install dependencies on win32: Error: Installation failed'));
   });
 
   it('keeps polling when the session lookup keeps failing instead of ending the session', async () => {
@@ -609,13 +552,13 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
-    // First lookup (readiness) succeeds; every one after it fails.
+    // The launch succeeds; every monitoring lookup after it fails.
     let polls = 0;
     mockedExecShellCommand.mockImplementation((cmd: string) => {
       if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.31.0\n');
+      if (cmd.includes('upterm host')) return Promise.resolve(readySession());
       if (cmd.includes('session info')) {
         polls++;
-        if (polls === 1) return Promise.resolve(readySession());
         return Promise.reject(new Error('Command failed with exit code 1: connection refused'));
       }
       return Promise.resolve('success');
@@ -625,7 +568,6 @@ describe('upterm GitHub integration', () => {
     // loop has to have survived them to reach it.
     mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
       const pathStr = filePath.toString();
-      if (pathStr.includes('id_rsa') || pathStr.includes('id_ed25519')) return false;
       if (pathStr.endsWith('continue')) return polls >= 4;
       return true;
     });
@@ -649,27 +591,9 @@ describe('upterm GitHub integration', () => {
 
       await run();
 
-      const tmuxCmd = mockedExecShellCommand.mock.calls.map(c => c[0]).find(c => c.includes('upterm host'));
-      expect(tmuxCmd).toMatch(/--name gha-[0-9a-f]{8}/);
+      const launchCmd = mockedExecShellCommand.mock.calls.map(c => c[0]).find(c => c.includes('upterm host'));
+      expect(launchCmd).toMatch(/--name gha-[0-9a-f]{8}/);
       expect(core.saveState).toHaveBeenCalledWith('sessionName', expect.stringMatching(/^gha-[0-9a-f]{8}$/));
-    });
-
-    it('does not treat ready-without-ssh-command as ready', async () => {
-      // status is "ready" but the admin query failed, so there is no usable connect
-      // string yet. Declaring success here would print an empty command.
-      //
-      // The sequence MUST end in a terminal status. fsWithoutExitFiles() removes
-      // both exit files and `detached` defaults to false, so run() proceeds into
-      // waitForSession() - a sequence that stayed `ready` would never return.
-      fsWithoutExitFiles();
-      baselineShell(noDetail, noDetail, readySession(), endedResponse);
-
-      await run();
-
-      expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
-      // Proves readiness actually rejected the two detail-less responses rather
-      // than succeeding on the first.
-      expect(sessionInfoCalls()).toBeGreaterThanOrEqual(3);
     });
 
     it('ends monitoring on ended, including after a crash', async () => {
@@ -697,8 +621,9 @@ describe('upterm GitHub integration', () => {
       await run();
 
       expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
-      // One readiness lookup, one monitoring lookup that saw `ending`.
-      expect(sessionInfoCalls()).toBe(2);
+      // The launch itself consumes the ready response; one monitoring lookup
+      // sees `ending` and stops there.
+      expect(sessionInfoCalls()).toBe(1);
       expect(core.setFailed).not.toHaveBeenCalled();
     });
 
@@ -726,24 +651,24 @@ describe('upterm GitHub integration', () => {
       expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
     });
 
-    it('says the session ended, with its exit code, when readiness sees it end', async () => {
-      // What a misconfigured upterm-server produces: the session ends on the
-      // first poll, with retries to spare. "did not become ready after maximum
-      // retries" would send the user looking for a slowness problem.
+    it('says the session ended, with its exit code, when the launch itself reports it ended', async () => {
+      // What a misconfigured upterm-server produces: the session has already
+      // ended by the time `upterm host --detach` returns. "did not start a
+      // usable session" would send the user looking for the wrong problem.
       baselineShell(JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', reason: 'connect_failed', exitCode: 1}));
 
       await run();
 
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Upterm session ended before it became ready (status: ended)'));
-      expect(core.setFailed).not.toHaveBeenCalledWith(expect.stringContaining('maximum retries'));
+      expect(core.setFailed).not.toHaveBeenCalledWith(expect.stringContaining('did not start a usable session'));
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('- Reason: connect_failed'));
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('- Exit code: 1'));
       // A terminal session has no admin socket to query; saying its admin query
       // "did not succeed" would contradict the headline.
       expect(core.setFailed).not.toHaveBeenCalledWith(expect.stringContaining('answered from its record only'));
-      // The report describes the session readiness gave up on, not a second
-      // lookup that could disagree with it.
-      expect(sessionInfoCalls()).toBe(1);
+      // The report describes the session the launch itself observed, not a
+      // separate lookup that could disagree with it.
+      expect(sessionInfoCalls()).toBe(0);
     });
 
     it('keeps the rest of the diagnostics when the upterm log cannot be read', async () => {
@@ -759,7 +684,7 @@ describe('upterm GitHub integration', () => {
       await run();
 
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining(`- Could not read upterm log (${logPath}): Error: EACCES: permission denied`));
-      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Upterm did not become ready after maximum retries'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Upterm did not start a usable session.'));
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('- Session status: ready'));
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('=== Troubleshooting Steps ==='));
     });
@@ -775,29 +700,6 @@ describe('upterm GitHub integration', () => {
       // and a session that exited are different things, and the logs have to
       // say which happened.
       expect(core.info).not.toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
-    });
-
-    it('retries readiness when the first lookup throws instead of failing the run', async () => {
-      // A lookup that failed is not a session that failed. Abandoning the
-      // remaining retries here would fail the job on a hiccup - and would skip
-      // collectDiagnostics(), the report written for exactly this case.
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation((cmd: string) => {
-        if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.31.0\n');
-        if (cmd.includes('session info')) {
-          polls++;
-          if (polls === 1) return Promise.reject(new Error('Command failed with exit code 1: connection refused'));
-          return Promise.resolve(readySession());
-        }
-        return Promise.resolve('foobar');
-      });
-
-      await run();
-
-      expect(core.setFailed).not.toHaveBeenCalled();
-      expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
-      // The rejected lookup burned a retry rather than ending readiness.
-      expect(polls).toBeGreaterThanOrEqual(2);
     });
 
     it('reuses the readiness result in detached mode instead of re-querying', async () => {
@@ -857,20 +759,20 @@ describe('upterm GitHub integration', () => {
       when(core.getInput).calledWith('detached').mockReturnValue('true');
 
       // "ready" straight from the record, with no connect string - never usable,
-      // so readiness must exhaust its retries and fail with diagnostics rather
-      // than hand detached mode a session nobody can reach.
+      // so the launch must fail with diagnostics rather than hand detached mode
+      // a session nobody can reach.
       baselineShell(noDetail);
 
       await run();
 
-      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Upterm did not become ready after maximum retries'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Upterm did not start a usable session.'));
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Session name: gha-'));
       // Non-terminal and detail-less: the admin query should have answered, so
       // the report says it did not.
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('- Upterm answered from its record only; its admin query did not succeed'));
       expect(core.saveState).not.toHaveBeenCalledWith('message', expect.anything());
-      // One lookup per readiness retry.
-      expect(sessionInfoCalls()).toBeGreaterThanOrEqual(30);
+      // The launch's own output is what failed; no separate lookup was needed.
+      expect(sessionInfoCalls()).toBe(0);
     });
   });
 
@@ -882,23 +784,6 @@ describe('upterm GitHub integration', () => {
       Object.defineProperty(process, 'arch', {
         value: 'x64'
       });
-    });
-
-    it('does not kill tmux when this run never started a session', async () => {
-      // isPost is saved before installDependencies(), and post-if is
-      // "!cancelled()", so a failed download or a rejected upterm version lands
-      // here having started nothing. Killing the shared default tmux server would
-      // destroy a developer's unrelated sessions on a self-hosted runner.
-      postState({sessionStarted: '', message: ''});
-
-      await run();
-
-      // Neither the scoped teardown nor a server-wide one: a session named
-      // `upterm` found now was not started by this run.
-      expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('kill-session'));
-      expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('kill-server'));
-      // Directories are still ours, so they are still removed.
-      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
     });
 
     it('keeps waiting when a lookup throws instead of reporting the session gone', async () => {
@@ -952,48 +837,6 @@ describe('upterm GitHub integration', () => {
       expect(lookupWarnings.length).toBeLessThan(polls);
       // The countdown still does NOT advance on an unknown.
       expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
-    });
-
-    it('stops the session before removing its directories', async () => {
-      postState();
-      // Without this, the shared beforeEach's existsSync makes continueFileExists()
-      // true on the first poll, and the loop would exit via the continue file
-      // before ever reaching the terminal-status check below - so the 'ended'
-      // response would not be what actually ends the loop.
-      fsWithoutExitFiles();
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('session info') ? JSON.stringify({name: 'gha-3f9a1c05', status: 'ended'}) : ''));
-
-      await run();
-
-      const killIndex = mockedExecShellCommand.mock.calls.findIndex(c => c[0].includes('kill-session'));
-      expect(killIndex).toBeGreaterThanOrEqual(0);
-      expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('kill-server'));
-      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-rt-abc', {recursive: true, force: true});
-      // Post must RESTORE main's directories, never mint its own: fresh ones
-      // would point nowhere, and teardown would then remove the wrong paths
-      // while the real session's files survive.
-      expect(mockFs.mkdtempSync).not.toHaveBeenCalled();
-      // The runtime dir holds the live sockets; removing it first would unlink
-      // them out from under a still-running host.
-      expect(mockedExecShellCommand.mock.invocationCallOrder[killIndex]).toBeLessThan(mockFs.rmSync.mock.invocationCallOrder[0]);
-    });
-
-    it('tears down an attached-mode session by exact session name, never the whole tmux server', async () => {
-      // Attached mode saves no message, so post has nothing to wait on - but it
-      // is still where the session is stopped. The launch uses the default tmux
-      // server, which on a self-hosted runner may be one the job did not start
-      // (./run.sh inside tmux, or a developer's machine); kill-server there
-      // would take the runner offline or destroy unrelated sessions.
-      postState({message: ''});
-
-      await run();
-
-      // `=` makes tmux match the name exactly, so a user's `upterm-dev` is not
-      // prefix-matched by `upterm`.
-      expect(mockedExecShellCommand).toHaveBeenCalledWith("tmux kill-session -t '=upterm-wrapper' 2>/dev/null; tmux kill-session -t '=upterm' 2>/dev/null; true");
-      expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('kill-server'));
-      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
-      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-rt-abc', {recursive: true, force: true});
     });
 
     it('reaches teardown via the normal exit when the post-step lookup keeps failing', async () => {
@@ -1090,6 +933,143 @@ describe('upterm GitHub integration', () => {
       await run();
 
       expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
+    });
+  });
+
+  describe('launch', () => {
+    const launchCall = () => mockedExecShellCommand.mock.calls.map(c => c[0]).find(c => c.includes('upterm host'));
+
+    beforeEach(() => {
+      fsWithoutExitFiles();
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('upterm host')) return readySession();
+        if (cmd.includes('session info')) return endedResponse;
+        return '';
+      });
+    });
+
+    it('starts the session with upterm host --detach and nothing else', async () => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      await run();
+      const cmd = launchCall();
+      expect(cmd).toMatch(/^upterm host --detach --accept --output json --name gha-[0-9a-f]{8} --skip-host-key-check --server 'ssh:\/\/myserver:22'$/);
+      const all = mockedExecShellCommand.mock.calls.map(c => c[0]).join('\n');
+      expect(all).not.toMatch(/tmux|ssh-keygen|Invoke-CimMethod/);
+      expect(mockFs.appendFileSync).not.toHaveBeenCalledWith(expect.stringContaining('.ssh'), expect.anything());
+    });
+
+    it('authorizes each allowed user as github:NAME', async () => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      when(core.getInput).calledWith('limit-access-to-users').mockReturnValue("alice, o'brien");
+      when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('true');
+      await run();
+      const cmd = launchCall() as string;
+      expect(cmd).toContain("--authorized-user 'github:alice'");
+      expect(cmd).toContain("--authorized-user 'github:o'\\''brien'");
+      expect(cmd).not.toContain('--github-user');
+    });
+
+    it('hosts MSYS2 login bash on Windows, as v1 did', async () => {
+      Object.defineProperty(process, 'platform', {value: 'win32'});
+      Object.defineProperty(process, 'arch', {value: 'x64'});
+      await run();
+      expect(launchCall()).toMatch(/ -- bash -l$/);
+    });
+
+    it('publishes the ssh command from the launch output without polling for readiness', async () => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      await run();
+      expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
+      const launchIndex = mockedExecShellCommand.mock.calls.findIndex(c => c[0].includes('upterm host'));
+      const firstInfo = mockedExecShellCommand.mock.calls.findIndex(c => c[0].includes('session info'));
+      expect(firstInfo).toBeGreaterThan(launchIndex);
+    });
+
+    it('reports upterm’s own error and the session diagnostics when the launch fails', async () => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('upterm host')) throw new Error('Command failed with exit code 1\nStderr: Error: session gha-x could not start: dial tcp: connection refused');
+        if (cmd.includes('session info')) return JSON.stringify({name: 'gha-x', status: 'ended', reason: 'startup_failed'});
+        return '';
+      });
+      await run();
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('connection refused'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('startup_failed'));
+      expect(core.setFailed).not.toHaveBeenCalledWith(expect.stringMatching(/tmux/i));
+    });
+
+    it('fails when upterm reports a session with no ssh command', async () => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('upterm host')) return noDetail;
+        if (cmd.includes('session info')) return noDetail;
+        return '';
+      });
+      await run();
+      expect(core.setFailed).toHaveBeenCalled();
+    });
+  });
+
+  describe('teardown', () => {
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      fsWithoutExitFiles();
+    });
+
+    it('stops the session by name, then removes its directories, and never mints new ones', async () => {
+      postState();
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('session info') ? endedResponse : ''));
+      await run();
+      const stopIndex = mockedExecShellCommand.mock.calls.findIndex(c => c[0].includes('upterm session stop gha-3f9a1c05'));
+      expect(stopIndex).toBeGreaterThanOrEqual(0);
+      expect(mockedExecShellCommand.mock.invocationCallOrder[stopIndex]).toBeLessThan(mockFs.rmSync.mock.invocationCallOrder[0]);
+      expect(mockFs.mkdtempSync).not.toHaveBeenCalled();
+    });
+
+    it('exports the saved XDG directories before stopping, in attached mode too', async () => {
+      // Attached mode saves no message; its post step goes straight to teardown,
+      // and session stop resolves the session through XDG_STATE_HOME.
+      postState({message: ''});
+      mockedExecShellCommand.mockImplementation(async () => '');
+      delete process.env.XDG_STATE_HOME;
+      await run();
+      expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('upterm session stop gha-3f9a1c05'), expect.anything());
+      expect(process.env.XDG_STATE_HOME).toBeDefined();
+    });
+
+    it('does not stop anything when this run never started a session, but still removes its directories', async () => {
+      postState({sessionStarted: '', message: ''});
+      await run();
+      expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('session stop'), expect.anything());
+      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
+    });
+
+    it('stops the session through bash when the post step is interrupted', async () => {
+      postState();
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('session info') ? readySession() : ''));
+      // Park the wait loop at its first sleep, so the signal arrives mid-wait
+      // rather than racing a loop that mocked sleeps would spin through.
+      mockedSleep.mockImplementation(() => new Promise<void>(() => {}));
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+      const listeners: Array<() => Promise<void> | void> = [];
+      const on = jest.spyOn(process, 'on').mockImplementation(((event: string, fn: () => void) => {
+        if (event === 'SIGINT') listeners.push(fn);
+        return process;
+      }) as never);
+      try {
+        void run(); // never settles: the loop is parked; not awaited on purpose
+        await new Promise(r => setImmediate(r));
+        expect(listeners).toHaveLength(1);
+        await listeners[0]();
+        expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('upterm session stop gha-3f9a1c05'), expect.anything());
+        expect(exit).toHaveBeenCalledWith(1);
+      } finally {
+        on.mockRestore();
+        exit.mockRestore();
+      }
     });
   });
 
@@ -1211,7 +1191,9 @@ describe('upterm GitHub integration', () => {
       await run();
 
       expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
-      expect(sessionStops()).toBe(0);
+      // Exactly one: teardown's own unconditional stop, never a second one from
+      // the countdown itself - the re-check saw the join and disarmed it.
+      expect(sessionStops()).toBe(1);
       expect(polls).toBeGreaterThanOrEqual(20);
     });
 
@@ -1235,7 +1217,9 @@ describe('upterm GitHub integration', () => {
 
       await run();
 
-      expect(sessionStops()).toBe(0);
+      // Exactly one: teardown's own unconditional stop, never a second one from
+      // the countdown itself - the re-check's retry saw the join and disarmed it.
+      expect(sessionStops()).toBe(1);
       expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
       expect(polls).toBeGreaterThanOrEqual(20);
     });
@@ -1256,7 +1240,9 @@ describe('upterm GitHub integration', () => {
 
       await run();
 
-      expect(sessionStops()).toBe(0);
+      // Exactly one: teardown's own unconditional stop, never a second one from
+      // the countdown itself - the re-check found the session already ended.
+      expect(sessionStops()).toBe(1);
       expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
       expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
       expect(polls).toBe(14);
@@ -1304,6 +1290,7 @@ describe('upterm GitHub integration', () => {
       let polls = 0;
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
         if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('upterm host')) return readySession();
         if (!cmd.includes('session info')) return '';
         polls++;
         // Backstop: a regression that stops the countdown from firing must
@@ -1322,6 +1309,7 @@ describe('upterm GitHub integration', () => {
       let polls = 0;
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
         if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('upterm host')) return readySession();
         if (!cmd.includes('session info')) return '';
         polls++;
         return polls < 200 ? readySession() : endedResponse;
@@ -1407,7 +1395,6 @@ describe('upterm GitHub integration', () => {
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('TMP/TEMP'));
       // Names each measured path and its length.
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('107 bytes'));
-      expect(mockedLaunchOutsideJobObject).not.toHaveBeenCalled();
       expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('upterm host'));
       expect(core.saveState).not.toHaveBeenCalledWith('sessionStarted', 'true');
       expect(mockFs.mkdtempSync).not.toHaveBeenCalledWith(expect.stringContaining('upterm-rt-'));
@@ -1428,19 +1415,6 @@ describe('upterm GitHub integration', () => {
       expect(process.env.XDG_STATE_HOME).toBe(path.join(UPTERM_DATA_DIR, 'state').replace(/\\/g, '/'));
       expect(process.env.XDG_CONFIG_HOME).toBe(path.join(UPTERM_DATA_DIR, 'config').replace(/\\/g, '/'));
       expect(process.env.XDG_RUNTIME_DIR).toBe(UPTERM_RUNTIME_DIR.replace(/\\/g, '/'));
-    });
-
-    it('writes the same XDG values into tmux.conf that it exported', async () => {
-      await run();
-
-      // The host publishes its record under the tmux.conf XDG_STATE_HOME; every
-      // later `session info` resolves it through the exported one. They are
-      // derived from a single conversion for exactly this reason - two copies
-      // would agree only by coincidence, and diverge on one platform only.
-      const tmuxConf = (mockFs.writeFileSync as jest.Mock).mock.calls.find(c => String(c[0]).endsWith('tmux.conf'))?.[1] as string;
-      expect(tmuxConf).toContain(`set-environment -g XDG_STATE_HOME "${process.env.XDG_STATE_HOME}"`);
-      expect(tmuxConf).toContain(`set-environment -g XDG_CONFIG_HOME "${process.env.XDG_CONFIG_HOME}"`);
-      expect(tmuxConf).toContain(`set-environment -g XDG_RUNTIME_DIR "${process.env.XDG_RUNTIME_DIR}"`);
     });
 
     it('saves the directories for the post process', async () => {
