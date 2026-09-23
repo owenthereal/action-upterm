@@ -1,4 +1,16 @@
 import {spawn, execSync, ChildProcess} from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+
+/**
+ * Ceiling for the SSH command line to appear in act's output: act's image
+ * pull plus upterm's own release download, both of which can be slow under
+ * load. Exported so e2e.test.ts can budget every watcher that causally
+ * depends on the SSH line against the same number instead of a copy that can
+ * drift out of sync with it.
+ */
+export const SSH_COMMAND_TIMEOUT_MS = 240000; // 4 minutes
 
 /**
  * Run act to start an e2e-fixture workflow locally
@@ -32,7 +44,7 @@ export function runActWorkflow(options?: {workflowFile?: string; job?: string}):
         settled = true;
         reject(new Error('Timeout waiting for SSH command in act output'));
       }
-    }, 240000); // 4 minutes - act's image pull + upterm's release download can be slow under load
+    }, SSH_COMMAND_TIMEOUT_MS);
 
     actProcess.stdout?.on('data', (data: Buffer) => {
       const chunk = data.toString();
@@ -113,6 +125,29 @@ export function runActWorkflow(options?: {workflowFile?: string; job?: string}):
   return {process: actProcess, sshCommandPromise, waitForOutput, killProcess};
 }
 
+let guestIdentityPath: string | null = null;
+
+/**
+ * A throwaway ed25519 keypair for the guest's ssh connections, generated once
+ * per test process and reused by every joinAsGuest call.
+ *
+ * The fixtures set no access limits (open sessions), so any key
+ * authenticates - but the host running the tests may have no default
+ * identity at all (a fresh GitHub-hosted runner has no ~/.ssh/id_*, unlike a
+ * developer's machine), in which case ssh's own default-identity search
+ * finds nothing to offer and the relay replies "Permission denied
+ * (publickey)". Generating our own removes that dependency on whatever (if
+ * anything) happens to already be under ~/.ssh on the host.
+ */
+function ensureGuestIdentity(): string {
+  if (guestIdentityPath) return guestIdentityPath;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'e2e-guest-identity-'));
+  const keyPath = path.join(dir, 'id_ed25519');
+  execSync(`ssh-keygen -q -t ed25519 -N "" -f ${JSON.stringify(keyPath)}`);
+  guestIdentityPath = keyPath;
+  return keyPath;
+}
+
 /**
  * Join the session as a guest for holdMs, then leave without ending it.
  *
@@ -124,8 +159,12 @@ export function runActWorkflow(options?: {workflowFile?: string; job?: string}):
 export async function joinAsGuest(sshCommand: string, holdMs: number, input = ''): Promise<string> {
   const target = (sshCommand.match(/ssh\s+(\S+)/) ?? [])[1];
   if (!target) throw new Error(`Invalid SSH command format: ${sshCommand}`);
+  const identity = ensureGuestIdentity();
   return new Promise((resolve, reject) => {
-    const proc = spawn('ssh', ['-tt', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=10', target], {stdio: ['pipe', 'pipe', 'pipe']});
+    // IdentitiesOnly restricts ssh to exactly this key, so behavior doesn't
+    // vary with whatever else (an agent, other default identities) the host
+    // running the test happens to have.
+    const proc = spawn('ssh', ['-tt', '-i', identity, '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=10', target], {stdio: ['pipe', 'pipe', 'pipe']});
     let seen = '';
     proc.stdout.on('data', d => (seen += d.toString()));
     proc.stderr.on('data', d => (seen += d.toString()));
