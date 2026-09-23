@@ -107,7 +107,7 @@ function loadAction(): void {
 function baselineShell(...sessionResponses: string[]): void {
   const queue = sessionResponses.length ? [...sessionResponses] : [readySession()];
   mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-    if (cmd.includes('upterm version')) return 'Upterm version v0.30.0\n';
+    if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
     if (cmd.includes('session info')) return queue.length > 1 ? (queue.shift() as string) : queue[0];
     return 'foobar';
   });
