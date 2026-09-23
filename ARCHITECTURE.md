@@ -1,6 +1,6 @@
 # Architecture
 
-This document explains the technical architecture of action-upterm, with a focus on the nested command execution flow and cross-platform path handling.
+This document explains the technical architecture of action-upterm, with a focus on the three `upterm` calls that drive a session and cross-platform path handling.
 
 ## Table of Contents
 
@@ -9,73 +9,51 @@ This document explains the technical architecture of action-upterm, with a focus
 - [Platform-Specific Considerations](#platform-specific-considerations)
 - [Environment Variables](#environment-variables)
 - [Session Management](#session-management)
+- [File Structure](#file-structure)
+- [Error Handling](#error-handling)
+- [Testing Strategy](#testing-strategy)
 
 ## Command Execution Flow
 
-action-upterm uses a nested command structure to create an interactive debugging session. Understanding this flow is crucial for troubleshooting and maintenance.
+action-upterm's own footprint is three `upterm` invocations, all run through `execShellCommand` (bash on every platform, including Windows via `C:\msys64\usr\bin\bash.exe -lc`). Everything else - the wait loop, the countdown, teardown - is action code deciding when to make the next call.
 
-### Execution Layers
+### The three calls
 
-```
-GitHub Actions Runner
-  ↓
-bash (Node.js child process)
-  ↓ spawns
-tmux outer session (upterm-wrapper)
-  ↓ spawns
-upterm host process
-  ↓ spawns (via --force-command)
-tmux inner session (upterm)
-  ↓ user connects here
-User's shell
-```
+1. **`upterm host --detach --accept --output json --name gha-XXXXXXXX --skip-host-key-check --server <server> [--authorized-user github:NAME ...] [-- bash -l]`** (`launchSession()`, src/index.ts)
+   Starts upterm's own daemon and returns once it has started the hosted command and written its ready record - the JSON on stdout is the same shape `session info -o json` prints, so there is no separate readiness poll. On Windows, the hosted command is MSYS2's login bash (`bash -l`); everywhere else upterm runs `$SHELL` with no suffix. The daemon is not a child the launching step waits on: it detaches and outlives the step that started it.
 
-### Detailed Flow
+2. **`upterm session info <name> -o json`** (`getSession()`, src/session.ts)
+   Polled every 5 seconds by the wait loop (below) to read the session's status and `firstGuestJoinedAt`. A `no session named ...` error is treated as "the session is gone"; any other failure is treated as "unknown" and never spends the countdown or ends the wait, because a lookup failure says nothing about who is connected.
 
-1. **Node.js Process** (src/index.ts)
-   - Runs in GitHub Actions runner
-   - Orchestrates the entire setup
-   - Creates configuration files and directories
+3. **`upterm session stop <name>`** (`stopSession()`, src/index.ts)
+   Asks upterm to end this run's session. Called from three places: the countdown when it expires unanswered, the post step's normal teardown, and the post step's SIGINT/SIGTERM handler. Never throws - a session that is already gone still exits 0, and a transient failure is only warned about, because none of its three callers may fail the job over it.
 
-2. **Bash Shell** (via execShellCommand in src/helpers.ts)
-   - On Windows: Explicitly uses `C:\msys64\usr\bin\bash.exe`
-   - On Unix: Uses system's default bash
-   - Executes the outer tmux command
+### The wait loop and its `firstGuestJoinedAt` latch
 
-3. **Outer Tmux Session** (`upterm-wrapper`)
-   - Created in detached mode (`-d`)
-   - Loads custom tmux config with `-f` flag
-   - Path format: **Windows (C:/) or Unix (/home/...)**
-   - Sets up environment variables globally
-   - Spawns the upterm host process
+`waitForSession()` (src/index.ts) is the one loop used by both attached mode and detached mode's post step; only the timeout and the log message differ. Each iteration:
 
-4. **Upterm Host Process**
-   - Native binary (upterm.exe on Windows, upterm on Unix)
-   - Connects to upterm server
-   - Reads XDG environment variables
-   - Path format for XDG vars: **POSIX on Windows (/c/...), Unix unchanged**
-   - Uses `--force-command` to spawn inner tmux
+1. Checks for the continue file (`/continue` or `$GITHUB_WORKSPACE/continue`) - if present, the wait ends immediately with no session lookup.
+2. Polls `upterm session info`. A terminal status (`disconnected`, `ending`, `ended`) ends the wait. A live session updates the join latch.
+3. **The join latch**: `hasGuestJoined()` reads `session.firstGuestJoinedAt`, a field upterm itself sets from its own join events (present only from upterm v0.31.0+, which is why older upterm is refused). Once this has been true once for a session, the loop stops spending the countdown - the countdown never re-arms, and a guest who joins and immediately disconnects still latches it, because the daemon recorded the join, not the current connection count. `guestCount` is never used for this decision: it is `0` both when nobody has connected and when the admin query failed, so treating it as a live count would risk stopping a session someone is attached to.
+4. If the countdown is still armed (`wait-timeout-minutes` was set and no guest has ever joined) and it has reached zero, the loop does one last poll - because a guest may have joined, or the session may have ended, since the last check - and only then calls `stopSession()` and returns.
 
-5. **Inner Tmux Session** (`upterm`)
-   - Created by upterm's --force-command
-   - Also loads custom tmux config with `-f` flag
-   - Path format: **POSIX on Windows (/c/...), Unix unchanged**
-   - This is the session users connect to
-   - Inherits XDG environment from config
+### Teardown order
 
-6. **User Shell**
-   - Users SSH into the inner tmux session
-   - Full access to the GitHub Actions workspace
-   - Can run commands, debug issues, etc.
+`finalizeSession()`, run inside a `finally` in `runPost()`, always does two things in this order:
 
-### Why Nested Sessions?
+1. `stopSession()` (guarded by the `sessionStarted` state key, so a run that never reached `launchSession()` - a failed download, a rejected upterm version - doesn't try to stop a session it never started).
+2. `cleanupUptermData()` - removes this run's private directories (`uptermBaseDir`, `uptermRuntimeDir`) unconditionally.
 
-The nested tmux architecture serves several purposes:
+The order matters: the runtime directory holds the session's live sockets, so it must not be removed out from under a session that is still being asked to stop. The post step also installs a SIGINT/SIGTERM handler that runs `stopSession()` before exiting, because the runner interrupts a post step it is cancelling and `post-if: "!cancelled()"` already means the post step never runs at all when the *main* step was cancelled.
 
-1. **Wrapper Session**: Captures upterm's stdout/stderr for logging
-2. **Inner Session**: Provides the actual interactive debugging environment
-3. **Separation**: Allows the wrapper to continue even if inner session exits
-4. **Monitoring**: The action can monitor the wrapper session status
+### Why No WMI
+
+v1 launched the Windows session through WMI (`Invoke-CimMethod`) to detach it from the launching process tree. v2 does not, on the strength of a Windows probe (see `probe-evidence.md` in this plan) that ran `upterm host --detach` exactly as v2 does, on `windows-latest` and `windows-2022`:
+
+- **The daemon needs no WMI to survive.** It outlived its launching step ending, a sibling step's `timeout-minutes` firing, the cancelled step's Ctrl-C, and `if: always()` steps running after cancellation. It holds none of the launching step's pipes, so that step returns immediately once `upterm host --detach` prints its ready record.
+- **The runner's own orphan sweep reaps it** at "Complete job", on every OS, after both normal completion and cancellation, whether or not a guest ever joined - on Windows it kills `upterm` and its ConPTY `conhost`; on Linux/macOS, `upterm` and the hosted shell.
+- **A WMI-launched daemon escapes that sweep**: a process started via WMI carries no `RUNNER_TRACKING_ID`, the marker the sweep keys off, so "Complete job" terminates nothing. On a persistent (self-hosted) runner, a cancelled v1-style session leaked indefinitely. Dropping WMI removes a real leak, not just a layer of complexity.
+- `bash -l` (MSYS2 bash under ConPTY) works directly as the Windows hosted command - a connecting guest gets a working `MINGW64` prompt with no trampoline needed.
 
 ## Path Handling Strategy
 
@@ -100,8 +78,6 @@ Converts backslashes to forward slashes while preserving Windows drive letter fo
 **Use for:**
 - Paths passed to native Windows executables (upterm.exe)
 - Paths used in MSYS2 bash commands (works with both formats)
-- SSH key generation paths
-- Outer tmux config path (invoked from bash)
 
 **Examples:**
 ```typescript
@@ -117,8 +93,6 @@ Converts Windows paths to MSYS2/Cygwin POSIX-style paths.
 - XDG environment variables (XDG_RUNTIME_DIR, XDG_STATE_HOME, XDG_CONFIG_HOME)
 - Shell redirects and pipes (`>`, `2>`, `|`)
 - MSYS2 utilities (cat, tee, echo)
-- Inner tmux config path (spawned by upterm.exe)
-- Timeout flag file path
 
 **Examples:**
 ```typescript
@@ -150,7 +124,7 @@ Need to convert a path?
 ├─ Is it for a native Windows executable? (upterm.exe)
 │  └─ Use toShellPath() for arguments, toMsys2Path() for XDG environment variables
 │
-├─ Is it for bash/tmux invoked from bash?
+├─ Is it for bash invoked from bash?
 │  └─ Use toShellPath() (bash accepts both formats on Windows)
 │
 ├─ Is it for a process spawned BY a native Windows executable?
@@ -169,12 +143,10 @@ Need to convert a path?
 
 **Characteristics:**
 - Native POSIX paths
-- tmux and SSH tools readily available
 - Sockets live under the per-run runtime directory, rooted at `RUNNER_TEMP` whenever that fits upterm's socket path limit (see [File Structure](#file-structure))
 
 **Installation:**
 - Downloads pre-built upterm binary
-- Installs tmux via apt-get (if not present)
 
 **Path Handling:**
 - Minimal conversion needed
@@ -184,11 +156,10 @@ Need to convert a path?
 
 **Characteristics:**
 - Native POSIX paths (similar to Linux)
-- Uses Homebrew for package management
 - May have restrictive permissions in /tmp
 
 **Installation:**
-- Installs both upterm and tmux via Homebrew
+- Downloads the upterm binary from the GitHub release tarball (no Homebrew dependency)
 
 **Path Handling:**
 - Same as Linux - minimal conversion needed
@@ -199,20 +170,19 @@ Need to convert a path?
 - Native Windows paths with backslashes
 - Uses MSYS2 environment for Unix-like tools
 - Complex path format requirements
-- Two execution contexts: native Windows and MSYS2
+- Two execution contexts: native Windows (upterm.exe) and MSYS2 bash
 
 **Installation:**
 - Downloads Windows-native upterm.exe
-- Installs tmux via pacman (MSYS2 package manager)
+- Copies it into MSYS2's `/usr/bin` so it resolves inside the hosted MSYS2 login shell, whose minimal `PATH` would otherwise drop the tool-cache directory `core.addPath()` set up
 
 **Path Handling:**
 - Most complex due to mixed execution contexts
 - Requires careful path format selection
 - See "Path Handling Strategy" above
 
-**MSYS2 Environment:**
+**MSYS2 Environment (for every `execShellCommand` call, including the hosted session):**
 ```bash
-# Environment variables for MSYS2 bash
 MSYS2_PATH_TYPE=inherit  # Don't convert paths automatically
 CHERE_INVOKING=1         # Don't cd to home directory
 MSYSTEM=MINGW64          # Include MINGW64 binaries in PATH
@@ -232,128 +202,55 @@ action-upterm follows the [XDG Base Directory Specification](https://specificati
 | `XDG_STATE_HOME` | State data, logs | `{RUNNER_TEMP}/upterm-action-XXXXXX/state` | `/c/.../Temp/upterm-action-XXXXXX/state` |
 | `XDG_CONFIG_HOME` | Configuration files | `{RUNNER_TEMP}/upterm-action-XXXXXX/config` | `/c/.../Temp/upterm-action-XXXXXX/config` |
 
+On Windows these are exported in MSYS-form (`/c/...`), never `C:/...` - that's the form upterm.exe itself expects in its environment, and it's what every `execShellCommand` call inherits via `process.env`.
+
 **Why XDG Variables:**
 - Platform defaults may not exist in CI environments
 - Ensures consistent, writable locations
 - upterm uses XDG_RUNTIME_DIR for socket placement and XDG_STATE_HOME to locate a session's record - main and post must agree on both, or a healthy session reports as missing to post
 - Logs go to XDG_STATE_HOME for easy diagnostics
-- Exported to the action's own Node process (`process.env`), not just into tmux.conf - the action's own `upterm session info` calls need to resolve the same session record the host published to
-
-### Tmux Configuration
-
-A custom tmux configuration file is generated at runtime:
-
-**Location:** `{RUNNER_TEMP}/upterm-action-XXXXXX/tmux.conf`
-
-**Contents:**
-```tmux
-# Set XDG directories for upterm
-set-environment -g XDG_RUNTIME_DIR "/path/to/runtime"
-set-environment -g XDG_STATE_HOME "/path/to/state"
-set-environment -g XDG_CONFIG_HOME "/path/to/config"
-
-# Allow UPTERM_ADMIN_SOCKET to be inherited from client environment
-set-option -ga update-environment " UPTERM_ADMIN_SOCKET"
-
-# Enable aggressive window resizing for better multi-client support
-setw -g aggressive-resize on
-```
-
-**Why Custom Config:**
-- Ensures both outer and inner tmux sessions have consistent environment
-- Sets XDG variables globally for all sessions
-- Allows `upterm session current` to work without `--admin-socket` flag
-- Enables better multi-client support
+- Exported to the action's own Node process (`process.env`) once, by `exportXdgEnvironment()`, called by both main and post - the action's own `upterm session info`/`session stop` calls need to resolve the same session record the host published to
 
 ## Session Management
 
 ### Session Lifecycle
 
-1. **Creation** (`createUptermSession()`)
-   - Generate tmux config file
-   - Create directory structure
-   - Spawn outer tmux with custom config
-   - Wait for upterm to initialize (2 second delay)
+1. **Creation** (`launchSession()`)
+   - Create the per-run runtime/state/config directories, export XDG_* into `process.env`
+   - Run `upterm host --detach ...` (see [Command Execution Flow](#command-execution-flow)); it returns only once the session is up, with its JSON session info on stdout - no separate readiness polling
 
-2. **Readiness Check** (`waitForUptermReady()`)
-   - Polls `upterm session info <name> -o json`, addressing the session by the
-     `--name` passed to `upterm host` (no filesystem discovery)
-   - Ready requires BOTH `status === 'ready'` AND a usable `sshCommand`: when
-     upterm's admin query fails, it can return the record's view with status
-     still `ready` but no `sshCommand`, which is not something anyone can
-     connect to
-   - Maximum 30 retries with 1 second intervals. Wider than the old socket-file
-     check needed, because readiness now waits on upterm's second, unlocked
-     admin round-trip; the loop returns on its first success, so the budget only
-     costs anything on a run that was going to be slow
-   - Collects diagnostics on failure
+2. **SSH Command Output** (`outputSshCommand()`)
+   - Sets the `ssh-command` output and logs the SSH command
+   - Writes to the job summary - best effort: if the write fails (e.g. `GITHUB_STEP_SUMMARY` is unset), the error is logged at debug level and the action carries on
 
-3. **SSH Command Output** (`outputSshCommand()`)
-   - Retrieves SSH connection string
-   - Sets GitHub Actions output and logs the SSH command
-   - Writes to job summary - best effort: if the write fails (e.g. `GITHUB_STEP_SUMMARY` is unset), the error is logged at debug level and the action carries on
-
-4. **Monitoring** (`monitorSession()`)
+3. **Monitoring** (`waitForSession()`)
    - Polls session status every 5 seconds
-   - Checks for continue file
-   - Checks for timeout
-   - Handles connection errors gracefully
+   - Checks for the continue file
+   - Tracks `firstGuestJoinedAt` to decide whether the countdown is still armed (see [The wait loop and its firstGuestJoinedAt latch](#the-wait-loop-and-its-firstguestjoinedat-latch))
+   - A failed lookup ("unknown") never ends the wait and never spends the countdown
 
-5. **Termination**
-   - User creates `/continue` file
-   - Timeout reached (if configured)
-   - Session exits naturally
-   - External termination (error case)
+4. **Termination** - the wait ends when:
+   - The continue file is created
+   - The session reaches a terminal status (`disconnected`, `ending`, `ended`)
+   - The countdown expires while no guest has ever joined (`stopSession()` is called)
 
-6. **Post-Step Teardown** (`finalizeSession()`, run inside a `finally` in `runPost()`)
-   - Stops the session by killing only this action's two tmux sessions, by exact name: `tmux kill-session -t '=upterm-wrapper'` then `-t '=upterm'` (the `=` prevents prefix-matching a user's `upterm-dev`). Never `kill-server`: the launch uses the default tmux server, which on a self-hosted runner may not be the job's - a runner started with `./run.sh` inside tmux would go offline mid-job. Killing the session closes its panes, which sends `upterm host` the same SIGHUP
-   - That kill is guarded on the `sessionStarted` state key, so a run that never started a session (e.g. a failed download or a rejected upterm version) doesn't kill `upterm-wrapper`/`upterm` sessions it never created
-   - Removes this run's private directories (`uptermBaseDir`, `uptermRuntimeDir`) unconditionally - they are always safe to remove, whether or not a session ever started
-   - Runs on both success and failure paths, since `post-if` is `!cancelled()`
-
-### Timeout Mechanism
-
-When `wait-timeout-minutes` is specified:
-
-```bash
-# Background process that enforces timeout
-(
-  sleep $(( TIMEOUT * 60 ));
-  if [ -z "$(tmux list-clients -t upterm -f '#{?client_readonly,,1}')" ]; then
-    echo "UPTERM_TIMEOUT_REACHED" > {flag-file};
-    tmux kill-server;
-  fi
-) & disown
-```
-
-**Logic:**
-- Sleeps for specified duration
-- Asks tmux itself whether the `upterm` session has any writable client
-  (`tmux list-clients -t upterm -f '#{?client_readonly,,1}'`). The filter drops
-  read-only clients, which is what the action's own inner `tmux new -f
-  read-only` attaches as - so the action does not count as somebody having
-  connected
-- If no such client, writes flag file and kills the tmux server (`kill-server` - unlike post-step teardown; see [Concurrency](#concurrency))
-- Monitoring loop detects flag and exits gracefully
+5. **Post-Step Teardown** (`finalizeSession()`, run inside a `finally` in `runPost()`) - see [Teardown order](#teardown-order)
+   - Runs on both success and failure paths, since `post-if` is `!cancelled()`. On an outright cancellation of the main step, the post step does not run at all; the runner's orphan sweep is what ends the session (see [Why No WMI](#why-no-wmi))
 
 ### Diagnostics Collection
 
-On startup failure, comprehensive diagnostics are collected:
+On startup failure, `collectDiagnostics()` reports:
 
-- A headline saying which failure it was: "Upterm session ended before it became ready" when the session reached a terminal status (`ended`, `ending`, `disconnected`), otherwise "Upterm did not become ready after maximum retries"
+- A headline saying which failure it was: "Upterm session ended before it became ready" when the session reached a terminal status, otherwise "Upterm did not start a usable session"
 - The run's private base directory and session name
-- The session's status, taken from the last readiness poll when it saw a session, otherwise from a fresh `upterm session info` (or the lookup failure, if that query itself failed)
+- The session lookup failure, if the diagnostic lookup itself failed
+- The session's status (from the last observed poll, or a fresh lookup)
 - For a non-terminal session, whether upterm answered from its record only (no live detail) rather than a successful admin query
 - The session's `Reason`, `Exit code` and `Signal`, when present
 - Upterm's own log, read from `session.logPath` (`{XDG_STATE_HOME}/upterm/upterm.log`) when present; if it cannot be read, the error is recorded in its place and the rest of the report is still produced
-- Tmux session list
-- Tmux error log
-- Upterm command output log
-- Binary availability check (`upterm version`)
-- XDG_RUNTIME_DIR and other environment variables
-- Platform information
-
-This information helps users report issues with full context.
+- Upterm binary availability check (`upterm version`)
+- XDG_RUNTIME_DIR (both the form passed to upterm and the actual directory), USER, UID, and platform
+- Troubleshooting steps and a link to the issue tracker
 
 ### State Handed From Main to Post
 
@@ -364,26 +261,16 @@ The main and post invocations are separate Node processes; `core.saveState()` /
 |-----|---------|
 | `isPost` | Set before any fallible setup so a failure always routes to the post (cleanup) path instead of re-entering main. |
 | `sessionName` | The `gha-<8 hex>` name minted once in main, so post addresses the same session. |
-| `sessionStarted` | Saved immediately *before* the `tmux new` launch is attempted, so a launch that fails part-way is still torn down; guards the post step's `tmux kill-session` teardown so a failed download or rejected upterm version - neither of which reaches session creation - doesn't kill `upterm-wrapper`/`upterm` sessions this run never created. |
+| `sessionStarted` | Saved immediately *before* `upterm host --detach` is attempted, so a launch that fails part-way is still torn down; guards the post step's `stopSession()` call so a failed download or rejected upterm version - neither of which reaches session creation - doesn't try to stop a session this run never created. |
 | `uptermBaseDir` | Path to the per-run `upterm-action-XXXXXX` directory, so post restores rather than mints new directories. |
 | `uptermRuntimeDir` | Path to the per-run `upterm-rt-XXXXXX` directory (`XDG_RUNTIME_DIR`), wherever its root was chosen - post restores and removes it from here. |
 | `message` | The SSH connection message, saved only in detached mode; its absence tells post there is nothing to wait on. |
 
-There is no `socketPath` key - sessions are addressed by name, not by a socket path discovered on disk.
+There is no separate session-manager state, and no `socketPath` key - sessions are addressed by name, not by a socket path discovered on disk.
 
 ### Concurrency
 
-Multiple concurrent `action-upterm` invocations on the same runner remain
-**unsupported**. The tmux layer uses the shared default server (no `-L`/`-S`)
-with fixed session names (`upterm-wrapper`, `upterm`). `finalizeSession()`
-kills only those two sessions by exact name, but because the names are fixed,
-two runs would still kill each other's; and the wait-timeout script and the
-post step's SIGINT/SIGTERM handler still run an unscoped `tmux kill-server`
-that stops every session on that server, not just this run's. The per-run
-private directories (`upterm-action-XXXXXX`, `upterm-rt-XXXXXX`) and the
-per-run upterm session name (`gha-<8 hex>`)
-avoid collisions in *those* two places only - they do not make it safe to run
-two instances of this action in the same job.
+Each run mints its own session name (`gha-<8 hex>`) and its own private, `mkdtemp`'d runtime/state/config directories, so two `action-upterm` steps in the same job each address only their own session by name rather than sharing a fixed name or a stop call that would affect both. The one surface that is still process-wide is the continue file: `/continue` and `$GITHUB_WORKSPACE/continue` are shared paths, so creating either one resumes *every* `action-upterm` invocation in that job currently watching for it, not just one.
 
 ## File Structure
 
@@ -394,14 +281,10 @@ Each run creates two private directories, each `mkdtempSync`'d with mode
 
 ```
 {RUNNER_TEMP}/upterm-action-XXXXXX/    # base dir
-├── tmux.conf             # Custom tmux configuration
 ├── state/                # XDG_STATE_HOME
-│   ├── upterm/
-│   │   └── upterm.log      # upterm's own log (read via session.logPath in diagnostics)
-│   ├── upterm-command.log  # Our tee of the upterm host process's stdout/stderr
-│   └── tmux-error.log      # Tmux stderr
-├── config/               # XDG_CONFIG_HOME
-└── timeout-flag          # Created when timeout is reached
+│   └── upterm/
+│       └── upterm.log      # upterm's own log (read via session.logPath in diagnostics)
+└── config/               # XDG_CONFIG_HOME
 
 {runtime root}/upterm-rt-XXXXXX/       # XDG_RUNTIME_DIR
 └── upterm/
@@ -437,20 +320,18 @@ the measured paths and how to shorten them.
 1. **Installation Errors**
    - Platform not supported
    - Architecture not supported (only x64 and arm64)
-   - Package manager failures
    - Network issues downloading upterm
 
 2. **Session Creation Errors**
-   - Tmux not available
    - Upterm not available
-   - Unsupported upterm version (`< v0.30.0`), caught by `assertSupportedUptermVersion()` before a session is even attempted
+   - Unsupported upterm version (`< v0.31.0`, or an unparseable version), caught by `assertSupportedUptermVersion()` before a session is even attempted
    - Network connectivity to upterm server
    - Permission issues
 
 3. **Runtime Errors**
-   - Session never reaches a ready state with a usable `sshCommand` after retries
+   - `upterm host --detach` exits without a usable `sshCommand`
    - Connection refused (unexpected termination)
-   - Timeout reached
+   - Timeout reached while no guest ever joined
 
 ### Error Message Design
 
@@ -462,20 +343,15 @@ All errors include:
 
 Example:
 ```
-Failed to create upterm session: <error details>
+Failed to start the upterm session: <error details>
 
-Common causes:
-- Network connectivity issues (cannot reach upterm server)
-- Upterm server unavailable or incorrect server URL
-- Tmux not installed or not in PATH
-- On Windows: MSYS2 environment issues
+Diagnostics:
+- Upterm data directory: <path>
+- Session name: gha-XXXXXXXX
+- Session status: <status>
+...
 
-Troubleshooting:
-- Check upterm-server input is correct
-- Verify network connectivity
-- Review logs for specific errors
-
-For help: https://github.com/owenthereal/action-upterm/issues
+Please report this issue with the above diagnostics at: https://github.com/owenthereal/action-upterm/issues
 ```
 
 ## Testing Strategy
@@ -519,6 +395,5 @@ When modifying action-upterm, keep in mind:
 ## Further Reading
 
 - [upterm Documentation](https://github.com/owenthereal/upterm)
-- [tmux Manual](https://github.com/tmux/tmux/wiki)
 - [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
 - [MSYS2 Documentation](https://www.msys2.org/docs/what-is-msys2/)

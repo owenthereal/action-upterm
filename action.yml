@@ -23,11 +23,11 @@ inputs:
     required: true
     default: "ssh://uptermd.upterm.dev:22"
   wait-timeout-minutes:
-    description: "Integer number of minutes to wait for user to connect before shutting down server. In detached mode, the countdown starts after all regular steps finish. Once a user connects, the server will stay up."
+    description: "Integer number of minutes to wait for user to connect before shutting down server. In detached mode, the countdown starts after all regular steps finish. Once a guest has joined, the session stays up until it ends."
     required: false
     default: ""
   upterm-version:
-    description: "Upterm version/tag to install (e.g., v0.30.0). Requires v0.30.0 or newer. Defaults to latest when unset."
+    description: "Upterm version/tag to install (e.g., v0.31.0). Requires v0.31.0 or newer. Defaults to latest when unset."
     required: false
   detached:
     description: "In detached mode, the workflow job will continue while the upterm session is active"
