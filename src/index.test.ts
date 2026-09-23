@@ -146,7 +146,6 @@ function fsWithoutExitFiles(): void {
     // CONTINUE_FILE_PATHS: '/continue' (unix), 'C:/msys64/continue' (win32),
     // plus $GITHUB_WORKSPACE/continue.
     if (p.endsWith('continue')) return false;
-    if (p.includes('timeout-flag')) return false;
     return true;
   });
 }
@@ -627,7 +626,6 @@ describe('upterm GitHub integration', () => {
     mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
       const pathStr = filePath.toString();
       if (pathStr.includes('id_rsa') || pathStr.includes('id_ed25519')) return false;
-      if (pathStr.includes('timeout-flag')) return false;
       if (pathStr.endsWith('continue')) return polls >= 4;
       return true;
     });
@@ -1116,7 +1114,14 @@ describe('upterm GitHub integration', () => {
     it('detached: with nobody ever joining, stops the session when the countdown runs out', async () => {
       postState();
       when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('session info') ? readySession() : ''));
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        // Backstop: a regression that stops the countdown from firing must
+        // fail an assertion below, not hang the suite forever.
+        return polls < 500 ? readySession() : endedResponse;
+      });
 
       await run();
 
@@ -1173,8 +1178,14 @@ describe('upterm GitHub integration', () => {
     it('never treats guestCount as a join', async () => {
       postState();
       when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-      // Forwarding-only presence: counted, never a qualifying join.
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('session info') ? readySession({guestCount: 1}) : ''));
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        // Forwarding-only presence: counted, never a qualifying join. Backstop
+        // at 500 so a regression fails an assertion instead of hanging.
+        return polls < 500 ? readySession({guestCount: 1}) : endedResponse;
+      });
 
       await run();
 
@@ -1200,7 +1211,55 @@ describe('upterm GitHub integration', () => {
       await run();
 
       expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
+      expect(sessionStops()).toBe(0);
       expect(polls).toBeGreaterThanOrEqual(20);
+    });
+
+    it('does not stop when the final re-check itself fails, and tries again once a later lookup succeeds', async () => {
+      // A failed lookup never spends the countdown and never ends the wait -
+      // that includes the final re-check right before stopping. A regular poll
+      // that fails is already covered elsewhere; this is the re-check specifically.
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        // 12 no-guest polls spend the minute; the 13th (regular) and 14th
+        // (re-check) both fail; a guest is then seen joined, then the session ends.
+        if (polls <= 12) return readySession();
+        if (polls <= 14) throw new Error('Command failed with exit code 2\nStderr: registry unavailable');
+        if (polls < 20) return readySession({firstGuestJoinedAt: '2026-09-23T04:14:00Z'});
+        return endedResponse;
+      });
+
+      await run();
+
+      expect(sessionStops()).toBe(0);
+      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
+      expect(polls).toBeGreaterThanOrEqual(20);
+    });
+
+    it('does not stop or warn when the final re-check finds the session already ended', async () => {
+      postState();
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        // 12 no-guest polls spend the minute; the 13th regular poll still sees
+        // nobody and finds the countdown at zero; the 14th lookup is the final
+        // re-check, and it is the one that finds the session already ended.
+        if (polls <= 13) return readySession();
+        return endedResponse;
+      });
+
+      await run();
+
+      expect(sessionStops()).toBe(0);
+      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
+      expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+      expect(polls).toBe(14);
     });
 
     it('does not spend the countdown on lookups that fail', async () => {
@@ -1227,7 +1286,9 @@ describe('upterm GitHub integration', () => {
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
         if (!cmd.includes('session info')) return '';
         polls++;
-        return readySession();
+        // Backstop: a regression that stops the countdown from firing must
+        // fail an assertion below, not hang the suite forever.
+        return polls < 500 ? readySession() : endedResponse;
       });
 
       await run();
@@ -1240,10 +1301,14 @@ describe('upterm GitHub integration', () => {
 
     it('attached: counts down from readiness only when wait-timeout-minutes is set', async () => {
       when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+      let polls = 0;
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
         if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
-        if (cmd.includes('session info')) return readySession();
-        return '';
+        if (!cmd.includes('session info')) return '';
+        polls++;
+        // Backstop: a regression that stops the countdown from firing must
+        // fail an assertion below, not hang the suite forever.
+        return polls < 500 ? readySession() : endedResponse;
       });
 
       await run();
@@ -1266,6 +1331,7 @@ describe('upterm GitHub integration', () => {
 
       expect(polls).toBe(200);
       expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
+      expect(sessionStops()).toBe(0);
     });
   });
 
