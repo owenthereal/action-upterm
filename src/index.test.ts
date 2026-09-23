@@ -1,4 +1,5 @@
 import {when} from 'jest-when';
+import {execFileSync} from 'child_process';
 import path from 'path';
 
 jest.mock('@actions/core');
@@ -66,6 +67,9 @@ const TIMEOUT_FLAG_PATH = path.join(UPTERM_DATA_DIR, 'timeout-flag');
 const TIMEOUT_FLAG_SHELL_PATH = TIMEOUT_FLAG_PATH.replace(/\\/g, '/');
 
 process.env.RUNNER_TEMP = RUNNER_TEMP;
+
+// Captured before any test overrides process.platform.
+const describeWithPosixShell = process.platform === 'win32' ? describe.skip : describe;
 
 const READY_SESSION = {name: 'gha-3f9a1c05', status: 'ready', sessionId: 's1', sshCommand: 'ssh user@session123.upterm.dev', guestCount: 0};
 
@@ -575,6 +579,40 @@ describe('upterm GitHub integration', () => {
     expect(core.setFailed).toHaveBeenCalledWith('upterm-server is required');
   });
 
+  describe('upterm-server validation', () => {
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      Object.defineProperty(process, 'arch', {value: 'x64'});
+    });
+
+    it.each([
+      ['uptermd.upterm.dev:22', 'upterm-server must be an ssh://, ws:// or wss:// URL with a host, got: uptermd.upterm.dev:22'],
+      ['https://uptermd.upterm.dev', 'upterm-server must be an ssh://, ws:// or wss:// URL with a host, got: https://uptermd.upterm.dev'],
+      ['ssh://', 'upterm-server must be an ssh://, ws:// or wss:// URL with a host, got: ssh://'],
+      ['not a url', 'upterm-server is not a valid URL: not a url']
+    ])('rejects %s before installing anything', async (server, message) => {
+      when(core.getInput).calledWith('upterm-server').mockReturnValue(server);
+
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalledWith(message);
+      expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+      // Saved before validation, so the post step cleans up rather than
+      // re-running validation and reporting the same failure twice.
+      expect(core.saveState).toHaveBeenCalledWith('isPost', 'true');
+    });
+
+    // Forms upterm accepts that a hand-written host pattern tends to reject.
+    it.each(['wss://proxy.example.com/upterm', 'ssh://[::1]:22', 'ssh://upterm_server:22', 'SSH://uptermd.upterm.dev:22', 'ssh://user@uptermd.upterm.dev:22'])('accepts %s', async server => {
+      when(core.getInput).calledWith('upterm-server').mockReturnValue(server);
+
+      await run();
+
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(core.info).toHaveBeenCalledWith(`Creating a new session. Connecting to upterm server ${server}`);
+    });
+  });
+
   it('should handle shell command failures during installation', async () => {
     Object.defineProperty(process, 'platform', {
       value: 'linux'
@@ -783,6 +821,27 @@ describe('upterm GitHub integration', () => {
       const tmuxCmd = mockedExecShellCommand.mock.calls.map(c => c[0]).find(c => c.includes('upterm host'));
       expect(tmuxCmd).toMatch(/--name gha-[0-9a-f]{8}/);
       expect(core.saveState).toHaveBeenCalledWith('sessionName', expect.stringMatching(/^gha-[0-9a-f]{8}$/));
+    });
+
+    // Runs the real command through a real shell, with tmux stubbed to print
+    // the command it would run. Skipped on Windows hosts, where no POSIX shell
+    // is guaranteed; the command string is the same on every platform.
+    describeWithPosixShell('shell quoting', () => {
+      it('passes upterm-server and allowed users to tmux without shell expansion', async () => {
+        when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22/`id`');
+        when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('foo$(id)');
+
+        await run();
+
+        const tmuxCmd = mockedExecShellCommand.mock.calls.map(c => c[0]).find(c => c.includes('upterm host')) as string;
+        // The stderr redirect targets the mocked runner temp dir, which does not
+        // exist here; a failed redirect would stop the stub from running.
+        const script = `tmux() { for arg; do last=$arg; done; printf '%s' "$last"; }\n${tmuxCmd.replace(/ 2>'[^']*'$/, '')}`;
+        const received = execFileSync('/bin/sh', ['-c', script], {encoding: 'utf8'});
+
+        expect(received).toContain("--server 'ssh://myserver:22/`id`'");
+        expect(received).toContain("--github-user 'foo$(id)'");
+      });
     });
 
     it('does not treat ready-without-ssh-command as ready', async () => {
