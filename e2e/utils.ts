@@ -154,24 +154,44 @@ function ensureGuestIdentity(): string {
  * -tt allocates a pty with no local terminal, which is an accepted session
  * channel - a qualifying join for upterm's firstGuestJoinedAt. Leaving by
  * killing ssh (not by typing exit) leaves the shared shell running.
- * Resolves with everything the guest saw.
+ * Resolves with everything the guest saw; rejects loudly if the guest never
+ * actually authenticated, rather than resolving with a transcript nobody
+ * checks (both callers that only wait for firstGuestJoinedAt to appear, not
+ * for a specific string in the guest's own output, would otherwise see a
+ * failed join only as a much harder to diagnose pattern timeout minutes
+ * later - the post step polling for a join that can never come).
  */
 export async function joinAsGuest(sshCommand: string, holdMs: number, input = ''): Promise<string> {
   const target = (sshCommand.match(/ssh\s+(\S+)/) ?? [])[1];
   if (!target) throw new Error(`Invalid SSH command format: ${sshCommand}`);
   const identity = ensureGuestIdentity();
   return new Promise((resolve, reject) => {
-    // IdentitiesOnly restricts ssh to exactly this key, so behavior doesn't
-    // vary with whatever else (an agent, other default identities) the host
-    // running the test happens to have.
-    const proc = spawn('ssh', ['-tt', '-i', identity, '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=10', target], {stdio: ['pipe', 'pipe', 'pipe']});
+    // IdentitiesOnly and IdentityAgent=none restrict ssh to exactly this key,
+    // so behavior doesn't vary with whatever else - another default
+    // identity, a developer's own agent - the host running the test happens
+    // to have.
+    const proc = spawn('ssh', ['-tt', '-i', identity, '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=10', target], {
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
     let seen = '';
+    let holdElapsed = false;
     proc.stdout.on('data', d => (seen += d.toString()));
     proc.stderr.on('data', d => (seen += d.toString()));
     if (input) setTimeout(() => proc.stdin.write(input), 1000);
-    const timer = setTimeout(() => proc.kill('SIGTERM'), holdMs);
-    proc.on('close', () => {
+    const timer = setTimeout(() => {
+      holdElapsed = true;
+      proc.kill('SIGTERM');
+    }, holdMs);
+    proc.on('close', code => {
       clearTimeout(timer);
+      // A successful join is only ever closed by us, once holdMs elapses.
+      // Anything that closes on its own first - especially with "Permission
+      // denied" in its output, or ssh's own auth-failure exit code 255 -
+      // never joined at all.
+      if (!holdElapsed && (/Permission denied/i.test(seen) || code === 255)) {
+        reject(new Error(`Guest failed to authenticate to the relay: ${seen}`));
+        return;
+      }
       resolve(seen);
     });
     proc.on('error', reject);
