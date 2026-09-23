@@ -342,6 +342,9 @@ function validateInputs(): void {
   if (!uptermServer) {
     throw new Error('upterm-server is required');
   }
+  if (!/^(ssh|wss?):\/\/[a-zA-Z0-9.-]+(:\d+)?\/?$/.test(uptermServer)) {
+    throw new Error('upterm-server must use the ssh, ws, or wss scheme followed by a valid host[:port]');
+  }
 }
 
 export async function run() {
