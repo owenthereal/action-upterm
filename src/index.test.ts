@@ -56,7 +56,7 @@ const RUNNER_TEMP = '/runner/_temp';
 // way (RUNNER_TEMP has no drive letter, so this is the ONLY shape difference
 // to worry about for these two).
 const UPTERM_DATA_DIR = path.join(RUNNER_TEMP, 'upterm-action-') + 'abc123';
-const UPTERM_RUNTIME_DIR = path.join(RUNNER_TEMP, 'upterm-runtime-') + 'abc123';
+const UPTERM_RUNTIME_DIR = path.join(RUNNER_TEMP, 'upterm-rt-') + 'abc123';
 // Raw (Shape A), matching getUptermDirs().timeoutFlag exactly - both computed
 // via the same path.join() on the same base. Use TIMEOUT_FLAG_SHELL_PATH
 // below instead for anything asserting on a shell command string, since those
@@ -817,6 +817,85 @@ describe('upterm GitHub integration', () => {
       expect(core.info).toHaveBeenCalledWith('Signal: SIGKILL');
     });
 
+    it('ends monitoring on ending, separately from ended', async () => {
+      // `ending` is the brief transitional state while the host still holds the
+      // name. The sequence continues to `ended` so that, were `ending` not
+      // terminal, the loop would still stop - and the lookup count shows which
+      // response actually ended it.
+      fsWithoutExitFiles();
+      baselineShell(readySession(), JSON.stringify({name: 'gha-3f9a1c05', status: 'ending', sessionId: 's1'}), endedResponse);
+
+      await run();
+
+      expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+      // One readiness lookup, one monitoring lookup that saw `ending`.
+      expect(sessionInfoCalls()).toBe(2);
+      expect(core.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('reports the exit code when monitoring sees the session end', async () => {
+      fsWithoutExitFiles();
+      baselineShell(readySession(), JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', reason: 'exited', exitCode: 1}));
+
+      await run();
+
+      expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+      expect(core.info).toHaveBeenCalledWith('Exit code: 1');
+    });
+
+    it('does not fail startup when the job summary cannot be written', async () => {
+      // write() throws when GITHUB_STEP_SUMMARY is unset (older GHES, some
+      // runner setups). The summary is a convenience; the session is already up.
+      (core.summary.write as jest.Mock).mockRejectedValueOnce(new Error('Unable to find environment variable for $GITHUB_STEP_SUMMARY'));
+
+      await run();
+
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
+      expect(core.info).toHaveBeenCalledWith('SSH command available as output: ssh user@session123.upterm.dev');
+      // Monitoring was reached (and ended via the default continue file).
+      expect(core.debug).toHaveBeenCalledWith('Entering main loop');
+      expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
+    });
+
+    it('says the session ended, with its exit code, when readiness sees it end', async () => {
+      // What a misconfigured upterm-server produces: the session ends on the
+      // first poll, with retries to spare. "did not become ready after maximum
+      // retries" would send the user looking for a slowness problem.
+      baselineShell(JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', reason: 'connect_failed', exitCode: 1}));
+
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Upterm session ended before it became ready (status: ended)'));
+      expect(core.setFailed).not.toHaveBeenCalledWith(expect.stringContaining('maximum retries'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('- Reason: connect_failed'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('- Exit code: 1'));
+      // A terminal session has no admin socket to query; saying its admin query
+      // "did not succeed" would contradict the headline.
+      expect(core.setFailed).not.toHaveBeenCalledWith(expect.stringContaining('answered from its record only'));
+      // The report describes the session readiness gave up on, not a second
+      // lookup that could disagree with it.
+      expect(sessionInfoCalls()).toBe(1);
+    });
+
+    it('keeps the rest of the diagnostics when the upterm log cannot be read', async () => {
+      // An unreadable log must cost only its own section. Unguarded, the fs
+      // error escapes collectDiagnostics() and replaces the whole report.
+      const logPath = '/runner/_temp/upterm-action-abc123/state/upterm/upterm.log';
+      baselineShell(JSON.stringify({name: 'gha-3f9a1c05', status: 'ready', sessionId: 's1', logPath}));
+      mockFs.readFileSync.mockImplementation((p: fs.PathOrFileDescriptor) => {
+        if (String(p) === logPath) throw new Error(`EACCES: permission denied, open '${logPath}'`);
+        return '{}';
+      });
+
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining(`- Could not read upterm log (${logPath}): Error: EACCES: permission denied`));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Upterm did not become ready after maximum retries'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('- Session status: ready'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('=== Troubleshooting Steps ==='));
+    });
+
     it('ends monitoring on disconnected with its own message', async () => {
       fsWithoutExitFiles();
       baselineShell(readySession(), JSON.stringify({name: 'gha-3f9a1c05', status: 'disconnected', sessionId: 's1'}));
@@ -918,6 +997,9 @@ describe('upterm GitHub integration', () => {
 
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Upterm did not become ready after maximum retries'));
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Session name: gha-'));
+      // Non-terminal and detail-less: the admin query should have answered, so
+      // the report says it did not.
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('- Upterm answered from its record only; its admin query did not succeed'));
       expect(core.saveState).not.toHaveBeenCalledWith('message', expect.anything());
       // One lookup per readiness retry.
       expect(sessionInfoCalls()).toBeGreaterThanOrEqual(30);
@@ -930,7 +1012,7 @@ describe('upterm GitHub integration', () => {
       when(core.getState).calledWith('message').mockReturnValue('SSH: ssh user@session.upterm.dev');
       when(core.getState).calledWith('sessionName').mockReturnValue('gha-3f9a1c05');
       when(core.getState).calledWith('uptermBaseDir').mockReturnValue('/runner/_temp/upterm-action-abc');
-      when(core.getState).calledWith('uptermRuntimeDir').mockReturnValue('/runner/_temp/upterm-runtime-abc');
+      when(core.getState).calledWith('uptermRuntimeDir').mockReturnValue('/runner/_temp/upterm-rt-abc');
       when(core.getState).calledWith('sessionStarted').mockReturnValue('true');
       for (const [k, v] of Object.entries(overrides)) when(core.getState).calledWith(k).mockReturnValue(v);
     };
@@ -953,6 +1035,9 @@ describe('upterm GitHub integration', () => {
 
       await run();
 
+      // Neither the scoped teardown nor a server-wide one: a session named
+      // `upterm` found now was not started by this run.
+      expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('kill-session'));
       expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('kill-server'));
       // Directories are still ours, so they are still removed.
       expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
@@ -1096,9 +1181,10 @@ describe('upterm GitHub integration', () => {
 
       await run();
 
-      const killIndex = mockedExecShellCommand.mock.calls.findIndex(c => c[0].includes('kill-server'));
+      const killIndex = mockedExecShellCommand.mock.calls.findIndex(c => c[0].includes('kill-session'));
       expect(killIndex).toBeGreaterThanOrEqual(0);
-      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-runtime-abc', {recursive: true, force: true});
+      expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('kill-server'));
+      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-rt-abc', {recursive: true, force: true});
       // Post must RESTORE main's directories, never mint its own: fresh ones
       // would point nowhere, and teardown would then remove the wrong paths
       // while the real session's files survive.
@@ -1106,6 +1192,24 @@ describe('upterm GitHub integration', () => {
       // The runtime dir holds the live sockets; removing it first would unlink
       // them out from under a still-running host.
       expect(mockedExecShellCommand.mock.invocationCallOrder[killIndex]).toBeLessThan(mockFs.rmSync.mock.invocationCallOrder[0]);
+    });
+
+    it('tears down an attached-mode session by exact session name, never the whole tmux server', async () => {
+      // Attached mode saves no message, so post has nothing to wait on - but it
+      // is still where the session is stopped. The launch uses the default tmux
+      // server, which on a self-hosted runner may be one the job did not start
+      // (./run.sh inside tmux, or a developer's machine); kill-server there
+      // would take the runner offline or destroy unrelated sessions.
+      postState({message: ''});
+
+      await run();
+
+      // `=` makes tmux match the name exactly, so a user's `upterm-dev` is not
+      // prefix-matched by `upterm`.
+      expect(mockedExecShellCommand).toHaveBeenCalledWith("tmux kill-session -t '=upterm-wrapper' 2>/dev/null; tmux kill-session -t '=upterm' 2>/dev/null; true");
+      expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('kill-server'));
+      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
+      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-rt-abc', {recursive: true, force: true});
     });
 
     it('reaches teardown via the normal exit when the post-step lookup keeps failing', async () => {
@@ -1128,7 +1232,7 @@ describe('upterm GitHub integration', () => {
       expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
     });
 
-    it('tears down even when the post-step lookup throws', async () => {
+    it('tears down even when the post loop throws', async () => {
       // Unlike pollSession(), which swallows a lookup failure into 'unknown',
       // continueFileExists() calls fs.existsSync unguarded - a real fs error
       // there (e.g. an intermittent read failure) escapes the try untouched.
@@ -1143,7 +1247,7 @@ describe('upterm GitHub integration', () => {
       await run();
 
       expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
-      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-runtime-abc', {recursive: true, force: true});
+      expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-rt-abc', {recursive: true, force: true});
     });
 
     it('does not fail the job when cleanup cannot remove a directory', async () => {
@@ -1231,12 +1335,81 @@ describe('upterm GitHub integration', () => {
   });
 
   describe('private per-run directories', () => {
+    afterEach(() => {
+      // Some tests below point RUNNER_TEMP elsewhere; the rest of the file
+      // assumes the module-level value.
+      process.env.RUNNER_TEMP = RUNNER_TEMP;
+    });
+
     it('creates private per-run directories rooted at RUNNER_TEMP', async () => {
       await run();
 
       expect(mockFs.mkdtempSync).toHaveBeenCalledWith(path.join('/runner/_temp', 'upterm-action-'));
-      expect(mockFs.mkdtempSync).toHaveBeenCalledWith(path.join('/runner/_temp', 'upterm-runtime-'));
-      expect(mockFs.chmodSync).toHaveBeenCalledWith(expect.stringContaining('upterm-runtime-'), 0o700);
+      expect(mockFs.mkdtempSync).toHaveBeenCalledWith(path.join('/runner/_temp', 'upterm-rt-'));
+      expect(mockFs.chmodSync).toHaveBeenCalledWith(expect.stringContaining('upterm-rt-'), 0o700);
+      // RUNNER_TEMP fit, so nothing fell back and there is nothing to explain.
+      expect(core.info).not.toHaveBeenCalledWith(expect.stringContaining("for upterm's runtime directory"));
+    });
+
+    it('keeps the runtime directory under a self-hosted RUNNER_TEMP that fits the socket budget', async () => {
+      // GitHub's default self-hosted layout. With the old `upterm-runtime-`
+      // prefix the socket path here was 105 bytes and upterm refused it; the
+      // shorter prefix brings it to 100, inside the 103-byte limit.
+      const selfHosted = '/home/azureuser/actions-runner/_work/_temp';
+      process.env.RUNNER_TEMP = selfHosted;
+
+      await run();
+
+      expect(mockFs.mkdtempSync).toHaveBeenCalledWith(path.join(selfHosted, 'upterm-rt-'));
+      expect(core.saveState).toHaveBeenCalledWith('uptermRuntimeDir', path.join(selfHosted, 'upterm-rt-') + 'abc123');
+      expect(core.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('falls back to os.tmpdir() for the runtime directory when RUNNER_TEMP is too long for upterm', async () => {
+      // 47 bytes: the socket path under it would be 105, over upterm's 103, and
+      // `upterm host --name` would exit before creating any session.
+      const longRunnerTemp = '/Users/administrator/actions-runner/_work/_temp';
+      process.env.RUNNER_TEMP = longRunnerTemp;
+
+      await run();
+
+      // Runtime under os.tmpdir() (mocked to /mock-tmp); the base dir holds no
+      // sockets, so it stays under RUNNER_TEMP.
+      expect(mockFs.mkdtempSync).toHaveBeenCalledWith(path.join('/mock-tmp', 'upterm-rt-'));
+      expect(mockFs.mkdtempSync).toHaveBeenCalledWith(path.join(longRunnerTemp, 'upterm-action-'));
+      expect(mockFs.mkdtempSync).not.toHaveBeenCalledWith(path.join(longRunnerTemp, 'upterm-rt-'));
+      // The post step restores and removes whatever was saved, wherever it is.
+      expect(core.saveState).toHaveBeenCalledWith('uptermRuntimeDir', path.join('/mock-tmp', 'upterm-rt-') + 'abc123');
+      expect(process.env.XDG_RUNTIME_DIR).toBe((path.join('/mock-tmp', 'upterm-rt-') + 'abc123').replace(/\\/g, '/'));
+      // A self-hosted user can see where the sockets went, and why.
+      const fallbackInfo = core.info.mock.calls.map(c => String(c[0])).filter(m => m.includes("for upterm's runtime directory"));
+      expect(fallbackInfo).toHaveLength(1);
+      expect(fallbackInfo[0]).toContain('/mock-tmp');
+      expect(fallbackInfo[0]).toContain('105 bytes');
+      expect(fallbackInfo[0]).toContain('103-byte');
+      expect(core.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('fails with an actionable message, before launching upterm, when no candidate fits the socket budget', async () => {
+      // Windows has no /tmp fallback, so a long RUNNER_TEMP and a long TEMP
+      // leave nowhere to put the sockets.
+      Object.defineProperty(process, 'platform', {value: 'win32'});
+      Object.defineProperty(process, 'arch', {value: 'x64'});
+      process.env.RUNNER_TEMP = 'C:/Users/administrator/actions-runner/_work/_temp';
+      // Re-acquired after loadAction(): resetModules() recreated the os mock.
+      const os = require('os');
+      (os.tmpdir as jest.Mock).mockReturnValue('C:/Users/a-very-long-user-name/AppData/Local/Temp');
+
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('103-byte limit'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('TMP/TEMP'));
+      // Names each measured path and its length.
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('107 bytes'));
+      expect(mockedLaunchOutsideJobObject).not.toHaveBeenCalled();
+      expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('upterm host'));
+      expect(core.saveState).not.toHaveBeenCalledWith('sessionStarted', 'true');
+      expect(mockFs.mkdtempSync).not.toHaveBeenCalledWith(expect.stringContaining('upterm-rt-'));
     });
 
     it('exports XDG_STATE_HOME so session lookups find the record', async () => {

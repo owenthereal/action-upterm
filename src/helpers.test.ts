@@ -90,6 +90,65 @@ describe('execShellCommand', () => {
     await expect(execShellCommand(command)).rejects.toThrow('Command failed with exit code 1: false\nStderr: command failed');
   });
 
+  describe('quiet mode', () => {
+    let log: jest.SpyInstance;
+    let error: jest.SpyInstance;
+
+    beforeEach(() => {
+      log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+      error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+      log.mockRestore();
+      error.mockRestore();
+    });
+
+    it('keeps stdout out of the job log but still returns it', async () => {
+      // Session lookups run every few seconds for hours; printing each one's
+      // JSON would bury the log.
+      const json = '{"name":"gha-3f9a1c05","status":"ready"}\n';
+      mockProcess.stdout.on.mockImplementation((event, callback) => {
+        if (event === 'data') callback(Buffer.from(json));
+      });
+      mockProcess.on.mockImplementation((event, callback) => {
+        if (event === 'exit') callback(0);
+      });
+
+      await expect(execShellCommand('upterm session info x -o json', {quiet: true})).resolves.toBe(json);
+
+      expect(log).not.toHaveBeenCalled();
+      expect(core.debug).toHaveBeenCalledWith(json);
+    });
+
+    it('keeps stderr out of the job log but still includes it in the rejection', async () => {
+      mockProcess.stderr.on.mockImplementation((event, callback) => {
+        if (event === 'data') callback(Buffer.from('no session named "x"'));
+      });
+      mockProcess.on.mockImplementation((event, callback) => {
+        if (event === 'exit') callback(1);
+      });
+
+      await expect(execShellCommand('upterm session info x -o json', {quiet: true})).rejects.toThrow('Command failed with exit code 1: upterm session info x -o json\nStderr: no session named "x"');
+
+      expect(error).not.toHaveBeenCalled();
+      expect(core.debug).toHaveBeenCalledWith('no session named "x"');
+    });
+
+    it('still prints output when not quiet', async () => {
+      mockProcess.stdout.on.mockImplementation((event, callback) => {
+        if (event === 'data') callback(Buffer.from('hello\n'));
+      });
+      mockProcess.on.mockImplementation((event, callback) => {
+        if (event === 'exit') callback(0);
+      });
+
+      await execShellCommand('echo hello');
+
+      expect(log).toHaveBeenCalledWith('hello\n');
+    });
+  });
+
   it('should handle empty command', async () => {
     await expect(execShellCommand('')).rejects.toThrow('Command cannot be empty');
     await expect(execShellCommand('   ')).rejects.toThrow('Command cannot be empty');

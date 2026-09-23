@@ -52,19 +52,77 @@ interface UptermDirs {
 // Cache for getUptermDirs() to avoid repeated path computation
 let uptermDirsCache: UptermDirs | null = null;
 
+// upterm refuses any socket path longer than this many bytes, on every platform
+// (host/sessiondir/sessiondir.go:87, `maxSocketPath = 103`). The path it
+// measures is $XDG_RUNTIME_DIR/upterm/sessions/<name>/attach.sock
+// (utils/utils.go:43,84-86 append `upterm`; sessiondir.go:154-160
+// CheckSocketPath), and it measures it while validating `upterm host --name`
+// (cmd/upterm/command/host.go:320-331) - so an over-long root makes
+// `upterm host` exit immediately, before any session record exists.
+const UPTERM_MAX_SOCKET_PATH = 103;
+// Kept short on purpose: every byte here comes out of the socket budget above.
+const RUNTIME_DIR_PREFIX = 'upterm-rt-';
+// fs.mkdtempSync appends exactly six characters to its prefix.
+const MKDTEMP_SUFFIX_PLACEHOLDER = 'XXXXXX';
+
 /**
- * Root for this run's temporary directories.
+ * Root for this run's base directory (tmux.conf, state, config, timeout flag).
  *
- * RUNNER_TEMP is short enough for upterm's 103-byte socket budget AND is reaped
- * by the runner per job. A hardcoded /tmp is neither - never cleaned, and
- * unwritable on hardened or containerized runners.
+ * The base directory holds no sockets, so its length does not matter.
+ * RUNNER_TEMP is reaped by the runner per job.
  */
 function tempRoot(): string {
   return process.env.RUNNER_TEMP || os.tmpdir();
 }
 
-function createPrivateDir(prefix: string): string {
-  const dir = fs.mkdtempSync(path.join(tempRoot(), prefix));
+/** The attach socket path upterm will measure if the runtime dir is created under `root`. */
+function runtimeSocketPath(root: string, sessionName: string): string {
+  return path.join(root, `${RUNTIME_DIR_PREFIX}${MKDTEMP_SUFFIX_PLACEHOLDER}`, 'upterm', 'sessions', sessionName, 'attach.sock');
+}
+
+/**
+ * Root for this run's runtime directory (XDG_RUNTIME_DIR, which holds upterm's
+ * sockets): the first candidate whose socket path fits upterm's budget.
+ *
+ * This deliberately departs from the design spec, which said no action-side
+ * length check was needed because upterm's own check reports it better. That
+ * reasoning assumed the user picks the root. The action does: it overrides
+ * XDG_RUNTIME_DIR, so a runner whose RUNNER_TEMP is too long - GitHub's default
+ * self-hosted layout, ~/actions-runner/_work/_temp, under a long user name -
+ * could never start a session, and the user could not fix it.
+ *
+ * /tmp is the last resort, non-Windows only. It is reached only when both
+ * preferred roots are too long; the post step removes the directory, and if
+ * /tmp is unwritable mkdtempSync fails with a clear error.
+ */
+function runtimeRoot(sessionName: string): string {
+  const runnerTemp = process.env.RUNNER_TEMP;
+  const candidates = [...new Set([runnerTemp, os.tmpdir(), ...(process.platform === 'win32' ? [] : ['/tmp'])].filter((c): c is string => !!c))];
+  const tooLong: string[] = [];
+
+  for (const candidate of candidates) {
+    const socketPath = runtimeSocketPath(candidate, sessionName);
+    // Bytes, not characters: upterm compares len() of a Go string.
+    const bytes = Buffer.byteLength(socketPath);
+    if (bytes > UPTERM_MAX_SOCKET_PATH) {
+      tooLong.push(`${socketPath} is ${bytes} bytes`);
+      continue;
+    }
+    if (candidate !== runnerTemp) {
+      const why = tooLong.length ? `${tooLong.join('; ')}, over upterm's ${UPTERM_MAX_SOCKET_PATH}-byte socket path limit` : 'RUNNER_TEMP is not set';
+      core.info(`Using ${candidate} for upterm's runtime directory: ${why}`);
+    }
+    return candidate;
+  }
+
+  throw new Error(
+    `Cannot create upterm's runtime directory: every candidate gives a socket path over upterm's ${UPTERM_MAX_SOCKET_PATH}-byte limit (${tooLong.join('; ')}). ` +
+      'Use a shorter runner work folder (it contains RUNNER_TEMP), or on Windows point TMP/TEMP at a shorter directory.'
+  );
+}
+
+function createPrivateDir(root: string, prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(root, prefix));
   fs.chmodSync(dir, 0o700);
   return dir;
 }
@@ -79,10 +137,13 @@ function getUptermDirs(): UptermDirs {
   const savedBase = core.getState('uptermBaseDir');
   const savedRuntime = core.getState('uptermRuntimeDir');
 
-  const base = savedBase || createPrivateDir('upterm-action-');
-  const runtime = savedRuntime || createPrivateDir('upterm-runtime-');
-
+  // Each directory is saved as soon as it exists: runtimeRoot() can throw, and
+  // the post step can only remove a base directory it was told about.
+  const base = savedBase || createPrivateDir(tempRoot(), 'upterm-action-');
   if (!savedBase) core.saveState('uptermBaseDir', base);
+  // getSessionName() is memoized, so the name measured here is the one passed
+  // to `upterm host --name`.
+  const runtime = savedRuntime || createPrivateDir(runtimeRoot(getSessionName()), RUNTIME_DIR_PREFIX);
   if (!savedRuntime) core.saveState('uptermRuntimeDir', runtime);
 
   const state = path.join(base, 'state');
@@ -545,8 +606,8 @@ setw -g aggressive-resize on
 
     // Evidence for the post step that process teardown is warranted. isPost is
     // saved before installDependencies(), so without this a failed download or
-    // a rejected upterm version would reach finalizeSession() and kill the
-    // shared default tmux server.
+    // a rejected upterm version would reach finalizeSession() and kill tmux
+    // sessions named upterm-wrapper/upterm that this run never created.
     core.saveState('sessionStarted', 'true');
 
     if (process.platform === 'win32') {
@@ -624,27 +685,54 @@ async function setupSessionTimeout(waitTimeoutMinutes: string): Promise<void> {
   }
 }
 
-async function collectDiagnostics(): Promise<string> {
+/**
+ * Build the readiness-failure report.
+ *
+ * Takes the session readiness last observed, when its last poll saw one: a
+ * second lookup could disagree with the one that decided to give up. Falls
+ * back to a fresh lookup otherwise.
+ */
+async function collectDiagnostics(observed?: SessionInfo): Promise<string> {
   const dirs = getUptermDirs();
   const name = getSessionName();
-  let diagnostics = 'Upterm did not become ready after maximum retries.\n\nDiagnostics:\n';
+
+  let lookupFailure = '';
+  const session =
+    observed ??
+    (await getSession(name).catch(error => {
+      lookupFailure = `- Session lookup failed: ${error}\n`;
+      return null;
+    }));
+
+  // A session that ended is not one that was slow: a misconfigured
+  // upterm-server ends it on the first poll, with retries to spare.
+  const headline = session && isTerminal(session.status) ? `Upterm session ended before it became ready (status: ${session.status}).` : 'Upterm did not become ready after maximum retries.';
+  let diagnostics = `${headline}\n\nDiagnostics:\n`;
 
   diagnostics += `- Upterm data directory: ${dirs.base}\n`;
   diagnostics += `- Session name: ${name}\n`;
-
-  const session = await getSession(name).catch(error => {
-    diagnostics += `- Session lookup failed: ${error}\n`;
-    return null;
-  });
+  diagnostics += lookupFailure;
 
   diagnostics += `- Session status: ${session ? session.status : 'no session record found'}\n`;
-  if (session && !session.hasLiveDetail) diagnostics += '- Upterm answered from its record only; its admin query did not succeed\n';
+  // Only meaningful for a session that should still be answering: a terminal
+  // one has no admin socket left to query, so the absence of live detail there
+  // is expected, not a failure.
+  if (session && !isTerminal(session.status) && !session.hasLiveDetail) diagnostics += '- Upterm answered from its record only; its admin query did not succeed\n';
   if (session?.reason) diagnostics += `- Reason: ${session.reason}\n`;
+  if (session?.exitCode !== undefined) diagnostics += `- Exit code: ${session.exitCode}\n`;
+  if (session?.signal) diagnostics += `- Signal: ${session.signal}\n`;
 
   // upterm writes its log under XDG_STATE_HOME, not the runtime dir - the old
   // path never existed, so this section was always silently omitted.
+  //
+  // Guarded: an unreadable log must cost only its own section. Unguarded, the
+  // error escapes this function and replaces the entire report.
   if (session?.logPath && fs.existsSync(session.logPath)) {
-    diagnostics += `- Upterm log:\n${fs.readFileSync(session.logPath, 'utf8')}\n`;
+    try {
+      diagnostics += `- Upterm log:\n${fs.readFileSync(session.logPath, 'utf8')}\n`;
+    } catch (error) {
+      diagnostics += `- Could not read upterm log (${session.logPath}): ${error}\n`;
+    }
   }
 
   // Check tmux sessions
@@ -767,10 +855,14 @@ async function pollSession(): Promise<PollResult> {
  */
 async function waitForUptermReady(): Promise<SessionInfo> {
   let tries = UPTERM_READY_MAX_RETRIES;
+  // What the LAST poll saw, if it saw a session - handed to the diagnostics so
+  // the report describes the state that ended the wait.
+  let lastObserved: SessionInfo | undefined;
 
   while (tries-- > 0) {
     core.info(`Waiting for upterm to be ready... (${UPTERM_READY_MAX_RETRIES - tries}/${UPTERM_READY_MAX_RETRIES})`);
     const poll = await pollSession();
+    lastObserved = poll.kind === 'session' ? poll.session : undefined;
 
     if (poll.kind === 'session') {
       if (poll.session.status === 'ready' && poll.session.hasLiveDetail) return poll.session;
@@ -785,7 +877,7 @@ async function waitForUptermReady(): Promise<SessionInfo> {
     await sleep(UPTERM_READY_POLL_INTERVAL);
   }
 
-  throw new Error(await collectDiagnostics());
+  throw new Error(await collectDiagnostics(lastObserved));
 }
 
 async function outputSshCommand(session: SessionInfo): Promise<string | null> {
@@ -796,8 +888,15 @@ async function outputSshCommand(session: SessionInfo): Promise<string | null> {
   }
 
   core.setOutput('ssh-command', sshCommand);
-  await core.summary.addHeading('Upterm SSH Connection').addCodeBlock(sshCommand, 'bash').addRaw(`\n\nConnect with: <code>${sshCommand}</code>`).write();
   core.info(`SSH command available as output: ${sshCommand}`);
+  // The job summary is a convenience. write() throws when GITHUB_STEP_SUMMARY
+  // is unset (older GHES, some runner setups), and that must not fail a
+  // session that is already up.
+  try {
+    await core.summary.addHeading('Upterm SSH Connection').addCodeBlock(sshCommand, 'bash').addRaw(`\n\nConnect with: <code>${sshCommand}</code>`).write();
+  } catch (error) {
+    core.debug(`Could not write the job summary: ${error}`);
+  }
   return sshCommand;
 }
 
@@ -932,17 +1031,27 @@ function cleanupUptermData(): void {
  * the non-detached path stops the host - monitorSession() merely breaks - so
  * the post step is where teardown happens, for every mode.
  *
- * Process teardown is GUARDED; directory cleanup is not. run() saves isPost
- * before installDependencies(), and post-if is "!cancelled()", so a failed
- * download or a rejected upterm version reaches this function having started
- * nothing. Killing the shared default tmux server there would destroy
- * unrelated sessions - a developer's own, on a self-hosted runner. The
- * directories are ours in every case, so removing them stays unconditional.
+ * Process teardown is SCOPED: it kills only the two sessions this action
+ * creates, by exact name, never the whole server. The launch uses the default
+ * tmux server, which on a self-hosted runner can be one the job did not start -
+ * a runner launched with ./run.sh inside tmux, or a developer's machine - and
+ * `kill-server` there would take the runner offline mid-job or destroy
+ * unrelated sessions. The `=` prefix makes tmux match the name exactly, so a
+ * session such as `upterm-dev` is never prefix-matched. Killing a session
+ * closes its panes, which delivers the same SIGHUP to `upterm host` that
+ * kill-server would.
+ *
+ * Process teardown is also GUARDED; directory cleanup is not. run() saves
+ * isPost before installDependencies(), and post-if is "!cancelled()", so a
+ * failed download or a rejected upterm version reaches this function having
+ * started nothing - and a session named `upterm` it finds then is not ours.
+ * The directories are ours in every case, so removing them stays
+ * unconditional.
  */
 async function finalizeSession(): Promise<void> {
   if (core.getState('sessionStarted') === 'true') {
     try {
-      await execShellCommand('tmux kill-server 2>/dev/null || true');
+      await execShellCommand("tmux kill-session -t '=upterm-wrapper' 2>/dev/null; tmux kill-session -t '=upterm' 2>/dev/null; true");
     } catch (error) {
       core.debug(`Could not stop tmux: ${error}`);
     }

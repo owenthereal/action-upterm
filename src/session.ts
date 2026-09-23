@@ -96,7 +96,9 @@ export function parseSessionInfo(raw: string): SessionInfo {
 export async function getSession(name: string): Promise<SessionInfo | null> {
   let raw: string;
   try {
-    raw = await execShellCommand(`upterm session info ${shellEscape(name)} -o json`);
+    // Quiet: the monitor and post loops call this every few seconds for as long
+    // as someone is connected, and each call would dump its JSON into the log.
+    raw = await execShellCommand(`upterm session info ${shellEscape(name)} -o json`, {quiet: true});
   } catch (error) {
     if (/no session named/i.test(String(error))) return null;
     throw error;

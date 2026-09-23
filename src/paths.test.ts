@@ -163,11 +163,11 @@ describe('Path handling', () => {
         configurable: true
       });
 
-      const runtimeDir = 'C:/Users/foo/AppData/Local/Temp/upterm-runtime-XXXXXX';
+      const runtimeDir = 'C:/Users/foo/AppData/Local/Temp/upterm-rt-XXXXXX';
       let result = runtimeDir.replace(/\\/g, '/');
       result = result.replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`);
 
-      expect(result).toBe('/c/Users/foo/AppData/Local/Temp/upterm-runtime-XXXXXX');
+      expect(result).toBe('/c/Users/foo/AppData/Local/Temp/upterm-rt-XXXXXX');
     });
 
     it('should use toMsys2Path for shell redirects on Windows', () => {

@@ -10,10 +10,14 @@ export const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, 
  * Executes a shell command and returns the output as a Promise.
  *
  * @param cmd - The shell command to execute
+ * @param options.quiet - Send the command's output to core.debug instead of the
+ *   job log. For commands polled on a timer, whose output would otherwise fill
+ *   the log. Only where the output goes changes: stdout is still returned, and
+ *   stderr is still included in the rejection.
  * @returns Promise that resolves with the command's stdout output
  * @throws Error if the command fails or if cmd is empty
  */
-export function execShellCommand(cmd: string): Promise<string> {
+export function execShellCommand(cmd: string, options: {quiet?: boolean} = {}): Promise<string> {
   core.debug(`Executing shell command: [${cmd}]`);
 
   if (!cmd.trim()) {
@@ -34,16 +38,18 @@ export function execShellCommand(cmd: string): Promise<string> {
           });
     let stdout = '';
     let stderr = '';
+    const logStdout = options.quiet ? core.debug : console.log;
+    const logStderr = options.quiet ? core.debug : console.error;
 
     proc.stdout.on('data', data => {
       const output = data.toString();
-      console.log(output);
+      logStdout(output);
       stdout += output;
     });
 
     proc.stderr.on('data', data => {
       const output = data.toString();
-      console.error(output);
+      logStderr(output);
       stderr += output;
     });
 

@@ -113,7 +113,9 @@ describe('getSession', () => {
     mockedExec.mockResolvedValue(READY_WITH_DETAIL);
     const info = await getSession('gha-3f9a1c05');
     expect(info?.status).toBe('ready');
-    expect(mockedExec).toHaveBeenCalledWith("upterm session info 'gha-3f9a1c05' -o json");
+    // Quiet: this runs every few seconds in the monitor and post loops, and its
+    // JSON would otherwise be dumped into the job log each time.
+    expect(mockedExec).toHaveBeenCalledWith("upterm session info 'gha-3f9a1c05' -o json", {quiet: true});
   });
 
   it('returns null when the session name is not found', async () => {
