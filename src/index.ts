@@ -92,8 +92,10 @@ function runtimeSocketPath(root: string, sessionName: string): string {
  * could never start a session, and the user could not fix it.
  *
  * /tmp is the last resort, non-Windows only. It is reached only when both
- * preferred roots are too long; the post step removes the directory, and if
- * /tmp is unwritable mkdtempSync fails with a clear error.
+ * preferred roots are too long. Unlike RUNNER_TEMP it is not reaped by the
+ * runner, so the directory is removed only if the post step runs - a cancelled
+ * job leaves it behind. If /tmp is unwritable, mkdtempSync fails with a clear
+ * error.
  */
 function runtimeRoot(sessionName: string): string {
   const runnerTemp = process.env.RUNNER_TEMP;
@@ -195,7 +197,7 @@ interface XdgPaths {
  * upterm finds a session's record through XDG_STATE_HOME
  * (cmd/upterm/command/session.go:425). Until now the action only set these
  * inside tmux.conf, because every query passed --admin-socket explicitly.
- * execShellCommand inherits process.env on both platforms (helpers.ts:26-34),
+ * execShellCommand inherits process.env on both platforms (see its spawn call),
  * so one assignment covers every call site, in main and in post alike.
  *
  * The conversion lives here and only here. XDG_STATE_HOME must agree exactly
