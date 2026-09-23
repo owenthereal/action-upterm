@@ -1,4 +1,4 @@
-name: E2E Fixture (Detached)
+name: E2E Fixture (Long Build)
 
 on:
   workflow_dispatch:
@@ -10,15 +10,12 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Start upterm session (detached)
-        id: upterm
         uses: ./detached
         with:
           wait-timeout-minutes: 1
 
-      - name: Verify workflow continued
+      - name: Build longer than the countdown
         run: |
-          echo "DETACHED_WORKFLOW_CONTINUED"
-          echo "SSH_OUTPUT=${{ steps.upterm.outputs.ssh-command }}"
-
-      - name: Build
-        run: sleep 45
+          echo "BUILD_STARTED"
+          sleep 90
+          echo "BUILD_FINISHED"
