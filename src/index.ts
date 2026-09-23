@@ -342,8 +342,19 @@ function validateInputs(): void {
   if (!uptermServer) {
     throw new Error('upterm-server is required');
   }
-  if (!/^(ssh|wss?):\/\/[a-zA-Z0-9.-]+(:\d+)?\/?$/.test(uptermServer)) {
-    throw new Error('upterm-server must use the ssh, ws, or wss scheme followed by a valid host[:port]');
+  // Only the scheme and host are checked, so a typo fails here instead of
+  // surfacing later in the tmux log. The rest is left to upterm, which
+  // validates --server itself; a stricter pattern would reject forms it
+  // accepts (IPv6 literals, wss behind a path-prefixed proxy). Shell safety
+  // comes from the quoting in createUptermSession(), not from this check.
+  let url: URL;
+  try {
+    url = new URL(uptermServer);
+  } catch {
+    throw new Error(`upterm-server is not a valid URL: ${uptermServer}`);
+  }
+  if (!['ssh:', 'ws:', 'wss:'].includes(url.protocol) || !url.hostname) {
+    throw new Error(`upterm-server must be an ssh://, ws:// or wss:// URL with a host, got: ${uptermServer}`);
   }
 }
 
@@ -355,12 +366,13 @@ export async function run() {
       return;
     }
 
-    validateInputs();
-
     // Mark that the main action has run (for POST action detection)
-    // This must happen before any fallible setup so the post action
-    // always runs cleanup instead of re-entering the main path.
+    // This must happen before any fallible setup - input validation included -
+    // so the post action always runs cleanup instead of re-entering the main
+    // path and reporting the same failure twice.
     core.saveState('isPost', 'true');
+
+    validateInputs();
 
     await installDependencies();
     await assertSupportedUptermVersion();
@@ -607,7 +619,12 @@ setw -g aggressive-resize on
     // generateSessionName() produces `gha-` + 8 hex chars and nothing else, so
     // it is shell-safe by construction. Any change that lets a name carry
     // user input must wrap it in shellEscape(), as session.ts already does.
-    const tmuxCmd = `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --name ${getSessionName()} --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -f read-only -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`;
+    const uptermHostCmd = `upterm host --name ${getSessionName()} --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -f read-only -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}`;
+    // Two shells parse this: ours, then the one tmux runs uptermHostCmd in.
+    // Escaping uptermHostCmd as a whole hands it to tmux verbatim. Wrapping it
+    // in double quotes instead would let our shell expand $(...) and backticks
+    // inside the single-quoted --server and --github-user values.
+    const tmuxCmd = `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} ${shellEscape(uptermHostCmd)} 2>${shellEscape(getTmuxErrorLogPath())}`;
 
     // Evidence for the post step that process teardown is warranted. isPost is
     // saved before installDependencies(), so without this a failed download or
