@@ -31,12 +31,27 @@ on:
           - cancel
           - long-build
           - guest-before-post
+      nonce:
+        description: "Unique token the driver matches this run by (script/acceptance sets this; not meant for manual dispatch)"
+        required: false
+        default: ""
+
+# Embeds the nonce in the run's own title so script/acceptance can find the
+# exact run it dispatched by an exact match, rather than "the first run
+# created at/after now" - which a concurrent dispatch, or clock skew between
+# the driver's machine and GitHub, can attach to the wrong run entirely.
+run-name: "acceptance ${{ inputs.scenario }} ${{ inputs.runs-on }} ${{ inputs.nonce }}"
+
+permissions:
+  contents: read
 
 jobs:
   acceptance:
     runs-on: ${{ inputs.runs-on }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Start upterm session
         id: upterm
@@ -47,7 +62,9 @@ jobs:
 
       - name: Publish the join command for the driver
         shell: bash
-        run: echo "${{ steps.upterm.outputs.ssh-command }}" > ssh-command.txt
+        env:
+          SSH_COMMAND: ${{ steps.upterm.outputs.ssh-command }}
+        run: echo "$SSH_COMMAND" > ssh-command.txt
 
       - uses: actions/upload-artifact@v4
         with:
@@ -57,8 +74,10 @@ jobs:
       - name: Build
         timeout-minutes: 40
         shell: bash
+        env:
+          SCENARIO: ${{ inputs.scenario }}
         run: |
-          if [ "${{ inputs.scenario }}" = "cancel" ]; then
+          if [ "$SCENARIO" = "cancel" ]; then
             sleep 1800
           else
             sleep 90
