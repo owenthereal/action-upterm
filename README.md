@@ -186,3 +186,20 @@ touch /c/msys64/continue
 - **Requires upterm v0.31.0 or newer.** See [Requirements](#requirements) above; pin `@v1` if you need an older upterm.
 - **`upterm session current` works inside the session** — upterm itself injects `UPTERM_ADMIN_SOCKET` and `UPTERM_SESSION_NAME`, so no wrapper configuration is needed for it to resolve.
 - **Windows no longer uses WMI to launch the session.** See [ARCHITECTURE.md](ARCHITECTURE.md#why-no-wmi) for why.
+
+## Maintainers: Acceptance Tests
+
+`yarn test:e2e` (act) proves the action's behavior on Linux, but act has no orphan-process sweep and cannot run Windows or macOS jobs. Cancellation — before and after a guest joins — and the long-build and guest-leaves-before-post cases on Windows and macOS can only be proven against real GitHub-hosted runners.
+
+`.github/workflows/acceptance.yml` is a `workflow_dispatch` workflow (inputs: `runs-on`, `scenario`) that starts a detached session and either sleeps through a long "build" or a cancellable one. `script/acceptance` drives it end to end: dispatch, download the published `ssh-command` artifact, join as a guest over SSH, cancel the run when the scenario calls for it, then fetch the completed job's log and assert specific lines appear (or don't).
+
+```bash
+script/acceptance ubuntu-latest cancel                 # cancel with no guest
+script/acceptance --with-guest windows-latest cancel    # cancel after a guest joins
+script/acceptance macos-latest long-build
+script/acceptance macos-latest guest-before-post
+```
+
+Every scenario's guest join uses the operator's own default SSH identity/agent (no `-i`, no `-o IdentityAgent=none`) — the fixture sets `limit-access-to-actor: true`, so only the GitHub account that dispatched the run, at its own keyboard, can join as the actor. This is the one place a real personal identity is used, by the maintainer's choice; the e2e fixtures instead generate a throwaway keypair because their sessions are open to anyone.
+
+`workflow_dispatch` only triggers a workflow file that's on the repo's default branch, so pre-merge validation runs a copy of the workflow pushed to a throwaway branch of a scratch repo, and `script/acceptance --run-id <id> …` (which skips the dispatch) attaches to the run it produced. Because cancellation is run-level, cancel scenarios run in their own runs, separate from the non-cancel ones.

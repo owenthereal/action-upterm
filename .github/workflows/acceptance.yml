@@ -1,0 +1,66 @@
+name: Acceptance (real runners)
+
+# A dispatchable workflow for a maintainer to drive by hand (with
+# script/acceptance) against real GitHub-hosted runners.
+#
+# act - which runs the e2e-fixture-*.yml jobs - has no orphan-process sweep
+# and cannot run Windows or macOS jobs, so cancellation (before and after a
+# guest joins), and the long-build and guest-leaves-before-post cases on
+# Windows and macOS, can only be proven here. See README.md's "Maintainers:
+# acceptance tests" section.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs-on:
+        description: "Runner to test against"
+        required: true
+        type: choice
+        default: ubuntu-latest
+        options:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+          - windows-2022
+      scenario:
+        description: "Scenario to run"
+        required: true
+        type: choice
+        default: cancel
+        options:
+          - cancel
+          - long-build
+          - guest-before-post
+
+jobs:
+  acceptance:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Start upterm session
+        id: upterm
+        uses: ./detached
+        with:
+          limit-access-to-actor: true
+          wait-timeout-minutes: 1
+
+      - name: Publish the join command for the driver
+        shell: bash
+        run: echo "${{ steps.upterm.outputs.ssh-command }}" > ssh-command.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-command
+          path: ssh-command.txt
+
+      - name: Build
+        timeout-minutes: 40
+        shell: bash
+        run: |
+          if [ "${{ inputs.scenario }}" = "cancel" ]; then
+            sleep 1800
+          else
+            sleep 90
+          fi
+          echo "BUILD_FINISHED"

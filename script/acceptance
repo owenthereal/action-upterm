@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# script/acceptance — drive .github/workflows/acceptance.yml against a real
+# GitHub Actions runner and assert on the resulting job log.
+#
+# act (which runs the e2e-fixture-*.yml jobs) has no orphan-process sweep and
+# cannot run Windows or macOS, so cancellation - and the long-build and
+# guest-leaves-before-post cases on Windows/macOS - can only be proven
+# against real runners. This script dispatches the workflow (or attaches to
+# an already-running run via --run-id, for pre-merge validation from a
+# throwaway branch elsewhere - see README.md's "Maintainers: acceptance
+# tests" section), joins the session over SSH exactly like a human guest
+# would, and asserts specific lines appear (or don't) in the job's log.
+#
+# Every scenario's guest join uses the operator's own default SSH
+# identity/agent - no -i, no -o IdentityAgent=none. limit-access-to-actor
+# authorizes the GitHub account that dispatched the run, and only the person
+# running this script, at their own keyboard, can join as that account. This
+# is the one place a real personal identity is used, by the maintainer's
+# choice - unlike the e2e fixtures, which generate a throwaway keypair
+# because their sessions are open to anyone.
+#
+# Usage:
+#   script/acceptance [--repo OWNER/REPO] [--ref REF] [--workflow FILE] \
+#     [--run-id ID] [--with-guest] RUNS_ON SCENARIO
+#
+# RUNS_ON:  ubuntu-latest | macos-latest | windows-latest | windows-2022
+# SCENARIO: cancel | long-build | guest-before-post
+#
+#   --repo OWNER/REPO  Repo to dispatch/inspect (default: owenthereal/action-upterm)
+#   --ref REF           Branch to dispatch from (default: main; ignored with --run-id)
+#   --workflow FILE      Workflow file name (default: acceptance.yml)
+#   --run-id ID          Skip dispatch; assert against a run that's already going.
+#                         Needed for pre-merge validation, since workflow_dispatch
+#                         only works for a workflow file on the repo's default
+#                         branch.
+#   --with-guest          cancel only: join as the actor for 5s before cancelling.
+set -euo pipefail
+
+repo="owenthereal/action-upterm"
+ref=""
+workflow="acceptance.yml"
+run_id=""
+with_guest=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) repo=$2; shift 2 ;;
+    --ref) ref=$2; shift 2 ;;
+    --workflow) workflow=$2; shift 2 ;;
+    --run-id) run_id=$2; shift 2 ;;
+    --with-guest) with_guest=true; shift ;;
+    --) shift; break ;;
+    -*) echo "Unknown flag: $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+
+if [ $# -ne 2 ]; then
+  echo "Usage: script/acceptance [--repo OWNER/REPO] [--ref REF] [--workflow FILE] [--run-id ID] [--with-guest] RUNS_ON SCENARIO" >&2
+  exit 2
+fi
+runs_on=$1
+scenario=$2
+
+case "$scenario" in
+  cancel | long-build | guest-before-post) ;;
+  *)
+    echo "Unknown scenario: $scenario (want cancel, long-build, or guest-before-post)" >&2
+    exit 2
+    ;;
+esac
+
+failures=0
+pass() { echo "PASS: $1"; }
+fail() {
+  echo "FAIL: $1"
+  failures=$((failures + 1))
+}
+
+assert_contains() {
+  local desc=$1 pattern=$2 log=$3
+  if grep -Eq -- "$pattern" "$log"; then
+    pass "$desc"
+  else
+    fail "$desc (pattern not found: $pattern)"
+  fi
+}
+
+assert_not_contains() {
+  local desc=$1 pattern=$2 log=$3
+  if grep -Eq -- "$pattern" "$log"; then
+    fail "$desc (unexpectedly found: $pattern)"
+  else
+    pass "$desc"
+  fi
+}
+
+# Asserts each pattern is found, and that the line numbers strictly increase
+# (i.e. the patterns appear in this order in the log).
+assert_order() {
+  local desc=$1 log=$2
+  shift 2
+  local prev_line=0 pattern line
+  for pattern in "$@"; do
+    line=$(grep -nE -- "$pattern" "$log" | head -1 | cut -d: -f1 || true)
+    if [ -z "$line" ]; then
+      fail "$desc (pattern not found: $pattern)"
+      return
+    fi
+    if [ "$line" -le "$prev_line" ]; then
+      fail "$desc (out of order at: $pattern)"
+      return
+    fi
+    prev_line=$line
+  done
+  pass "$desc"
+}
+
+# --- dispatch or reuse a run -------------------------------------------------
+
+if [ -n "$run_id" ]; then
+  echo "Using existing run $run_id (skipping dispatch)"
+else
+  dispatch_ref=${ref:-main}
+  dispatch_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  echo "Dispatching $workflow on $repo@$dispatch_ref (runs-on=$runs_on scenario=$scenario)"
+  gh workflow run "$workflow" --repo "$repo" --ref "$dispatch_ref" \
+    -f "runs-on=$runs_on" -f "scenario=$scenario"
+
+  for _ in $(seq 1 24); do
+    run_id=$(gh run list --repo "$repo" --workflow "$workflow" --event workflow_dispatch \
+      -L 5 --json databaseId,createdAt \
+      --jq "[.[] | select(.createdAt >= \"$dispatch_time\")] | sort_by(.createdAt) | .[0].databaseId // empty")
+    if [ -n "$run_id" ]; then
+      break
+    fi
+    sleep 5
+  done
+  if [ -z "$run_id" ]; then
+    echo "Could not find the dispatched run" >&2
+    exit 1
+  fi
+fi
+
+run_url=$(gh run view "$run_id" --repo "$repo" --json url --jq .url)
+echo "Run: $run_url"
+
+# --- helpers ------------------------------------------------------------
+
+# Poll for the ssh-command artifact (uploaded early, downloadable while the
+# run is still in progress) and print its contents.
+download_ssh_command() {
+  local dir
+  dir=$(mktemp -d)
+  for _ in $(seq 1 60); do
+    if gh run download "$run_id" --repo "$repo" -n ssh-command -D "$dir" >/dev/null 2>&1 && [ -s "$dir/ssh-command.txt" ]; then
+      tr -d '\r\n' <"$dir/ssh-command.txt"
+      rm -rf "$dir"
+      return 0
+    fi
+    sleep 5
+  done
+  rm -rf "$dir"
+  echo "Timed out waiting for the ssh-command artifact" >&2
+  return 1
+}
+
+# Join the session as the operator (see the header comment on identity), hold
+# for hold_seconds - or until the remote side closes first, e.g. after
+# sending "exit\n" - then disconnect.
+join_session() {
+  local target=$1 hold_seconds=$2 input=${3:-}
+  local out
+  out=$(mktemp)
+  (
+    if [ -n "$input" ]; then
+      sleep 1
+      printf '%s' "$input"
+    fi
+    sleep $((hold_seconds + 30))
+  ) | ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+    "$target" >"$out" 2>&1 &
+  local ssh_pid=$!
+  local waited=0
+  while kill -0 "$ssh_pid" 2>/dev/null && [ "$waited" -lt "$hold_seconds" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$ssh_pid" 2>/dev/null; then
+    kill -TERM "$ssh_pid" 2>/dev/null || true
+  fi
+  wait "$ssh_pid" 2>/dev/null || true
+  cat "$out"
+  rm -f "$out"
+}
+
+# Poll until a jq boolean filter over `gh run view --json jobs` is true.
+wait_for_status() {
+  local jq_filter=$1 v
+  for _ in $(seq 1 120); do
+    v=$(gh run view "$run_id" --repo "$repo" --json jobs --jq "$jq_filter" 2>/dev/null || true)
+    if [ "$v" = "true" ]; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+wait_for_completion() {
+  local status
+  for _ in $(seq 1 90); do
+    status=$(gh run view "$run_id" --repo "$repo" --json status --jq .status)
+    if [ "$status" = "completed" ]; then
+      return 0
+    fi
+    sleep 10
+  done
+  echo "Timed out waiting for the run to complete" >&2
+  return 1
+}
+
+# The named step's conclusion (e.g. "success", "skipped", "cancelled"), or
+# empty if no such step exists.
+step_conclusion() {
+  local name=$1
+  gh run view "$run_id" --repo "$repo" --json jobs \
+    --jq ".jobs[0].steps[] | select(.name==\"$name\") | .conclusion"
+}
+
+# Job logs are only available once the job has completed; retry a few times
+# for GitHub's own lag between "completed" and the log becoming downloadable.
+fetch_log() {
+  local log tries=0
+  log=$(mktemp)
+  while [ "$tries" -lt 12 ]; do
+    if gh run view "$run_id" --repo "$repo" --log >"$log" 2>/dev/null && [ -s "$log" ]; then
+      echo "$log"
+      return 0
+    fi
+    tries=$((tries + 1))
+    sleep 5
+  done
+  echo "$log"
+}
+
+# --- per-scenario driving -------------------------------------------------
+
+case "$scenario" in
+  cancel)
+    ssh_command=$(download_ssh_command)
+    target=$(printf '%s' "$ssh_command" | sed -E 's/^ssh +//')
+    echo "Join command: $ssh_command"
+    if [ "$with_guest" = true ]; then
+      echo "Joining as the actor for 5s before cancelling..."
+      join_session "$target" 5 >/dev/null
+    fi
+    echo "Cancelling $run_id..."
+    gh run cancel "$run_id" --repo "$repo"
+    wait_for_completion
+    log=$(fetch_log)
+    assert_contains "runner's sweep terminated the orphaned upterm process" \
+      'Terminate orphan process: pid \([0-9]+\) \(upterm' "$log"
+    # The runner still logs a debug trace evaluating the post-if condition for
+    # a skipped step (its name appears in the log either way), so the log
+    # text alone can't tell "skipped" from "ran" - the step's own conclusion
+    # can: post-if "!cancelled()" makes a cancelled job skip it outright.
+    post_conclusion=$(step_conclusion "Post Start upterm session")
+    if [ "$post_conclusion" = "skipped" ]; then
+      pass "the post step (Post Start upterm session) did not run (conclusion: skipped)"
+    else
+      fail "the post step (Post Start upterm session) did not run (conclusion: ${post_conclusion:-<none>})"
+    fi
+    ;;
+
+  long-build)
+    wait_for_completion
+    log=$(fetch_log)
+    assert_order "BUILD_FINISHED, then the countdown, then the timeout warning" "$log" \
+      'BUILD_FINISHED' \
+      'Waiting for client to connect \(at most 60 more second\(s\)\)' \
+      'Timed out waiting for client to connect'
+    conclusion=$(gh run view "$run_id" --repo "$repo" --json conclusion --jq .conclusion)
+    if [ "$conclusion" = "success" ]; then
+      pass "job succeeded"
+    else
+      fail "job succeeded (conclusion: $conclusion)"
+    fi
+    ;;
+
+  guest-before-post)
+    ssh_command=$(download_ssh_command)
+    target=$(printf '%s' "$ssh_command" | sed -E 's/^ssh +//')
+    echo "Join command: $ssh_command"
+    echo "Joining for 3s during the build, then leaving..."
+    join_session "$target" 3 >/dev/null
+
+    echo "Waiting for the post step to be in_progress..."
+    wait_for_status '(.jobs[0].steps[] | select(.name=="Post Start upterm session") | .status) == "in_progress"'
+
+    echo "Joining again, sending exit to end the session..."
+    join_session "$target" 20 $'exit\n' >/dev/null
+
+    wait_for_completion
+    log=$(fetch_log)
+    assert_contains "a guest joined" 'A guest joined at' "$log"
+    assert_contains "the post step waited for the session to end" 'Waiting for session to end' "$log"
+    assert_not_contains "no client-connect timeout" 'Timed out waiting for client to connect' "$log"
+    ;;
+esac
+
+echo
+if [ "$failures" -eq 0 ]; then
+  echo "All assertions passed ($run_url)"
+  exit 0
+else
+  echo "$failures assertion(s) failed ($run_url)"
+  exit 1
+fi
