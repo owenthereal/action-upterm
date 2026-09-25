@@ -82,10 +82,15 @@ describe('E2E: attached mode against the real relay', () => {
       expect(sshCommand).toMatch(SSH_COMMAND_PATTERN);
 
       // Join as a guest, run a command, and leave (kill ssh, not "exit") without
-      // ending the shared shell.
-      const guestOutput = await joinAsGuest(sshCommand, 4000, 'echo E2E_GUEST_OK\n');
-      expect(guestOutput).toContain('E2E_GUEST_OK');
-      console.log('Guest saw E2E_GUEST_OK; guest left without ending the session');
+      // ending the shared shell. Computed rather than a literal marker: with a
+      // pty, the guest's own typed input is echoed back too, so a literal
+      // 'echo E2E_GUEST_OK' would satisfy toContain() from the echoed
+      // keystrokes alone, whether or not the command actually ran. Sending the
+      // arithmetic and asserting on the evaluated result proves the shell
+      // itself executed it.
+      const guestOutput = await joinAsGuest(sshCommand, 4000, 'echo E2E_$((6*7))\n');
+      expect(guestOutput).toContain('E2E_42');
+      console.log('Guest saw E2E_42; guest left without ending the session');
 
       const container = findContainer('act-E2E-Fixture-upterm');
       dockerExec(container, 'touch /continue');
