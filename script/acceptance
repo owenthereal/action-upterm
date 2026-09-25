@@ -122,7 +122,7 @@ assert_order() {
 to_epoch() {
   local ts
   ts=$(printf '%s' "$1" | sed -E 's/\.[0-9]+Z$/Z/')
-  date -u -d "$ts" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null
+  date -u -d "$ts" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || true
 }
 
 # The post step prints "A guest joined at <firstGuestJoinedAt>", upterm's own
@@ -134,14 +134,14 @@ to_epoch() {
 assert_join_precedes_build() {
   local desc=$1 log=$2
   local join_ts build_ts join_epoch build_epoch
-  join_ts=$(grep -E 'A guest joined at' "$log" | head -1 | sed -E 's/.*A guest joined at ([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z).*/\1/')
-  build_ts=$(grep -E 'BUILD_FINISHED' "$log" | head -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' | head -1)
+  join_ts=$(grep -E 'A guest joined at' "$log" | head -1 | sed -E 's/.*A guest joined at ([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z).*/\1/') || true
+  build_ts=$(grep -E 'BUILD_FINISHED' "$log" | head -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' | head -1) || true
   if [ -z "$join_ts" ] || [ -z "$build_ts" ]; then
     fail "$desc (could not find both timestamps: join=${join_ts:-<none>} build=${build_ts:-<none>})"
     return
   fi
-  join_epoch=$(to_epoch "$join_ts")
-  build_epoch=$(to_epoch "$build_ts")
+  join_epoch=$(to_epoch "$join_ts") || true
+  build_epoch=$(to_epoch "$build_ts") || true
   if [ -z "$join_epoch" ] || [ -z "$build_epoch" ]; then
     fail "$desc (could not parse a timestamp: join=$join_ts build=$build_ts)"
     return
@@ -173,7 +173,7 @@ else
   for _ in $(seq 1 24); do
     run_id=$(gh run list --repo "$repo" --workflow "$workflow" --event workflow_dispatch \
       -L 20 --json databaseId,displayTitle \
-      --jq "[.[] | select(.displayTitle | contains(\"$nonce\"))] | .[0].databaseId // empty")
+      --jq "[.[] | select(.displayTitle | contains(\"$nonce\"))] | .[0].databaseId // empty") || true
     if [ -n "$run_id" ]; then
       break
     fi
@@ -208,45 +208,85 @@ download_ssh_command() {
   return 1
 }
 
-# Join the session as the operator (see the header comment on identity), hold
-# for hold_seconds - or until the remote side closes first, e.g. after
-# sending "exit\n" - then disconnect. Prints the guest's captured output on
-# stdout, as before, and returns 0 whenever the hold ran its course (whether
-# ended by us or by a deliberate remote exit); returns ssh's own nonzero exit
-# status only when ssh itself gave up before the hold completed (e.g. an
-# auth or connection failure) - a caller that cares can tell the two apart.
+# Join the session as the operator (see the header comment on identity).
+# Sends a computed marker (an expression only the guest's own shell can
+# evaluate: "echo J_$((6*7))") as soon as the connection is up, and waits -
+# bounded to marker_bound seconds - until "J_42" is echoed back in the
+# captured output. That proves the join actually completed (SSH handshake,
+# auth, and the session channel), not just that ssh was invoked; a short
+# hold can otherwise end before all of that finishes. Only once the marker
+# is proven does it send input (if any) and hold for hold_seconds - or
+# until the remote side closes first, e.g. after input="exit\n" - then
+# disconnect. Prints the guest's captured output on stdout, always. Returns
+# 0 only when the marker was proven and the hold then ran its course
+# (whether ended by us or by a deliberate remote exit); returns non-zero -
+# the marker-wait timeout, or ssh's own exit status when ssh gave up early
+# (e.g. "Permission denied", 255) - if the join was never proven. A caller
+# running under `set -e` must capture that status explicitly rather than
+# call this bare.
 join_session() {
   local target=$1 hold_seconds=$2 input=${3:-}
-  local out status=0
+  local marker_bound=30
+  local out fifo status=0 waited=0 joined=false
   out=$(mktemp)
-  (
-    if [ -n "$input" ]; then
-      sleep 1
-      printf '%s' "$input"
-    fi
-    sleep $((hold_seconds + 30))
-  ) | ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  fifo=$(mktemp -u)
+  mkfifo "$fifo"
+  exec 3<>"$fifo"
+  rm -f "$fifo"
+
+  ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
     -o ForwardAgent=no -o ClearAllForwardings=yes \
-    "$target" >"$out" 2>&1 &
+    "$target" <&3 >"$out" 2>&1 &
   local ssh_pid=$!
-  local waited=0
-  while kill -0 "$ssh_pid" 2>/dev/null && [ "$waited" -lt "$hold_seconds" ]; do
+
+  local marker=$'echo J_$((6*7))\n'
+  printf '%s' "$marker" >&3
+
+  while [ "$waited" -lt "$marker_bound" ]; do
+    if grep -q 'J_42' "$out" 2>/dev/null; then
+      joined=true
+      break
+    fi
+    if ! kill -0 "$ssh_pid" 2>/dev/null; then
+      break
+    fi
     sleep 1
     waited=$((waited + 1))
   done
+
+  if [ "$joined" = true ]; then
+    if [ -n "$input" ]; then
+      printf '%s' "$input" >&3
+    fi
+    waited=0
+    while kill -0 "$ssh_pid" 2>/dev/null && [ "$waited" -lt "$hold_seconds" ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+  fi
+
+  exec 3>&-
   if kill -0 "$ssh_pid" 2>/dev/null; then
-    # The hold ran its course; we're ending it ourselves - not a failure,
-    # whatever status a killed ssh reports.
+    # Either the marker never showed up within the bound and we're giving
+    # up, or the hold ran its course; either way we're ending it ourselves -
+    # not a failure, whatever status a killed ssh reports.
     kill -TERM "$ssh_pid" 2>/dev/null || true
     wait "$ssh_pid" 2>/dev/null || true
   else
-    # ssh already exited on its own, before the hold completed: either the
-    # remote closed it deliberately (e.g. after "exit", which exits 0), or
-    # ssh itself failed (e.g. permission denied, connection refused) -
-    # capture its real status so the caller can tell the two apart.
+    # ssh already exited on its own: either a deliberate remote exit (e.g.
+    # after "exit", which exits 0), or ssh itself failed (e.g. permission
+    # denied, connection refused) - capture its real status.
     wait "$ssh_pid" 2>/dev/null || status=$?
   fi
+
+  if [ "$joined" != true ] && [ "$status" -eq 0 ]; then
+    # The marker never appeared and ssh didn't report a failure status
+    # either (e.g. it was still connected when the bound ran out) - still a
+    # failed proof.
+    status=1
+  fi
+
   cat "$out"
   rm -f "$out"
   return "$status"
@@ -268,7 +308,7 @@ wait_for_status() {
 wait_for_completion() {
   local status
   for _ in $(seq 1 90); do
-    status=$(gh run view "$run_id" --repo "$repo" --json status --jq .status)
+    status=$(gh run view "$run_id" --repo "$repo" --json status --jq .status) || true
     if [ "$status" = "completed" ]; then
       return 0
     fi
@@ -314,16 +354,12 @@ case "$scenario" in
       # Prove the join itself rather than discarding its output: a silent
       # auth/connection failure here would otherwise still let the run get
       # cancelled and the orphan-sweep assertions pass, having tested nothing
-      # about a guest actually being present. join_session returns nonzero
-      # (ssh's own exit status, e.g. 255) only when ssh gave up before the
-      # 5s hold completed.
-      guest_out=$(join_session "$target" 5 $'echo J_$((6*7))\n') && guest_status=0 || guest_status=$?
-      if [ "$guest_status" -ne 0 ] || printf '%s' "$guest_out" | grep -Eq 'Permission denied|Connection (refused|closed)'; then
+      # about a guest actually being present. join_session proves the join
+      # itself (marker echoed back) before counting the hold, and returns
+      # non-zero - with the captured output - if that proof never completes.
+      guest_out=$(join_session "$target" 5) && guest_status=0 || guest_status=$?
+      if [ "$guest_status" -ne 0 ]; then
         echo "FATAL: guest join failed (ssh exit ${guest_status}): $guest_out" >&2
-        exit 1
-      fi
-      if ! printf '%s' "$guest_out" | grep -q 'J_42'; then
-        echo "FATAL: guest join did not prove itself (expected J_42 in output): $guest_out" >&2
         exit 1
       fi
       echo "Guest joined and proved itself (J_42)"
@@ -338,7 +374,7 @@ case "$scenario" in
     # a skipped step (its name appears in the log either way), so the log
     # text alone can't tell "skipped" from "ran" - the step's own conclusion
     # can: post-if "!cancelled()" makes a cancelled job skip it outright.
-    post_conclusion=$(step_conclusion "Post Start upterm session")
+    post_conclusion=$(step_conclusion "Post Start upterm session") || true
     if [ "$post_conclusion" = "skipped" ]; then
       pass "the post step (Post Start upterm session) did not run (conclusion: skipped)"
     else
@@ -353,7 +389,7 @@ case "$scenario" in
       'BUILD_FINISHED' \
       'Waiting for client to connect \(at most 60 more second\(s\)\)' \
       'Timed out waiting for client to connect'
-    conclusion=$(gh run view "$run_id" --repo "$repo" --json conclusion --jq .conclusion)
+    conclusion=$(gh run view "$run_id" --repo "$repo" --json conclusion --jq .conclusion) || true
     if [ "$conclusion" = "success" ]; then
       pass "job succeeded"
     else
@@ -366,13 +402,27 @@ case "$scenario" in
     target=$(printf '%s' "$ssh_command" | sed -E 's/^ssh +//')
     echo "Join command: $ssh_command"
     echo "Joining for 3s during the build, then leaving..."
-    join_session "$target" 3 >/dev/null
+    # join_session proves the join (marker echoed back) before counting the
+    # 3s hold; a failure here is a FAIL with the output, not a script
+    # crash - it's already covered by the log assertions below, but a
+    # bare nonzero return would otherwise abort the whole script under
+    # `set -e` before those assertions ever ran.
+    guest_out=$(join_session "$target" 3) && join_status=0 || join_status=$?
+    if [ "$join_status" -ne 0 ]; then
+      fail "the build-time guest join proved itself (J_42) before its hold (ssh exit ${join_status}): $guest_out"
+    fi
 
     echo "Waiting for the post step to be in_progress..."
     wait_for_status '(.jobs[0].steps[] | select(.name=="Post Start upterm session") | .status) == "in_progress"'
 
     echo "Joining again, sending exit to end the session..."
-    join_session "$target" 20 $'exit\n' >/dev/null
+    # Same as above: this is now a bare join_session call whose non-zero
+    # status would otherwise abort the script under `set -e` instead of
+    # reporting a FAIL and letting it reach the summary.
+    guest_out=$(join_session "$target" 20 $'exit\n') && join_status=0 || join_status=$?
+    if [ "$join_status" -ne 0 ]; then
+      fail "the post-step guest join proved itself (J_42) and sent exit (ssh exit ${join_status}): $guest_out"
+    fi
 
     wait_for_completion
     log=$(fetch_log)
