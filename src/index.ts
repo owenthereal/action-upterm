@@ -188,7 +188,11 @@ interface XdgPaths {
  */
 function exportXdgEnvironment(): XdgPaths {
   const dirs = getUptermDirs();
-  // On Windows, upterm.exe expects POSIX-style paths in XDG vars (e.g., /c/Users/... not C:/Users/...)
+  // On Windows this is POSIX-style (/c/Users/... not C:/Users/...) not because
+  // upterm.exe itself expects that - it's a native executable - but because
+  // MSYS2's bash converts POSIX-style env values to Windows form automatically
+  // when it launches a native child process. Every upterm call goes through
+  // bash for exactly that reason.
   const convert = process.platform === 'win32' ? toMsys2Path : toShellPath;
   const xdg: XdgPaths = {
     runtime: convert(dirs.runtime),
@@ -234,9 +238,11 @@ function toShellPath(filePath: string): string {
  *
  * Use this for:
  * - XDG environment variables (XDG_RUNTIME_DIR, XDG_STATE_HOME, etc.)
- * - Shell redirects and pipes (>, 2>, |)
- * - MSYS2 utilities (cat, tee, echo)
- * - Timeout flag file path
+ * - A path handed to a bash command that will itself launch a native Windows
+ *   child process (e.g. the `cp` source path when copying upterm.exe into
+ *   MSYS2's /usr/bin) - MSYS2's bash converts it to Windows form
+ *   automatically for that child, so the value bash itself sees must be
+ *   POSIX-style
  *
  * @example
  * // On Windows:
@@ -406,10 +412,14 @@ async function installDependencies(): Promise<void> {
     await handler();
     core.debug('Installed dependencies successfully');
   } catch (error) {
+    // Installation is the same on every platform: download the upterm release
+    // tarball from GitHub and extract it (Windows also copies upterm.exe into
+    // MSYS2's /usr/bin so it's on the hosted login shell's PATH). No apt-get,
+    // Homebrew or pacman is involved - those were tmux-era guidance.
     const platformGuidance: Record<string, string> = {
-      linux: 'Ensure apt-get is available and you have sudo permissions',
-      darwin: 'Ensure Homebrew is installed: https://brew.sh',
-      win32: 'Ensure MSYS2 is properly configured with pacman package manager'
+      linux: 'Ensure this runner can reach GitHub releases (github.com) to download and extract the upterm tarball',
+      darwin: 'Ensure this runner can reach GitHub releases (github.com) to download and extract the upterm tarball',
+      win32: "Ensure this runner can reach GitHub releases (github.com) to download upterm.exe, and that it can be copied into MSYS2's /usr/bin"
     };
     const guidance = platformGuidance[process.platform] || '';
     throw new Error(`Failed to install dependencies on ${process.platform}: ${error}\n\n` + (guidance ? `Tip: ${guidance}` : ''));
@@ -678,9 +688,15 @@ function continueFileExists(): boolean {
 
 /**
  * Ask upterm to end this run's session. Never throws: it is called from the
- * countdown, from teardown and from a signal handler, and in none of them may a
- * session that is already gone - `session stop` reports that and exits 0 - or a
- * transient failure fail the job.
+ * countdown, from teardown and from a signal handler, and in none of them may
+ * upterm's own exit code, or a transient failure, fail the job.
+ *
+ * `session stop` itself exits 0 and prints "has already ended" for a session
+ * whose record is still there but no longer held (an ordinary completed
+ * session); it exits 1 with "no session named" only when no record exists at
+ * all - which a launch that failed before any record was written, or a fully
+ * reaped session, both produce. That case is expected, not a failure: treated
+ * as a quiet no-op (core.debug), exactly as getSession() does for lookups.
  */
 async function stopSession(): Promise<void> {
   const name = getSessionName();
@@ -689,6 +705,10 @@ async function stopSession(): Promise<void> {
     // characters, shell-safe by construction.
     await execShellCommand(`upterm session stop ${name}`, {quiet: true});
   } catch (error) {
+    if (/no session named/i.test(String(error))) {
+      core.debug(`upterm session ${name} was never started or is already fully gone: ${error}`);
+      return;
+    }
     core.warning(`Could not stop upterm session ${name}: ${error}`);
   }
 }
@@ -816,7 +836,9 @@ async function runDetachedMode(session: SessionInfo): Promise<void> {
  * Remove this run's private directories.
  *
  * Guarded: rmSync(force) suppresses only ENOENT and defaults to maxRetries 0,
- * so on Windows - where the tee redirects still hold state/*.log open - an
+ * so on Windows - where the upterm process this run started can still be
+ * releasing its own open handle on state/upterm/upterm.log a moment after
+ * `session stop` returns, more strictly enforced there than on POSIX - an
  * unguarded EBUSY would fail a job whose debug session succeeded.
  */
 function cleanupUptermData(): void {

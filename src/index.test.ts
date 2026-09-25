@@ -448,7 +448,7 @@ describe('upterm GitHub integration', () => {
     expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Failed to install dependencies on win32: Error: Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.'));
   });
 
-  it('should install using brew on macos', async () => {
+  it('downloads and installs the upterm tarball on macos (no Homebrew), then starts a session', async () => {
     Object.defineProperty(process, 'platform', {
       value: 'darwin'
     });
@@ -878,8 +878,10 @@ describe('upterm GitHub integration', () => {
     });
 
     it('does not fail the job when cleanup cannot remove a directory', async () => {
-      // Windows holds state/*.log open via tee; rmSync defaults to maxRetries 0,
-      // so EBUSY must not turn a successful debug session into a failed job.
+      // On Windows the upterm process can still be releasing its own open
+      // handle on state/upterm/upterm.log a moment after stop; rmSync
+      // defaults to maxRetries 0, so EBUSY must not turn a successful debug
+      // session into a failed job.
       postState();
       mockFs.rmSync.mockImplementation(() => {
         throw new Error('EBUSY: resource busy or locked');
@@ -1059,11 +1061,51 @@ describe('upterm GitHub integration', () => {
       expect(process.env.XDG_STATE_HOME).toBeDefined();
     });
 
+    it('on windows, with a drive-letter RUNNER_TEMP, XDG_STATE_HOME is already MSYS-form when session stop is called', async () => {
+      // A drive-letter RUNNER_TEMP (e.g. C:\runner\_temp), as a real Windows
+      // runner sets it - not the POSIX-style RUNNER_TEMP the rest of this
+      // suite uses. Pins two things at once: the win32 conversion
+      // (XDG_STATE_HOME must be /c/... for upterm.exe's own child processes,
+      // never C:/...) and that exportXdgEnvironment() runs before stopSession()
+      // - captured from inside the mock, at the moment the command is built,
+      // not after run() resolves, so a regression in either would be caught.
+      Object.defineProperty(process, 'platform', {value: 'win32'});
+      postState({
+        uptermBaseDir: 'C:\\runner\\_temp\\upterm-action-abc',
+        uptermRuntimeDir: 'C:\\runner\\_temp\\upterm-rt-abc',
+        message: ''
+      });
+      let capturedXdgStateHome: string | undefined;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('session stop')) capturedXdgStateHome = process.env.XDG_STATE_HOME;
+        return '';
+      });
+      await run();
+      expect(capturedXdgStateHome).toBe('/c/runner/_temp/upterm-action-abc/state');
+    });
+
     it('does not stop anything when this run never started a session, but still removes its directories', async () => {
       postState({sessionStarted: '', message: ''});
       await run();
       expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('session stop'), expect.anything());
       expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
+    });
+
+    it('treats "no session named" from session stop as a quiet no-op, like getSession does for lookups', async () => {
+      // A launch that failed part-way (sessionStarted saved, but the record
+      // never got written) leaves nothing for `session stop` to find; upterm
+      // reports that with "no session named" and exit 1. Warning about it
+      // every time is noise for an expected case - debug only, same
+      // treatment getSession() gives a "not found" lookup.
+      postState({message: ''});
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('session stop')) throw new Error('Command failed: no session named "gha-3f9a1c05"');
+        return '';
+      });
+      await run();
+      expect(core.warning).not.toHaveBeenCalled();
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(core.debug).toHaveBeenCalledWith(expect.stringContaining('no session named'));
     });
 
     it('stops the session through bash when the post step is interrupted', async () => {
