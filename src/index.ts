@@ -1,31 +1,19 @@
-import {execSync} from 'child_process';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
-import {execShellCommand, launchOutsideJobObject, shellEscape, sleep} from './helpers';
-import {generateSessionName, getSession, isTerminal, isUptermVersionSupported, parseUptermVersion, SessionInfo} from './session';
+import {execShellCommand, shellEscape, sleep} from './helpers';
+import {generateSessionName, getSession, hasGuestJoined, isTerminal, isUptermVersionSupported, parseUptermVersion, parseSessionInfo, SessionInfo, formatVersion, UPTERM_MIN_VERSION} from './session';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
-const UPTERM_READY_POLL_INTERVAL = 1000;
-// Readiness now requires upterm's second, unlocked admin round-trip to have
-// succeeded - strictly harder than the old "does a socket inode exist" check,
-// and a slow first attempt costs a whole retry. A wider budget costs nothing on
-// the happy path (the loop returns on its first success) and the alternative is
-// a hard failure on a session that was about to be fine.
-const UPTERM_READY_MAX_RETRIES = 30;
 const SESSION_STATUS_POLL_INTERVAL = 5000;
 // Consecutive failed lookups between warnings, ~1 minute at the 5s poll
 // interval. The first failure always warns.
 const UNKNOWN_POLL_WARN_INTERVAL = 12;
 const SUPPORTED_UPTERM_ARCHITECTURES = ['amd64', 'arm64'] as const;
-const TMUX_DIMENSIONS = {width: 132, height: 43};
-// Delay (in milliseconds) to allow upterm sufficient time to initialize before proceeding.
-// This 2-second delay helps ensure the upterm server is fully started and ready for connections.
-const UPTERM_INIT_DELAY = 2000;
 
 // Continue file paths - users can touch either location to exit the session
 // /continue may require sudo, but $GITHUB_WORKSPACE/continue never does
@@ -45,8 +33,6 @@ interface UptermDirs {
   runtime: string;
   state: string;
   config: string;
-  logs: {uptermCommand: string; tmuxError: string};
-  timeoutFlag: string;
 }
 
 // Cache for getUptermDirs() to avoid repeated path computation
@@ -66,7 +52,7 @@ const RUNTIME_DIR_PREFIX = 'upterm-rt-';
 const MKDTEMP_SUFFIX_PLACEHOLDER = 'XXXXXX';
 
 /**
- * Root for this run's base directory (tmux.conf, state, config, timeout flag).
+ * Root for this run's base directory (state, config, timeout flag).
  *
  * The base directory holds no sockets, so its length does not matter.
  * RUNNER_TEMP is reaped by the runner per job.
@@ -153,12 +139,7 @@ function getUptermDirs(): UptermDirs {
     base,
     runtime, // XDG_RUNTIME_DIR - for sockets
     state, // XDG_STATE_HOME - for upterm's session records and logs
-    config: path.join(base, 'config'), // XDG_CONFIG_HOME
-    logs: {
-      uptermCommand: path.join(state, 'upterm-command.log'), // Our action's log of upterm stdout/stderr
-      tmuxError: path.join(state, 'tmux-error.log') // Our action's log of tmux stderr
-    },
-    timeoutFlag: path.join(base, 'timeout-flag') // Flag file for timeout detection
+    config: path.join(base, 'config') // XDG_CONFIG_HOME
   };
   return uptermDirsCache;
 }
@@ -195,10 +176,9 @@ interface XdgPaths {
  * converted values for anyone who needs to write them somewhere else.
  *
  * upterm finds a session's record through XDG_STATE_HOME
- * (cmd/upterm/command/session.go:425). Until now the action only set these
- * inside tmux.conf, because every query passed --admin-socket explicitly.
- * execShellCommand inherits process.env on both platforms (see its spawn call),
- * so one assignment covers every call site, in main and in post alike.
+ * (cmd/upterm/command/session.go:425). execShellCommand inherits process.env
+ * on both platforms (see its spawn call), so one assignment covers every call
+ * site, in main and in post alike.
  *
  * The conversion lives here and only here. XDG_STATE_HOME must agree exactly
  * between the host process (which publishes the record) and every query (which
@@ -208,7 +188,11 @@ interface XdgPaths {
  */
 function exportXdgEnvironment(): XdgPaths {
   const dirs = getUptermDirs();
-  // On Windows, upterm.exe expects POSIX-style paths in XDG vars (e.g., /c/Users/... not C:/Users/...)
+  // On Windows this is POSIX-style (/c/Users/... not C:/Users/...) not because
+  // upterm.exe itself expects that - it's a native executable - but because
+  // MSYS2's bash converts POSIX-style env values to Windows form automatically
+  // when it launches a native child process. Every upterm call goes through
+  // bash for exactly that reason.
   const convert = process.platform === 'win32' ? toMsys2Path : toShellPath;
   const xdg: XdgPaths = {
     runtime: convert(dirs.runtime),
@@ -254,10 +238,11 @@ function toShellPath(filePath: string): string {
  *
  * Use this for:
  * - XDG environment variables (XDG_RUNTIME_DIR, XDG_STATE_HOME, etc.)
- * - Shell redirects and pipes (>, 2>, |)
- * - MSYS2 utilities (cat, tee, echo)
- * - Paths spawned by native Windows executables (inner tmux)
- * - Timeout flag file path
+ * - A path handed to a bash command that will itself launch a native Windows
+ *   child process (e.g. the `cp` source path when copying upterm.exe into
+ *   MSYS2's /usr/bin) - MSYS2's bash converts it to Windows form
+ *   automatically for that child, so the value bash itself sees must be
+ *   POSIX-style
  *
  * @example
  * // On Windows:
@@ -275,18 +260,6 @@ function toMsys2Path(filePath: string): string {
     result = result.replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`);
   }
   return result;
-}
-
-function getUptermTimeoutFlagPath(): string {
-  return toMsys2Path(getUptermDirs().timeoutFlag);
-}
-
-function getUptermCommandLogPath(): string {
-  return toMsys2Path(getUptermDirs().logs.uptermCommand);
-}
-
-function getTmuxErrorLogPath(): string {
-  return toMsys2Path(getUptermDirs().logs.tmuxError);
 }
 
 type UptermArchitecture = (typeof SUPPORTED_UPTERM_ARCHITECTURES)[number];
@@ -361,7 +334,6 @@ export async function run() {
 
     await installDependencies();
     await assertSupportedUptermVersion();
-    await setupSSH();
     const session = await startUptermSession();
 
     if (core.getInput('detached') === 'true') {
@@ -369,7 +341,7 @@ export async function run() {
       return;
     }
 
-    await monitorSession();
+    await waitForSession(attachedTimeoutSeconds(), `SSH: ${session.sshCommand}`);
   } catch (error: unknown) {
     if (error instanceof Error) {
       core.setFailed(error.message);
@@ -393,7 +365,6 @@ async function installDependencies(): Promise<void> {
       }
 
       core.addPath(extractDir);
-      await execShellCommand('if ! command -v tmux &>/dev/null; then sudo apt-get update && sudo apt-get -y install tmux; fi');
     },
     win32: async () => {
       const archiveUrl = getUptermDownloadUrl('win32', process.arch);
@@ -408,17 +379,15 @@ async function installDependencies(): Promise<void> {
       core.addPath(extractDir);
 
       // core.addPath only puts the tool-cache dir on the Node process PATH and
-      // on subsequent (non-MSYS2) steps via GITHUB_PATH. The interactive
-      // SSH/tmux session spawns bash login shells that re-source /etc/profile
-      // with the default MSYS2_PATH_TYPE=minimal, which rebuilds PATH and drops
-      // that tool-cache dir - so upterm would be missing once the user connects.
-      // /usr/bin is always on the minimal MSYS2 PATH (it's where bash and the
-      // pacman-installed tmux live), so copy the binary there to guarantee it
-      // resolves in every MSYS2 context. Done via bash `cp` so /usr/bin tracks
-      // whichever MSYS2 root the shell uses rather than a hardcoded location.
+      // on subsequent (non-MSYS2) steps via GITHUB_PATH. The interactive SSH
+      // session spawns bash login shells that re-source /etc/profile with the
+      // default MSYS2_PATH_TYPE=minimal, which rebuilds PATH and drops that
+      // tool-cache dir - so upterm would be missing once the user connects.
+      // /usr/bin is always on the minimal MSYS2 PATH (it's where bash lives),
+      // so copy the binary there to guarantee it resolves in every MSYS2
+      // context. Done via bash `cp` so /usr/bin tracks whichever MSYS2 root
+      // the shell uses rather than a hardcoded location.
       await execShellCommand(`cp ${shellEscape(toMsys2Path(uptermExePath))} /usr/bin/upterm.exe`);
-
-      await execShellCommand('if ! command -v tmux &>/dev/null; then pacman -S --noconfirm tmux; fi');
     },
     darwin: async () => {
       const archiveUrl = getUptermDownloadUrl('darwin', process.arch);
@@ -431,7 +400,6 @@ async function installDependencies(): Promise<void> {
       }
 
       core.addPath(extractDir);
-      await execShellCommand('brew install tmux');
     }
   };
 
@@ -444,10 +412,14 @@ async function installDependencies(): Promise<void> {
     await handler();
     core.debug('Installed dependencies successfully');
   } catch (error) {
+    // Installation is the same on every platform: download the upterm release
+    // tarball from GitHub and extract it (Windows also copies upterm.exe into
+    // MSYS2's /usr/bin so it's on the hosted login shell's PATH). No apt-get,
+    // Homebrew or pacman is involved - those were tmux-era guidance.
     const platformGuidance: Record<string, string> = {
-      linux: 'Ensure apt-get is available and you have sudo permissions',
-      darwin: 'Ensure Homebrew is installed: https://brew.sh',
-      win32: 'Ensure MSYS2 is properly configured with pacman package manager'
+      linux: 'Ensure this runner can reach GitHub releases (github.com) to download and extract the upterm tarball',
+      darwin: 'Ensure this runner can reach GitHub releases (github.com) to download and extract the upterm tarball',
+      win32: "Ensure this runner can reach GitHub releases (github.com) to download upterm.exe, and that it can be copied into MSYS2's /usr/bin"
     };
     const guidance = platformGuidance[process.platform] || '';
     throw new Error(`Failed to install dependencies on ${process.platform}: ${error}\n\n` + (guidance ? `Tip: ${guidance}` : ''));
@@ -455,11 +427,13 @@ async function installDependencies(): Promise<void> {
 }
 
 /**
- * Refuse to run against an upterm older than 0.30.
+ * Refuse to run against an upterm older than v0.31.0.
  *
- * The action addresses its session with `--name` and `upterm session info NAME
- * -o json`, neither of which exists before 0.30. Failing here beats failing
- * later with a socket that was never going to be found.
+ * v0.31.0 is the first upterm that publishes firstGuestJoinedAt. v2 decides
+ * whether to stop an unanswered session from this field, and an older upterm
+ * always omits it, which would read as "nobody joined" and stop a session
+ * somebody is in. Older versions are refused, not guessed at - including a
+ * version string that cannot be parsed, which v1 only warned about.
  */
 async function assertSupportedUptermVersion(): Promise<void> {
   let output: string;
@@ -470,64 +444,18 @@ async function assertSupportedUptermVersion(): Promise<void> {
   }
 
   const version = parseUptermVersion(output);
+  const floor = formatVersion(UPTERM_MIN_VERSION);
 
+  // Refused, not warned about: v2 decides whether to stop a session from a
+  // field older upterms never publish, and an unknown version is an unknown
+  // answer to "can this upterm say whether anyone joined?".
   if (!version) {
-    core.warning(`Could not determine the installed upterm version from: ${output.trim()}. Continuing, but this action requires upterm >= v0.30.0.`);
-    return;
+    throw new Error(`Could not determine the installed upterm version from: ${output.trim()}. action-upterm v2 requires upterm >= ${floor}.`);
   }
 
   if (!isUptermVersionSupported(version)) {
-    throw new Error(
-      `action-upterm requires upterm >= v0.30.0 (found v${version.major}.${version.minor}.${version.patch}). ` +
-        `Remove the upterm-version input to use the latest release, or pin owenthereal/action-upterm@v1.15.0 to keep using an older upterm.`
-    );
+    throw new Error(`action-upterm v2 requires upterm >= ${floor} (found ${formatVersion(version)}). ` + `Remove the upterm-version input to use the latest release, or pin owenthereal/action-upterm@v1 to keep using an older upterm.`);
   }
-}
-
-async function generateSSHKeys(sshPath: string): Promise<void> {
-  const idRsaPath = path.join(sshPath, 'id_rsa');
-  const idEd25519Path = path.join(sshPath, 'id_ed25519');
-
-  if (fs.existsSync(idRsaPath)) {
-    core.debug('SSH key already exists');
-    return;
-  }
-
-  core.debug('Generating SSH keys');
-  fs.mkdirSync(sshPath, {recursive: true});
-
-  // Use absolute paths instead of ~ to avoid MSYS2 home directory mismatch on Windows
-  const rsaKeyPath = toShellPath(idRsaPath);
-  const ed25519KeyPath = toShellPath(idEd25519Path);
-
-  try {
-    await execShellCommand(`ssh-keygen -q -t rsa -N "" -f "${rsaKeyPath}"; ssh-keygen -q -t ed25519 -N "" -f "${ed25519KeyPath}"`);
-    core.debug('Generated SSH keys successfully');
-  } catch (error) {
-    throw new Error(`Failed to generate SSH keys: ${error}`);
-  }
-}
-
-function configureSSHClient(sshPath: string): void {
-  core.debug('Configuring ssh client');
-  const sshConfig = `Host *
-  StrictHostKeyChecking no
-  CheckHostIP no
-  TCPKeepAlive yes
-  ServerAliveInterval 30
-  ServerAliveCountMax 180
-  VerifyHostKeyDNS yes
-  UpdateHostKeys yes
-  AddressFamily inet
-`;
-  fs.appendFileSync(path.join(sshPath, 'config'), sshConfig);
-}
-
-async function setupSSH(): Promise<void> {
-  const sshPath = path.join(os.homedir(), '.ssh');
-
-  await generateSSHKeys(sshPath);
-  configureSSHClient(sshPath);
 }
 
 function getAllowedUsers(): string[] {
@@ -544,147 +472,57 @@ function getAllowedUsers(): string[] {
   return [...new Set(allowedUsers)];
 }
 
-function buildAuthorizedKeysParameter(allowedUsers: string[]): string {
-  return allowedUsers.map(user => `--github-user ${shellEscape(user)}`).join(' ') + ' ';
+/**
+ * The command the session hosts, as a CLI suffix. Unix: none, so upterm runs
+ * $SHELL. Windows: MSYS2's login bash - what v1's tmux ran - found as
+ * /usr/bin/bash because this command line is run by MSYS2 bash.
+ */
+function hostedCommand(): string {
+  return process.platform === 'win32' ? ' -- bash -l' : '';
 }
 
-async function createUptermSession(uptermServer: string, authorizedKeysParameter: string): Promise<void> {
-  core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
-
-  // Get deterministic paths for all upterm-related files
+/**
+ * Start this run's session in the background and return what upterm reports
+ * for it.
+ *
+ * `upterm host --detach` returns only once the daemon has started the command
+ * and written the ready record, so its JSON - the same shape `session info -o
+ * json` prints - is already a usable session: no readiness polling. The daemon
+ * outlives this step on every platform without help (see the Windows notes in
+ * ARCHITECTURE.md), and the runner's orphan sweep reaps it at the end of the job.
+ */
+async function launchSession(uptermServer: string, allowedUsers: string[]): Promise<SessionInfo> {
   const dirs = getUptermDirs();
-
-  // Create all required directories - upterm and our action expect these to exist
   fs.mkdirSync(dirs.runtime, {recursive: true});
   fs.mkdirSync(dirs.state, {recursive: true});
   fs.mkdirSync(dirs.config, {recursive: true});
-  // The same triple that goes into this process's environment goes into
-  // tmux.conf below: the host and every later query must agree on XDG_STATE_HOME
-  // or the session record cannot be resolved.
-  const xdg = exportXdgEnvironment();
-  core.debug(`Created upterm directories under ${dirs.base}`);
+  exportXdgEnvironment();
 
-  // Remove any stale timeout flag left in a reused temp directory (e.g. on a
-  // self-hosted runner, or a second invocation in the same job). Otherwise
-  // monitorSession() would read the old flag via the native path and report a
-  // timeout for this fresh session before its timer has even been armed.
-  fs.rmSync(dirs.timeoutFlag, {force: true});
+  const auth = allowedUsers.map(user => ` --authorized-user ${shellEscape(`github:${user}`)}`).join('');
+  // getSessionName() is gha- + 8 hex characters: shell-safe by construction.
+  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --skip-host-key-check --server ${shellEscape(uptermServer)}${auth}${hostedCommand()}`;
 
-  // Create custom tmux config that sets XDG environment variables globally
-  // Using a custom config file ensures both outer and inner tmux sessions get the same config
-  const tmuxConf = `# Set XDG directories for upterm
-set-environment -g XDG_RUNTIME_DIR "${xdg.runtime}"
-set-environment -g XDG_STATE_HOME "${xdg.state}"
-set-environment -g XDG_CONFIG_HOME "${xdg.config}"
+  core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
+  // Evidence for the post step that there may be a session to stop. Saved
+  // before the launch: a launch that fails half way can still leave one.
+  core.saveState('sessionStarted', 'true');
 
-# Allow UPTERM_ADMIN_SOCKET to be inherited from client environment.
-# The action itself no longer runs 'upterm session current' - it addresses the
-# session by name - but a human who runs it from a shell inside the session
-# still needs the variable to reach their tmux client.
-set-option -ga update-environment " UPTERM_ADMIN_SOCKET"
-
-# Enable aggressive window resizing for better multi-client support
-setw -g aggressive-resize on
-`;
-
-  const tmuxConfPath = path.join(dirs.base, 'tmux.conf');
-  fs.writeFileSync(tmuxConfPath, tmuxConf);
-  core.debug(`Created tmux config at ${tmuxConfPath}`);
-
-  // Use -f to load our custom config for both outer and inner tmux sessions
-  // For outer tmux: Use Windows path (C:/...) with quotes since it runs in bash
-  // For inner tmux: Use POSIX path (/c/...) without quotes since upterm.exe spawns it
-  const tmuxConfPathShell = toShellPath(tmuxConfPath);
-  const tmuxConfPathPosix = toMsys2Path(tmuxConfPath);
-  const tmuxConfFlagOuter = `-f ${shellEscape(tmuxConfPathShell)}`;
-  const tmuxConfFlagInner = `-f ${tmuxConfPathPosix}`;
-
+  let output: string;
   try {
-    // getSessionName() is interpolated raw, unlike every other value here:
-    // generateSessionName() produces `gha-` + 8 hex chars and nothing else, so
-    // it is shell-safe by construction. Any change that lets a name carry
-    // user input must wrap it in shellEscape(), as session.ts already does.
-    const tmuxCmd = `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --name ${getSessionName()} --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -f read-only -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`;
-
-    // Evidence for the post step that process teardown is warranted. isPost is
-    // saved before installDependencies(), so without this a failed download or
-    // a rejected upterm version would reach finalizeSession() and kill tmux
-    // sessions named upterm-wrapper/upterm that this run never created.
-    core.saveState('sessionStarted', 'true');
-
-    if (process.platform === 'win32') {
-      // On Windows, launch the tmux/upterm process tree outside the
-      // runner's Job Object via WMI.  Without this, a sibling step's
-      // timeout-minutes limit terminates the entire Job Object, taking
-      // tmux and upterm with it.  WMI's Win32_Process::Create spawns
-      // the process under WmiPrvSE.exe, which is outside the runner's
-      // Job Object and therefore immune to step timeout cascades.
-      //
-      // Pass the current PATH so that the WMI-spawned bash can find
-      // tmux and upterm (which were added to PATH by installDependencies).
-      // MSYSTEM and CHERE_INVOKING are set by the launch script itself
-      // (the WMI-spawned process has a minimal environment), so we only
-      // need to forward PATH and HOME here.
-      launchOutsideJobObject(
-        tmuxCmd,
-        {
-          PATH: process.env.PATH || '',
-          HOME: process.env.USERPROFILE || os.homedir()
-        },
-        getUptermDirs().base
-      );
-    } else {
-      await execShellCommand(tmuxCmd);
-    }
-    core.debug('Created new session successfully');
+    output = await execShellCommand(cmd, {quiet: true});
   } catch (error) {
-    try {
-      const tmuxError = await execShellCommand(`cat ${shellEscape(getTmuxErrorLogPath())} 2>/dev/null || echo "No tmux error log found"`);
-      core.error(`Tmux error log: ${tmuxError.trim()}`);
-    } catch (logError) {
-      core.debug(`Could not read tmux error log: ${logError}`);
-    }
-
-    const errorMsg = `Failed to create upterm session: ${error}
-
-Common causes:
-- Network connectivity issues (cannot reach upterm server)
-- Upterm server unavailable or incorrect server URL
-- Tmux not installed or not in PATH
-- On Windows: MSYS2 environment issues
-- Insufficient permissions for creating sockets/files
-
-Troubleshooting:
-- Check upterm-server input is correct (default: ssh://uptermd.upterm.dev:22)
-- Verify network connectivity to upterm server
-- On Windows: Ensure MSYS2 is properly configured
-- Check the logs above for specific error details
-
-For help, see: https://github.com/owenthereal/action-upterm/issues`;
-    throw new Error(errorMsg);
+    throw new Error(`Failed to start the upterm session: ${error}\n\n${await collectDiagnostics()}`);
   }
-}
 
-async function setupSessionTimeout(waitTimeoutMinutes: string): Promise<void> {
-  const timeout = parseInt(waitTimeoutMinutes, 10);
-  const timeoutFlagPath = getUptermTimeoutFlagPath();
-
-  const timeoutScript = `
-    (
-      sleep $(( ${timeout} * 60 ));
-      if [ -z "$(tmux list-clients -t upterm -f '#{?client_readonly,,1}')" ]; then
-        echo "UPTERM_TIMEOUT_REACHED" > ${shellEscape(timeoutFlagPath)};
-        tmux kill-server;
-      fi
-    ) & disown
-  `;
-
-  try {
-    await execShellCommand(timeoutScript);
-    core.info(`wait-timeout-minutes set - will wait for ${waitTimeoutMinutes} minutes for someone to connect, otherwise shut down`);
-  } catch (error) {
-    throw new Error(`Failed to setup timeout: ${error}`);
+  const session = parseSessionInfo(output);
+  // A terminal status must fail even with an sshCommand: upterm's printStarted
+  // can report "disconnected" - the record's status the instant the tunnel
+  // dropped - alongside a claim captured moments earlier that still carries an
+  // sshCommand. A connect string for a session already gone can never connect.
+  if (isTerminal(session.status) || !session.sshCommand) {
+    throw new Error(await collectDiagnostics(session));
   }
+  return session;
 }
 
 /**
@@ -708,7 +546,7 @@ async function collectDiagnostics(observed?: SessionInfo): Promise<string> {
 
   // A session that ended is not one that was slow: a misconfigured
   // upterm-server ends it on the first poll, with retries to spare.
-  const headline = session && isTerminal(session.status) ? `Upterm session ended before it became ready (status: ${session.status}).` : 'Upterm did not become ready after maximum retries.';
+  const headline = session && isTerminal(session.status) ? `Upterm session ended before it became ready (status: ${session.status}).` : 'Upterm did not start a usable session.';
   let diagnostics = `${headline}\n\nDiagnostics:\n`;
 
   diagnostics += `- Upterm data directory: ${dirs.base}\n`;
@@ -737,34 +575,6 @@ async function collectDiagnostics(observed?: SessionInfo): Promise<string> {
     }
   }
 
-  // Check tmux sessions
-  try {
-    const tmuxList = await execShellCommand('tmux list-sessions 2>/dev/null || echo "No tmux sessions"');
-    diagnostics += `- Tmux sessions: ${tmuxList.trim()}\n`;
-  } catch (error) {
-    diagnostics += `- Could not check tmux sessions: ${error}\n`;
-  }
-
-  // Check tmux error log
-  try {
-    const tmuxErrorLog = await execShellCommand(`cat ${shellEscape(getTmuxErrorLogPath())} 2>/dev/null || echo "No tmux error log"`);
-    if (tmuxErrorLog.trim() !== 'No tmux error log') {
-      diagnostics += `- Tmux error log:\n${tmuxErrorLog.trim()}\n`;
-    }
-  } catch (error) {
-    diagnostics += `- Could not read tmux error log: ${error}\n`;
-  }
-
-  // Check upterm command output log
-  try {
-    const cmdLog = await execShellCommand(`cat ${shellEscape(getUptermCommandLogPath())} 2>/dev/null || echo "No command log"`);
-    if (cmdLog.trim() !== 'No command log') {
-      diagnostics += `- Upterm command output:\n${cmdLog.trim()}\n`;
-    }
-  } catch (error) {
-    diagnostics += `- Could not read command log: ${error}\n`;
-  }
-
   // Check if upterm is in PATH
   try {
     const uptermVersion = await execShellCommand('upterm version 2>&1 || echo "upterm not found in PATH"');
@@ -782,7 +592,7 @@ async function collectDiagnostics(observed?: SessionInfo): Promise<string> {
   diagnostics += `- Platform: ${process.platform}\n`;
 
   diagnostics += '\n=== Troubleshooting Steps ===\n';
-  diagnostics += '1. Check tmux and upterm are installed and in PATH\n';
+  diagnostics += '1. Check upterm is installed and in PATH\n';
   diagnostics += '2. Verify upterm-server setting is correct\n';
   diagnostics += '3. Check network connectivity to upterm server\n';
   diagnostics += '4. Review the logs above for specific error messages\n';
@@ -790,22 +600,6 @@ async function collectDiagnostics(observed?: SessionInfo): Promise<string> {
 
   diagnostics += '\nPlease report this issue with the above diagnostics at: https://github.com/owenthereal/action-upterm/issues';
   return diagnostics;
-}
-
-/**
- * Report whether a guest has joined: true, false, or null for UNKNOWN.
- *
- * Null means upterm answered without the live detail that carries the counts.
- * A missing guestCount must never be read as zero - that would shut down a
- * session a developer is actively attached to.
- *
- * Takes the session rather than fetching one: the post loop already needs a
- * lookup for its terminal check, and two lookups per poll would double the
- * shell-outs and could disagree with each other within a single iteration.
- */
-function guestPresence(session: SessionInfo | null): boolean | null {
-  if (!session?.hasLiveDetail) return null;
-  return (session.guestCount ?? 0) > 0;
 }
 
 /**
@@ -847,41 +641,6 @@ async function pollSession(): Promise<PollResult> {
   }
 }
 
-/**
- * Wait until the session is genuinely usable.
- *
- * Readiness requires BOTH status === 'ready' AND live detail. upterm returns
- * "ready" from the record alone when its admin query fails
- * (cmd/upterm/command/session.go:485-488), and a "ready" session with no
- * sshCommand is one nobody can connect to.
- */
-async function waitForUptermReady(): Promise<SessionInfo> {
-  let tries = UPTERM_READY_MAX_RETRIES;
-  // What the LAST poll saw, if it saw a session - handed to the diagnostics so
-  // the report describes the state that ended the wait.
-  let lastObserved: SessionInfo | undefined;
-
-  while (tries-- > 0) {
-    core.info(`Waiting for upterm to be ready... (${UPTERM_READY_MAX_RETRIES - tries}/${UPTERM_READY_MAX_RETRIES})`);
-    const poll = await pollSession();
-    lastObserved = poll.kind === 'session' ? poll.session : undefined;
-
-    if (poll.kind === 'session') {
-      if (poll.session.status === 'ready' && poll.session.hasLiveDetail) return poll.session;
-      if (isTerminal(poll.session.status)) break;
-    }
-    // 'gone' (the record is not published this early) and 'unknown' (the lookup
-    // itself failed) both mean "not ready YET", never "failed": burn a retry,
-    // exactly as a `starting` status does. An unguarded lookup here would let
-    // one hiccup abandon the remaining retries and fail the job - and would
-    // skip collectDiagnostics(), the report written for precisely this case.
-
-    await sleep(UPTERM_READY_POLL_INTERVAL);
-  }
-
-  throw new Error(await collectDiagnostics(lastObserved));
-}
-
 async function outputSshCommand(session: SessionInfo): Promise<string | null> {
   const sshCommand = session.sshCommand;
   if (!sshCommand) {
@@ -903,19 +662,7 @@ async function outputSshCommand(session: SessionInfo): Promise<string | null> {
 }
 
 async function startUptermSession(): Promise<SessionInfo> {
-  const allowedUsers = getAllowedUsers();
-  const authorizedKeysParameter = buildAuthorizedKeysParameter(allowedUsers);
-  const uptermServer = core.getInput('upterm-server');
-  const waitTimeoutMinutes = core.getInput('wait-timeout-minutes');
-
-  await createUptermSession(uptermServer, authorizedKeysParameter);
-  await sleep(UPTERM_INIT_DELAY);
-
-  if (waitTimeoutMinutes && core.getInput('detached') !== 'true') {
-    await setupSessionTimeout(waitTimeoutMinutes);
-  }
-
-  const session = await waitForUptermReady();
+  const session = await launchSession(core.getInput('upterm-server'), getAllowedUsers());
   await outputSshCommand(session);
   return session;
 }
@@ -934,65 +681,144 @@ function logSessionEnded(session: SessionInfo): void {
   if (session.signal) core.info(`Signal: ${session.signal}`);
 }
 
-async function monitorSession(): Promise<void> {
-  core.debug('Entering main loop');
-  // Main loop: wait for /continue file or upterm exit
-  /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
-  while (true) {
-    if (continueFileExists()) {
-      core.info("Exiting debugging session because '/continue' file was created");
-      break;
-    }
-
-    // Check if timeout was reached before looking the session up
-    if (isTimeoutReached()) {
-      logTimeoutMessage();
-      break;
-    }
-
-    const poll = await pollSession();
-    if (poll.kind === 'gone') {
-      core.info("Exiting debugging session: 'upterm' quit");
-      break;
-    }
-    if (poll.kind === 'session') {
-      if (isTerminal(poll.session.status)) {
-        logSessionEnded(poll.session);
-        break;
-      }
-      if (poll.session.sshCommand) core.info(`Session ${poll.session.name} (${poll.session.status}): ${poll.session.sshCommand}`);
-    }
-    // poll.kind === 'unknown' falls through: a lookup that failed is not a
-    // session that ended. The checks at the top of the loop remain the exits.
-
-    await sleep(SESSION_STATUS_POLL_INTERVAL);
-  }
-}
-
 function continueFileExists(): boolean {
   const continuePath = process.platform === 'win32' ? CONTINUE_FILE_PATHS.win32 : CONTINUE_FILE_PATHS.unix;
   return fs.existsSync(continuePath) || fs.existsSync(path.join(process.env.GITHUB_WORKSPACE ?? '/', 'continue'));
 }
 
-function isTimeoutReached(): boolean {
-  // This is a Node fs check, so it must use the native filesystem path.
-  // getUptermTimeoutFlagPath() returns the MSYS "/c/..." form used by the bash
-  // writer in setupSessionTimeout(); Node cannot resolve that on Windows (it
-  // maps to C:\c\...), so check the native path the flag actually lives at.
-  return fs.existsSync(getUptermDirs().timeoutFlag);
+/**
+ * Ask upterm to end this run's session. Never throws: it is called from the
+ * countdown, from teardown and from a signal handler, and in none of them may
+ * upterm's own exit code, or a transient failure, fail the job.
+ *
+ * `session stop` itself exits 0 and prints "has already ended" for a session
+ * whose record is still there but no longer held (an ordinary completed
+ * session); it exits 1 with "no session named" only when no record exists at
+ * all - which a launch that failed before any record was written, or a fully
+ * reaped session, both produce. That case is expected, not a failure: treated
+ * as a quiet no-op (core.debug), exactly as getSession() does for lookups.
+ */
+async function stopSession(): Promise<void> {
+  const name = getSessionName();
+  try {
+    // Unescaped, as in the launch: generateSessionName() yields gha- + 8 hex
+    // characters, shell-safe by construction.
+    await execShellCommand(`upterm session stop ${name}`, {quiet: true});
+  } catch (error) {
+    if (/no session named/i.test(String(error))) {
+      core.debug(`upterm session ${name} was never started or is already fully gone: ${error}`);
+      return;
+    }
+    core.warning(`Could not stop upterm session ${name}: ${error}`);
+  }
 }
 
-function logTimeoutMessage(): void {
-  core.info('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
-  core.info('The session was automatically shut down to prevent unnecessary resource usage');
+/** wait-timeout-minutes in attached mode: null when unset, so the wait is unbounded. */
+function attachedTimeoutSeconds(): number | null {
+  const input = core.getInput('wait-timeout-minutes');
+  return input ? parseInt(input, 10) * 60 : null;
+}
+
+/** wait-timeout-minutes in detached mode's post step: 10 minutes when unset, as in v1. */
+function detachedTimeoutSeconds(): number {
+  const minutes = parseInt(core.getInput('wait-timeout-minutes') || '10', 10);
+  return (isNaN(minutes) || minutes <= 0 ? 10 : minutes) * 60;
+}
+
+type WaitEnd = 'continue' | 'ended' | 'timeout';
+
+/**
+ * Wait for this run's session to end, for the continue file, or - while no guest
+ * has ever joined - for the countdown to run out, in which case the session is
+ * stopped.
+ *
+ * "Has a guest ever joined" is upterm's firstGuestJoinedAt, never guestCount:
+ * the daemon records it from its own join events, so a guest who came and went
+ * between two polls, or during the build before the post step began, is not
+ * missed, and forwarding-only connections - which guestCount includes - do not
+ * count. Once seen, the countdown is disarmed for the rest of the session.
+ *
+ * Only a lookup that succeeded spends the countdown. A failed one ('unknown')
+ * says nothing about who is there, and spending time on it could stop a session
+ * somebody is in.
+ */
+async function waitForSession(timeoutSeconds: number | null, message: string): Promise<WaitEnd> {
+  let remaining = timeoutSeconds;
+  let joined = false;
+  const noteJoin = (session: SessionInfo) => {
+    if (joined || !hasGuestJoined(session)) return;
+    joined = true;
+    core.info(`A guest joined at ${session.firstGuestJoinedAt}; the session stays up until it ends`);
+  };
+
+  /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
+  while (true) {
+    if (continueFileExists()) {
+      core.info("Exiting debugging session because '/continue' file was created");
+      return 'continue';
+    }
+
+    const poll = await pollSession();
+    if (poll.kind === 'gone') {
+      core.info("Exiting debugging session: 'upterm' quit");
+      return 'ended';
+    }
+    if (poll.kind === 'session') {
+      if (isTerminal(poll.session.status)) {
+        logSessionEnded(poll.session);
+        return 'ended';
+      }
+      noteJoin(poll.session);
+      // Evidence in the log that this process resolved the session main published.
+      core.info(`Session ${poll.session.name} (${poll.session.status})`);
+    }
+
+    const counting = remaining !== null && !joined;
+    console.log(`${counting ? `Waiting for client to connect (at most ${remaining} more second(s))` : 'Waiting for session to end'}\n${message}`);
+
+    if (counting && (remaining as number) <= 0) {
+      // A last look before acting: a guest may have joined since the poll
+      // above, or the session may have ended since then. A failed lookup here
+      // must never spend the countdown or end the wait, exactly like an
+      // ordinary poll - it says nothing about who is there, and could stop a
+      // session somebody is in.
+      const last = await pollSession();
+      if (last.kind === 'gone') {
+        core.info("Exiting debugging session: 'upterm' quit");
+        return 'ended';
+      }
+      if (last.kind === 'session') {
+        if (isTerminal(last.session.status)) {
+          logSessionEnded(last.session);
+          return 'ended';
+        }
+        noteJoin(last.session);
+        if (!joined) {
+          core.warning(`Timed out waiting for client to connect (after ${timeoutSeconds} seconds)`);
+          core.info('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
+          await stopSession();
+          return 'timeout';
+        }
+        continue;
+      }
+      // last.kind === 'unknown': do not stop, and do not spend the countdown
+      // further - it stays at zero. Sleep one interval and let the next
+      // successful poll and re-check decide.
+      await sleep(SESSION_STATUS_POLL_INTERVAL);
+      continue;
+    }
+
+    await sleep(SESSION_STATUS_POLL_INTERVAL);
+    if (counting && poll.kind === 'session') remaining = (remaining as number) - SESSION_STATUS_POLL_INTERVAL / 1000;
+  }
 }
 
 async function runDetachedMode(session: SessionInfo): Promise<void> {
   core.debug('Entering detached mode');
 
-  // waitForUptermReady() already proved this session has a usable connect
-  // string. Re-querying here would let a transient admin-query failure fail a
-  // healthy session moments after startup succeeded.
+  // launchSession() already proved this session has a usable connect string.
+  // Re-querying here would let a transient admin-query failure fail a healthy
+  // session moments after startup succeeded.
   //
   // Emit the notice once; use plain text for the post-action loop
   // to avoid creating duplicate annotations in the GitHub Actions UI.
@@ -1010,7 +836,9 @@ async function runDetachedMode(session: SessionInfo): Promise<void> {
  * Remove this run's private directories.
  *
  * Guarded: rmSync(force) suppresses only ENOENT and defaults to maxRetries 0,
- * so on Windows - where the tee redirects still hold state/*.log open - an
+ * so on Windows - where the upterm process this run started can still be
+ * releasing its own open handle on state/upterm/upterm.log a moment after
+ * `session stop` returns, more strictly enforced there than on POSIX - an
  * unguarded EBUSY would fail a job whose debug session succeeded.
  */
 function cleanupUptermData(): void {
@@ -1026,37 +854,19 @@ function cleanupUptermData(): void {
 }
 
 /**
- * Stop the session this run started, then remove its directories.
+ * Stop the session this run started, then remove its directories. Order
+ * matters: the runtime directory holds the session's live sockets.
  *
- * Order matters: the runtime directory holds the live admin/attach sockets, so
- * removing it under a running host unlinks them out from under it. Nothing in
- * the non-detached path stops the host - monitorSession() merely breaks - so
- * the post step is where teardown happens, for every mode.
- *
- * Process teardown is SCOPED: it kills only the two sessions this action
- * creates, by exact name, never the whole server. The launch uses the default
- * tmux server, which on a self-hosted runner can be one the job did not start -
- * a runner launched with ./run.sh inside tmux, or a developer's machine - and
- * `kill-server` there would take the runner offline mid-job or destroy
- * unrelated sessions. The `=` prefix makes tmux match the name exactly, so a
- * session such as `upterm-dev` is never prefix-matched. Killing a session
- * closes its panes, which delivers the same SIGHUP to `upterm host` that
- * kill-server would.
- *
- * Process teardown is also GUARDED; directory cleanup is not. run() saves
- * isPost before installDependencies(), and post-if is "!cancelled()", so a
- * failed download or a rejected upterm version reaches this function having
- * started nothing - and a session named `upterm` it finds then is not ours.
- * The directories are ours in every case, so removing them stays
- * unconditional.
+ * Guarded by sessionStarted: isPost is saved before installation, and post-if
+ * is "!cancelled()", so a failed download or a rejected upterm version reaches
+ * here having started nothing. The directories are ours either way.
  */
 async function finalizeSession(): Promise<void> {
   if (core.getState('sessionStarted') === 'true') {
-    try {
-      await execShellCommand("tmux kill-session -t '=upterm-wrapper' 2>/dev/null; tmux kill-session -t '=upterm' 2>/dev/null; true");
-    } catch (error) {
-      core.debug(`Could not stop tmux: ${error}`);
-    }
+    // The post step is a fresh process: session stop finds the session through
+    // XDG_STATE_HOME, which only main had exported so far.
+    exportXdgEnvironment();
+    await stopSession();
   }
   cleanupUptermData();
 }
@@ -1070,64 +880,20 @@ async function runPost(): Promise<void> {
 
     exportXdgEnvironment();
 
-    const shutdown = () => {
+    // The runner interrupts a post step it is cancelling. Stop the session on the
+    // way out - through bash, like every other upterm call, because on Windows the
+    // exported XDG paths are MSYS-form and only a bash launch converts them.
+    const shutdown = async () => {
       core.error('Got signal');
-      try {
-        execSync('tmux kill-server');
-      } catch {
-        /* Ignore errors during shutdown */
-      }
+      await stopSession();
       process.exit(1);
     };
-
-    // Support canceling the post-job Action
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
 
     core.debug('Waiting for session to end');
 
-    let waitTimeoutSeconds = parseInt(core.getInput('wait-timeout-minutes') || '10', 10) * 60;
-    if (isNaN(waitTimeoutSeconds) || waitTimeoutSeconds <= 0) {
-      waitTimeoutSeconds = 10 * 60; // Default 10 minutes
-    }
-
-    let anyoneConnected = false;
-
-    for (let seconds = waitTimeoutSeconds; seconds > 0; ) {
-      const poll = await pollSession();
-      const connected = poll.kind === 'session' ? guestPresence(poll.session) : null;
-      if (connected === true) anyoneConnected = true;
-
-      // Prove, in the log, that this fresh post process resolved the SAME named
-      // session that main published - the only visible evidence that XDG state
-      // was restored across the process boundary.
-      if (poll.kind === 'session') core.info(`Session ${poll.session.name} (${poll.session.status})`);
-
-      console.log(`${anyoneConnected ? 'Waiting for session to end' : `Waiting for client to connect (at most ${seconds} more second(s))`}\n${message}`);
-
-      if (continueFileExists()) {
-        core.info("Exiting debugging session because '/continue' file was created");
-        break;
-      }
-
-      if (poll.kind === 'gone') {
-        core.info("Exiting debugging session: 'upterm' quit");
-        break;
-      }
-      if (poll.kind === 'session' && isTerminal(poll.session.status)) {
-        logSessionEnded(poll.session);
-        break;
-      }
-      // poll.kind === 'unknown' falls through: a failed lookup is not a
-      // finished session.
-
-      await sleep(5000);
-      // Only spend the countdown on a CONFIRMED "nobody here". `null` means
-      // upterm could not tell us, and treating that as "nobody" would shut down
-      // a session someone is attached to.
-      if (!anyoneConnected && connected === false) seconds -= 5;
-      if (seconds <= 0) core.warning(`Timed out waiting for client to connect (after ${waitTimeoutSeconds})`);
-    }
+    await waitForSession(detachedTimeoutSeconds(), message);
   } finally {
     await finalizeSession();
   }

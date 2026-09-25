@@ -1,6 +1,6 @@
 # Debug [GitHub Actions](https://github.com/features/actions) With SSH
 
-This GitHub Action enables direct interaction with the host system running your GitHub Actions via SSH, utilizing [upterm](https://upterm.dev/) and [tmux](https://github.com/tmux/tmux/wiki). This setup facilitates real-time GitHub Actions debugging and allows seamless workflow continuation.
+This GitHub Action enables direct interaction with the host system running your GitHub Actions via SSH, utilizing [upterm](https://upterm.dev/). This setup facilitates real-time GitHub Actions debugging and allows seamless workflow continuation.
 
 ## Features
 
@@ -12,6 +12,10 @@ This GitHub Action enables direct interaction with the host system running your 
 - **Linux** - Fully supported
 - **macOS** - Fully supported
 - **Windows** - Supported (requires MSYS2, automatically installed on GitHub Actions Windows runners)
+
+## Requirements
+
+This action installs [upterm](https://upterm.dev/) v0.31.0 or newer automatically. If you pin an older release with `upterm-version`, the action refuses to start (including a version string it cannot parse) — pin `owenthereal/action-upterm@v1` instead if you need an older upterm.
 
 ## Getting Started
 
@@ -26,7 +30,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Setup upterm session
-      uses: owenthereal/action-upterm@v1
+      uses: owenthereal/action-upterm@v2
 ```
 
 Access the SSH connection string in the `Checks` tab of your Pull Request.
@@ -44,7 +48,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Setup upterm session
-      uses: owenthereal/action-upterm@v1
+      uses: owenthereal/action-upterm@v2
       with:
         limit-access-to-actor: true # Restrict to the user who triggered the workflow
         limit-access-to-users: githubuser1,githubuser2 # Specific authorized users only
@@ -66,7 +70,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Setup upterm session
-      uses: owenthereal/action-upterm@v1
+      uses: owenthereal/action-upterm@v2
       with:
         ## Use the deployed Upterm server via Websocket or SSH
         upterm-server: wss://YOUR_HEROKU_APP_URL
@@ -74,7 +78,7 @@ jobs:
 
 ## Pin a Specific Upterm Version
 
-By default, the action downloads the latest Upterm release directly from GitHub. To pin a specific release (for example, `v0.30.0`), provide the optional `upterm-version` input:
+By default, the action downloads the latest Upterm release directly from GitHub. To pin a specific release (for example, `v0.31.0`), provide the optional `upterm-version` input:
 
 ```yaml
 name: CI
@@ -85,18 +89,17 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Setup upterm session
-      uses: owenthereal/action-upterm@v1
+      uses: owenthereal/action-upterm@v2
       with:
-        upterm-version: v0.30.0
+        upterm-version: v0.31.0
 ```
 
 - Works on all platforms (Linux, macOS, and Windows).
-- On macOS, Upterm is installed from the GitHub release tarball (Homebrew is still used for installing `tmux` only).
-- **Upterm versions below `v0.30.0` are not supported.** This action addresses its session by name via `upterm session info`, an API that does not exist before `v0.30.0`; the action fails fast at startup if it detects an older version. If you need an older Upterm, pin `owenthereal/action-upterm@v1.15.0` instead of `@v1` — that release predates this requirement.
+- **Upterm versions below `v0.31.0` are refused.** v0.31.0 is the first release that reports whether a guest has joined a session, which the timeout behavior below depends on; the action fails fast at startup against an older (or unparseable) version. If you need an older Upterm, pin `owenthereal/action-upterm@v1` instead of `@v2`.
 
 ## Shut Down the Server if No User Connects
 
-If no user connects, the server automatically shuts down after a specified time. This feature is handy for deploying `action-upterm` to provide a debug shell on job failure without unnecessarily prolonging pipeline operation.
+If no guest ever joins, the session shuts down after a specified time. This feature is handy for deploying `action-upterm` to provide a debug shell on job failure without unnecessarily prolonging pipeline operation.
 
 ```yaml
 name: CI
@@ -107,12 +110,14 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Setup upterm session
-      uses: owenthereal/action-upterm@v1
+      uses: owenthereal/action-upterm@v2
       if: ${{ failure() }}
       with:
         ## Shut down the server if unconnected after 5 minutes.
         wait-timeout-minutes: 5
 ```
+
+The countdown is disarmed the moment upterm records that a guest has joined — even a guest who joined and left again between polls, or (in detached mode) joined and left while the rest of the job was still running. Once that has happened, the countdown does not run again: the session stays up until it ends on its own.
 
 ## Detached Mode
 
@@ -127,14 +132,14 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Setup upterm session
-      uses: owenthereal/action-upterm@v1
+      uses: owenthereal/action-upterm@v2
       with:
         detached: true
     - name: Run tests with debug session available
       run: npm test
 ```
 
-By default, detached mode waits at the end of the job for a user to connect and then terminate the session. If no user connects within the timeout period (default 10 minutes), it terminates the session gracefully.
+By default, detached mode's countdown starts after all regular steps finish, and waits for a guest to join before terminating the session. If no guest joins within the timeout period (default 10 minutes), it terminates the session gracefully. If the job is cancelled, the post step that runs this countdown does not run at all — the runner's own orphan sweep ends the session once the job finishes.
 
 As this mode has turned out to be so useful as to having the potential for being the default mode once time travel becomes available, it is also available as `owenthereal/action-upterm/detached` for convenience.
 
@@ -150,24 +155,24 @@ cd $GITHUB_WORKSPACE && touch continue
 sudo touch /continue
 ```
 
-Press `C-b` followed by `d` (tmux detach command keys) to detach from the terminal without resuming the workflow.
+How you leave the SSH connection matters:
+
+- ssh's own `~.` escape sequence (or just closing your terminal window) only disconnects your terminal — the session itself keeps running and waiting for a client, and the workflow does not resume. Reconnect with the same SSH command to pick up where you left off.
+- Typing `exit` or pressing `Ctrl-D` sends EOF to the session's shell, which quits. That ends the session, and the workflow resumes immediately as a result.
+- Touching the continue file resumes the workflow the same way `exit`/`Ctrl-D` does, but without ending the session: it keeps running, reachable over SSH, until the job's post step stops it at the end of the job — the same cleanup that stops any session still up when the job finishes.
 
 ## Usage Tips
 
-### Resizing the tmux Window
+### Inside the Session
 
-After connecting via SSH:
-
-- Press `control-b`, then type `:resize-window -A` and press `<enter>`
-
-This will resize the console to the full width and height of the connected terminal.
-([Learn more](https://unix.stackexchange.com/a/570015))
+- Run `upterm session current` to see this session's own connection details from inside the SSH session.
+- Run `touch $GITHUB_WORKSPACE/continue` (see [Continue a Workflow](#continue-a-workflow)) to resume the workflow from inside the session, without needing another shell on the runner.
 
 ### Windows Support
 
 Windows runners are fully supported through MSYS2 (pre-installed on GitHub Actions Windows runners). The action automatically:
 - Downloads the Windows build of upterm
-- Installs tmux via pacman (MSYS2 package manager)
+- Runs the session as an MSYS2 login bash shell (`bash -l`)
 - Handles Windows/POSIX path format conversions internally
 
 **Continue file locations on Windows:**
@@ -178,3 +183,28 @@ cd $GITHUB_WORKSPACE && touch continue
 # Or at the MSYS2 root (may require elevation)
 touch /c/msys64/continue
 ```
+
+## Migrating from v1
+
+- **No more tmux.** v1 hosted the session inside a nested tmux, with its own keybindings (`C-b` prefix) for detaching and resizing. v2 lets upterm host the session directly: there is no tmux prefix, the shared terminal follows the connecting guest's size (v1 pinned it to 132x43), and ssh's own escape sequence (or closing the terminal window) is how you detach without resuming the workflow — see [Continue a Workflow](#continue-a-workflow) above for how that differs from ending the session.
+- **The hosted shell is now upterm's own default, not tmux's login shell.** v1's tmux started a login shell; v2 runs `$SHELL` directly (non-login), falling back to `/bin/sh` if `SHELL` is unset — which some self-hosted runners don't set. On Windows the hosted command is unchanged: MSYS2's login bash (`bash -l`).
+- **Requires upterm v0.31.0 or newer.** See [Requirements](#requirements) above; pin `@v1` if you need an older upterm.
+- **`upterm session current` works inside the session** — upterm itself injects `UPTERM_ADMIN_SOCKET` and `UPTERM_SESSION_NAME`, so no wrapper configuration is needed for it to resolve.
+- **Windows no longer uses WMI to launch the session.** See [ARCHITECTURE.md](ARCHITECTURE.md#why-no-wmi) for why.
+
+## Maintainers: Acceptance Tests
+
+`yarn test:e2e` (act) proves the action's behavior on Linux, but act has no orphan-process sweep and cannot run Windows or macOS jobs. Cancellation — before and after a guest joins — and the long-build and guest-leaves-before-post cases on Windows and macOS can only be proven against real GitHub-hosted runners.
+
+`.github/workflows/acceptance.yml` is a `workflow_dispatch` workflow (inputs: `runs-on`, `scenario`) that starts a detached session and either sleeps through a long "build" or a cancellable one. `script/acceptance` drives it end to end: dispatch, download the published `ssh-command` artifact, join as a guest over SSH, cancel the run when the scenario calls for it, then fetch the completed job's log and assert specific lines appear (or don't).
+
+```bash
+script/acceptance ubuntu-latest cancel                 # cancel with no guest
+script/acceptance --with-guest windows-latest cancel    # cancel after a guest joins
+script/acceptance macos-latest long-build
+script/acceptance macos-latest guest-before-post
+```
+
+Every scenario's guest join uses the operator's own default SSH identity/agent (no `-i`, no `-o IdentityAgent=none`) — the fixture sets `limit-access-to-actor: true`, so only the GitHub account that dispatched the run, at its own keyboard, can join as the actor. This is the one place a real personal identity is used, by the maintainer's choice; the e2e fixtures instead generate a throwaway keypair because their sessions are open to anyone.
+
+`workflow_dispatch` only triggers a workflow file that's on the repo's default branch, so pre-merge validation runs a copy of the workflow pushed to a throwaway branch of a scratch repo, and `script/acceptance --run-id <id> …` (which skips the dispatch) attaches to the run it produced. Because cancellation is run-level, cancel scenarios run in their own runs, separate from the non-cancel ones.

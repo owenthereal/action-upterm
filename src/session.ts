@@ -30,6 +30,15 @@ export interface SessionInfo {
   exitCode?: number;
   signal?: string;
   /**
+   * When the first guest's session was accepted, as upterm records it (v0.31.0+).
+   *
+   * Session-lifetime and published by the daemon from its own join events, so
+   * it is set even for a guest who joined and left between two of our polls,
+   * and it survives the session: an ended session's record still carries it.
+   * Absent until a guest joins. Forwarding-only connections never set it.
+   */
+  firstGuestJoinedAt?: string;
+  /**
    * True when upterm's admin query succeeded and the detail fields above are
    * trustworthy.
    *
@@ -106,7 +115,12 @@ export async function getSession(name: string): Promise<SessionInfo | null> {
   return parseSessionInfo(raw);
 }
 
-export const UPTERM_MIN_VERSION = {major: 0, minor: 30, patch: 0};
+/**
+ * v0.31.0 is the first upterm that publishes firstGuestJoinedAt. Below it the
+ * field is always absent, which v2 would read as "nobody has joined" and stop a
+ * session someone is sitting in — so older versions are refused, not guessed at.
+ */
+export const UPTERM_MIN_VERSION = {major: 0, minor: 31, patch: 0};
 
 export interface UptermVersion {
   major: number;
@@ -129,6 +143,15 @@ export function parseUptermVersion(output: string): UptermVersion | null {
   const match = output.match(/version\s+v?(\d+)\.(\d+)\.(\d+)/i);
   if (!match) return null;
   return {major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3])};
+}
+
+/** Whether upterm has recorded a qualifying guest join for this session. */
+export function hasGuestJoined(session: SessionInfo): boolean {
+  return typeof session.firstGuestJoinedAt === 'string' && session.firstGuestJoinedAt.length > 0;
+}
+
+export function formatVersion(v: UptermVersion): string {
+  return `v${v.major}.${v.minor}.${v.patch}`;
 }
 
 export function isUptermVersionSupported(v: UptermVersion): boolean {

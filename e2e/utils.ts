@@ -1,4 +1,16 @@
 import {spawn, execSync, ChildProcess} from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+
+/**
+ * Ceiling for the SSH command line to appear in act's output: act's image
+ * pull plus upterm's own release download, both of which can be slow under
+ * load. Exported so e2e.test.ts can budget every watcher that causally
+ * depends on the SSH line against the same number instead of a copy that can
+ * drift out of sync with it.
+ */
+export const SSH_COMMAND_TIMEOUT_MS = 240000; // 4 minutes
 
 /**
  * Run act to start an e2e-fixture workflow locally
@@ -12,10 +24,18 @@ export function runActWorkflow(options?: {workflowFile?: string; job?: string}):
 } {
   const workflowFile = options?.workflowFile ?? '.github/workflows/e2e-fixture.yml';
   const job = options?.job ?? 'upterm';
-  const actProcess = spawn('act', ['workflow_dispatch', '-W', workflowFile, '-j', job, '--container-architecture', 'linux/amd64'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    cwd: process.cwd()
-  });
+  const actProcess = spawn(
+    'act',
+    // '-' disables bind-mounting the host's docker.sock into the job container.
+    // None of the fixtures run docker; the bind-mount itself fails under
+    // colima's virtiofs-shared socket (mkdir over a socket node, ENOTSUP),
+    // which would otherwise fail every job at container creation.
+    ['workflow_dispatch', '-W', workflowFile, '-j', job, '--container-architecture', 'linux/amd64', '--container-daemon-socket', '-'],
+    {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: process.cwd()
+    }
+  );
 
   const sshCommandPromise = new Promise<string>((resolve, reject) => {
     let settled = false;
@@ -24,7 +44,7 @@ export function runActWorkflow(options?: {workflowFile?: string; job?: string}):
         settled = true;
         reject(new Error('Timeout waiting for SSH command in act output'));
       }
-    }, 180000); // 3 minutes
+    }, SSH_COMMAND_TIMEOUT_MS);
 
     actProcess.stdout?.on('data', (data: Buffer) => {
       const chunk = data.toString();
@@ -105,66 +125,81 @@ export function runActWorkflow(options?: {workflowFile?: string; job?: string}):
   return {process: actProcess, sshCommandPromise, waitForOutput, killProcess};
 }
 
+let guestIdentityPath: string | null = null;
+
 /**
- * Check SSH connectivity to upterm session.
- * Upterm uses ForceCommand (tmux attach) which requires a TTY, so we can't run arbitrary commands.
- * Instead, we verify that SSH authentication succeeds by checking the stderr for the known_hosts message.
- * Exit code 1 is expected because tmux attach fails without a TTY.
+ * A throwaway ed25519 keypair for the guest's ssh connections, generated once
+ * per test process and reused by every joinAsGuest call.
+ *
+ * The fixtures set no access limits (open sessions), so any key
+ * authenticates - but the host running the tests may have no default
+ * identity at all (a fresh GitHub-hosted runner has no ~/.ssh/id_*, unlike a
+ * developer's machine), in which case ssh's own default-identity search
+ * finds nothing to offer and the relay replies "Permission denied
+ * (publickey)". Generating our own removes that dependency on whatever (if
+ * anything) happens to already be under ~/.ssh on the host.
  */
-export async function sshCheckConnectivity(sshCommand: string, retries = 3): Promise<void> {
-  // Parse the ssh command to extract user@host
-  const match = sshCommand.match(/ssh\s+(\S+)/);
-  if (!match) {
-    throw new Error(`Invalid SSH command format: ${sshCommand}`);
-  }
-  const target = match[1];
+function ensureGuestIdentity(): string {
+  if (guestIdentityPath) return guestIdentityPath;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'e2e-guest-identity-'));
+  const keyPath = path.join(dir, 'id_ed25519');
+  execSync(`ssh-keygen -q -t ed25519 -N "" -f ${JSON.stringify(keyPath)}`);
+  guestIdentityPath = keyPath;
+  return keyPath;
+}
 
-  let lastError: Error | null = null;
-
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      await new Promise<void>((resolve, reject) => {
-        // Use -T to disable pseudo-terminal allocation (we expect tmux to fail)
-        // Use short timeout since we just want to verify authentication
-        const proc = spawn('ssh', ['-T', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=10', target], {stdio: ['pipe', 'pipe', 'pipe']});
-
-        let stderr = '';
-
-        proc.stderr.on('data', data => {
-          stderr += data.toString();
-        });
-
-        proc.on('close', code => {
-          // Check if SSH connected successfully (indicated by known_hosts message)
-          // Exit code 1 is expected because tmux attach fails without a TTY
-          if (stderr.includes('uptermd.upterm.dev')) {
-            // SSH connected and authenticated successfully
-            console.log(`SSH authentication succeeded (exit code ${code} expected due to no TTY)`);
-            resolve();
-          } else if (code === 255) {
-            // SSH connection failed entirely
-            reject(new Error(`SSH connection failed: ${stderr || 'no stderr'}`));
-          } else {
-            // Other errors might still indicate success if we got past authentication
-            console.log(`SSH exited with code ${code}, stderr: ${stderr}`);
-            resolve();
-          }
-        });
-
-        proc.on('error', reject);
-      });
-      return;
-    } catch (error) {
-      lastError = error as Error;
-      console.log(`SSH attempt ${attempt}/${retries} failed: ${lastError.message}`);
-      if (attempt < retries) {
-        console.log(`Waiting 3 seconds before retry...`);
-        await sleep(3000);
+/**
+ * Join the session as a guest for holdMs, then leave without ending it.
+ *
+ * -tt allocates a pty with no local terminal, which is an accepted session
+ * channel - a qualifying join for upterm's firstGuestJoinedAt. Leaving by
+ * killing ssh (not by typing exit) leaves the shared shell running.
+ * Resolves with everything the guest saw; rejects loudly if the guest never
+ * actually authenticated, rather than resolving with a transcript nobody
+ * checks (both callers that only wait for firstGuestJoinedAt to appear, not
+ * for a specific string in the guest's own output, would otherwise see a
+ * failed join only as a much harder to diagnose pattern timeout minutes
+ * later - the post step polling for a join that can never come).
+ */
+export async function joinAsGuest(sshCommand: string, holdMs: number, input = ''): Promise<string> {
+  const target = (sshCommand.match(/ssh\s+(\S+)/) ?? [])[1];
+  if (!target) throw new Error(`Invalid SSH command format: ${sshCommand}`);
+  const identity = ensureGuestIdentity();
+  return new Promise((resolve, reject) => {
+    // IdentitiesOnly and IdentityAgent=none restrict ssh to exactly this key,
+    // so behavior doesn't vary with whatever else - another default
+    // identity, a developer's own agent - the host running the test happens
+    // to have.
+    const proc = spawn('ssh', ['-tt', '-i', identity, '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=10', target], {
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    let seen = '';
+    let holdElapsed = false;
+    proc.stdout.on('data', d => (seen += d.toString()));
+    proc.stderr.on('data', d => (seen += d.toString()));
+    if (input) setTimeout(() => proc.stdin.write(input), 1000);
+    const timer = setTimeout(() => {
+      holdElapsed = true;
+      proc.kill('SIGTERM');
+    }, holdMs);
+    proc.on('close', code => {
+      clearTimeout(timer);
+      // A successful join is only ever closed by us, once holdMs elapses.
+      // Anything that closes on its own first - especially with "Permission
+      // denied" in its output, or ssh's own auth-failure exit code 255 -
+      // never joined at all.
+      if (!holdElapsed && (/Permission denied/i.test(seen) || code === 255)) {
+        reject(new Error(`Guest failed to authenticate to the relay: ${seen}`));
+        return;
       }
-    }
-  }
+      resolve(seen);
+    });
+    proc.on('error', reject);
+  });
+}
 
-  throw lastError || new Error('SSH failed after all retries');
+export function dockerExec(container: string, cmd: string): string {
+  return execSync(`docker exec ${container} sh -c ${JSON.stringify(cmd)}`, {encoding: 'utf8'});
 }
 
 /**
@@ -184,11 +219,4 @@ export function findContainer(nameSubstring: string): string {
     throw new Error(`Expected exactly one container matching "${nameSubstring}", found ${names.length}: ${names.join(', ')}`);
   }
   return names[0];
-}
-
-/**
- * Send tmux keys to a session inside a Docker container.
- */
-export function dockerExecTmuxSendKeys(container: string, tmuxTarget: string, keys: string): void {
-  execSync(`docker exec ${container} tmux send-keys -t ${tmuxTarget} ${keys}`, {encoding: 'utf8'});
 }

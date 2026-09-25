@@ -150,13 +150,6 @@ describe('Path handling', () => {
   });
 
   describe('Path usage patterns', () => {
-    it('should use toShellPath for SSH key paths', () => {
-      // SSH key generation uses toShellPath
-      const idRsaPath = 'C:\\Users\\foo\\.ssh\\id_rsa';
-      const shellPath = idRsaPath.replace(/\\/g, '/');
-      expect(shellPath).toBe('C:/Users/foo/.ssh/id_rsa');
-    });
-
     it('should use toMsys2Path for XDG environment variables on Windows', () => {
       Object.defineProperty(process, 'platform', {
         value: 'win32',
@@ -181,12 +174,6 @@ describe('Path handling', () => {
       result = result.replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`);
 
       expect(result).toBe('/c/temp/upterm-action-XXXXXX/state/upterm-command.log');
-    });
-
-    it('should preserve toShellPath format for tmux config when invoked from bash', () => {
-      const tmuxConfPath = 'C:/temp/upterm-action-XXXXXX/tmux.conf';
-      const shellPath = tmuxConfPath.replace(/\\/g, '/');
-      expect(shellPath).toBe('C:/temp/upterm-action-XXXXXX/tmux.conf');
     });
   });
 });

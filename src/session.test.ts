@@ -1,4 +1,4 @@
-import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported} from './session';
+import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion} from './session';
 import {execShellCommand} from './helpers';
 
 jest.mock('./helpers', () => ({
@@ -157,15 +157,46 @@ describe('parseUptermVersion', () => {
   });
 });
 
+describe('hasGuestJoined', () => {
+  it('is true once upterm has published firstGuestJoinedAt', () => {
+    const s = parseSessionInfo(JSON.stringify({name: 'gha-1', status: 'ready', firstGuestJoinedAt: '2026-09-23T04:12:15.3725867Z'}));
+    expect(hasGuestJoined(s)).toBe(true);
+  });
+
+  it('is false when the field is absent, whatever guestCount says', () => {
+    // guestCount counts forwarding-only presence, which does not qualify, and
+    // is a current count; only the published timestamp answers "ever joined".
+    const s = parseSessionInfo(JSON.stringify({name: 'gha-1', status: 'ready', sshCommand: 'ssh x@y', guestCount: 1}));
+    expect(hasGuestJoined(s)).toBe(false);
+  });
+
+  it('is false for an empty string', () => {
+    const s = parseSessionInfo(JSON.stringify({name: 'gha-1', status: 'ready', firstGuestJoinedAt: ''}));
+    expect(hasGuestJoined(s)).toBe(false);
+  });
+
+  it('holds for an ended session, read from the record', () => {
+    const s = parseSessionInfo(JSON.stringify({name: 'gha-1', status: 'ended', reason: 'stopped', firstGuestJoinedAt: '2026-09-23T04:12:15Z'}));
+    expect(hasGuestJoined(s)).toBe(true);
+  });
+});
+
+describe('formatVersion', () => {
+  it('renders a v-prefixed triple', () => {
+    expect(formatVersion({major: 0, minor: 31, patch: 0})).toBe('v0.31.0');
+  });
+});
+
 describe('isUptermVersionSupported', () => {
-  it('accepts 0.30.0 and newer', () => {
-    expect(isUptermVersionSupported({major: 0, minor: 30, patch: 0})).toBe(true);
-    expect(isUptermVersionSupported({major: 0, minor: 31, patch: 2})).toBe(true);
+  it('accepts 0.31.0 and newer', () => {
+    expect(isUptermVersionSupported({major: 0, minor: 31, patch: 0})).toBe(true);
+    expect(isUptermVersionSupported({major: 0, minor: 31, patch: 4})).toBe(true);
+    expect(isUptermVersionSupported({major: 0, minor: 32, patch: 0})).toBe(true);
     expect(isUptermVersionSupported({major: 1, minor: 0, patch: 0})).toBe(true);
   });
 
-  it('rejects anything older', () => {
+  it('rejects 0.30.x, which cannot report whether a guest ever joined', () => {
+    expect(isUptermVersionSupported({major: 0, minor: 30, patch: 9})).toBe(false);
     expect(isUptermVersionSupported({major: 0, minor: 29, patch: 0})).toBe(false);
-    expect(isUptermVersionSupported({major: 0, minor: 20, patch: 0})).toBe(false);
   });
 });

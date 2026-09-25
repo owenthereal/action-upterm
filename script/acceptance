@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+# script/acceptance — drive .github/workflows/acceptance.yml against a real
+# GitHub Actions runner and assert on the resulting job log.
+#
+# act (which runs the e2e-fixture-*.yml jobs) has no orphan-process sweep and
+# cannot run Windows or macOS, so cancellation - and the long-build and
+# guest-leaves-before-post cases on Windows/macOS - can only be proven
+# against real runners. This script dispatches the workflow (or attaches to
+# an already-running run via --run-id, for pre-merge validation from a
+# throwaway branch elsewhere - see README.md's "Maintainers: acceptance
+# tests" section), joins the session over SSH exactly like a human guest
+# would, and asserts specific lines appear (or don't) in the job's log.
+#
+# Every scenario's guest join uses the operator's own default SSH
+# identity/agent - no -i, no -o IdentityAgent=none. limit-access-to-actor
+# authorizes the GitHub account that dispatched the run, and only the person
+# running this script, at their own keyboard, can join as that account. This
+# is the one place a real personal identity is used, by the maintainer's
+# choice - unlike the e2e fixtures, which generate a throwaway keypair
+# because their sessions are open to anyone.
+#
+# Usage:
+#   script/acceptance [--repo OWNER/REPO] [--ref REF] [--workflow FILE] \
+#     [--run-id ID] [--with-guest] RUNS_ON SCENARIO
+#
+# RUNS_ON:  ubuntu-latest | macos-latest | windows-latest | windows-2022
+# SCENARIO: cancel | long-build | guest-before-post
+#
+#   --repo OWNER/REPO  Repo to dispatch/inspect (default: owenthereal/action-upterm)
+#   --ref REF           Branch to dispatch from (default: main; ignored with --run-id)
+#   --workflow FILE      Workflow file name (default: acceptance.yml)
+#   --run-id ID          Skip dispatch; assert against a run that's already going.
+#                         Needed for pre-merge validation, since workflow_dispatch
+#                         only works for a workflow file on the repo's default
+#                         branch.
+#   --with-guest          cancel only: join as the actor for 5s before cancelling.
+set -euo pipefail
+
+repo="owenthereal/action-upterm"
+ref=""
+workflow="acceptance.yml"
+run_id=""
+with_guest=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) repo=$2; shift 2 ;;
+    --ref) ref=$2; shift 2 ;;
+    --workflow) workflow=$2; shift 2 ;;
+    --run-id) run_id=$2; shift 2 ;;
+    --with-guest) with_guest=true; shift ;;
+    --) shift; break ;;
+    -*) echo "Unknown flag: $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+
+if [ $# -ne 2 ]; then
+  echo "Usage: script/acceptance [--repo OWNER/REPO] [--ref REF] [--workflow FILE] [--run-id ID] [--with-guest] RUNS_ON SCENARIO" >&2
+  exit 2
+fi
+runs_on=$1
+scenario=$2
+
+case "$scenario" in
+  cancel | long-build | guest-before-post) ;;
+  *)
+    echo "Unknown scenario: $scenario (want cancel, long-build, or guest-before-post)" >&2
+    exit 2
+    ;;
+esac
+
+failures=0
+pass() { echo "PASS: $1"; }
+fail() {
+  echo "FAIL: $1"
+  failures=$((failures + 1))
+}
+
+assert_contains() {
+  local desc=$1 pattern=$2 log=$3
+  if grep -Eq -- "$pattern" "$log"; then
+    pass "$desc"
+  else
+    fail "$desc (pattern not found: $pattern)"
+  fi
+}
+
+assert_not_contains() {
+  local desc=$1 pattern=$2 log=$3
+  if grep -Eq -- "$pattern" "$log"; then
+    fail "$desc (unexpectedly found: $pattern)"
+  else
+    pass "$desc"
+  fi
+}
+
+# Asserts each pattern is found, and that the line numbers strictly increase
+# (i.e. the patterns appear in this order in the log).
+assert_order() {
+  local desc=$1 log=$2
+  shift 2
+  local prev_line=0 pattern line
+  for pattern in "$@"; do
+    line=$(grep -nE -- "$pattern" "$log" | head -1 | cut -d: -f1 || true)
+    if [ -z "$line" ]; then
+      fail "$desc (pattern not found: $pattern)"
+      return
+    fi
+    if [ "$line" -le "$prev_line" ]; then
+      fail "$desc (out of order at: $pattern)"
+      return
+    fi
+    prev_line=$line
+  done
+  pass "$desc"
+}
+
+# Epoch seconds for an RFC3339 UTC timestamp (fractional seconds optional,
+# stripped before parsing since BSD date can't take them). Tries GNU date
+# first, then BSD/macOS date's -j -f.
+to_epoch() {
+  local ts
+  ts=$(printf '%s' "$1" | sed -E 's/\.[0-9]+Z$/Z/')
+  date -u -d "$ts" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || true
+}
+
+# GitHub Actions echoes a step's own script back to the log at step start
+# (ANSI-colored, e.g. '^[[36;1mecho "BUILD_FINISHED"^[[0m'), so a bare
+# 'BUILD_FINISHED' grep matches that echo - which always precedes the actual
+# runtime output - instead of the line the running script prints. Anchored to
+# "<timestamp>Z BUILD_FINISHED<end of line>" so it can only match the runtime
+# line; the echo has ANSI escapes between "Z " and "BUILD_FINISHED" and more
+# text (the closing escape) after it, so it can't match this pattern.
+build_finished_runtime_pattern='[0-9]Z BUILD_FINISHED[[:space:]]*$'
+
+# The post step prints "A guest joined at <firstGuestJoinedAt>", upterm's own
+# recorded join time - not the log line's own print time, which is always
+# later (the post step only starts after Build finishes, so a plain line-order
+# check can't tell a build-time join from a post-step-time one; both always
+# print after BUILD_FINISHED in the raw log). Compares the recorded VALUE
+# against BUILD_FINISHED's own log-line timestamp instead.
+assert_join_precedes_build() {
+  local desc=$1 log=$2
+  local join_ts build_ts join_epoch build_epoch
+  join_ts=$(grep -E 'A guest joined at' "$log" | head -1 | sed -E 's/.*A guest joined at ([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z).*/\1/') || true
+  build_ts=$(grep -E -- "$build_finished_runtime_pattern" "$log" | head -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' | head -1) || true
+  if [ -z "$join_ts" ] || [ -z "$build_ts" ]; then
+    fail "$desc (could not find both timestamps: join=${join_ts:-<none>} build=${build_ts:-<none>})"
+    return
+  fi
+  join_epoch=$(to_epoch "$join_ts") || true
+  build_epoch=$(to_epoch "$build_ts") || true
+  if [ -z "$join_epoch" ] || [ -z "$build_epoch" ]; then
+    fail "$desc (could not parse a timestamp: join=$join_ts build=$build_ts)"
+    return
+  fi
+  if [ "$join_epoch" -le "$build_epoch" ]; then
+    pass "$desc (joined $join_ts, BUILD_FINISHED $build_ts)"
+  else
+    fail "$desc (joined $join_ts, which is after BUILD_FINISHED at $build_ts)"
+  fi
+}
+
+# --- dispatch or reuse a run -------------------------------------------------
+
+if [ -n "$run_id" ]; then
+  echo "Using existing run $run_id (skipping dispatch)"
+else
+  dispatch_ref=${ref:-main}
+  # Unique per dispatch, not per clock: a "first run created at/after now"
+  # lookup attaches to whoever else's concurrent dispatch got there first, and
+  # clock skew between this machine and GitHub can make it never find the
+  # run at all. The workflow's run-name embeds this nonce, so the run this
+  # invocation started is found by an exact match on that, regardless of what
+  # else is running concurrently.
+  nonce="acc-$$-$RANDOM-$(date +%s)"
+  echo "Dispatching $workflow on $repo@$dispatch_ref (runs-on=$runs_on scenario=$scenario nonce=$nonce)"
+  gh workflow run "$workflow" --repo "$repo" --ref "$dispatch_ref" \
+    -f "runs-on=$runs_on" -f "scenario=$scenario" -f "nonce=$nonce"
+
+  for _ in $(seq 1 24); do
+    run_id=$(gh run list --repo "$repo" --workflow "$workflow" --event workflow_dispatch \
+      -L 20 --json databaseId,displayTitle \
+      --jq "[.[] | select(.displayTitle | contains(\"$nonce\"))] | .[0].databaseId // empty") || true
+    if [ -n "$run_id" ]; then
+      break
+    fi
+    sleep 5
+  done
+  if [ -z "$run_id" ]; then
+    echo "Could not find the dispatched run (nonce=$nonce)" >&2
+    exit 1
+  fi
+fi
+
+run_url=$(gh run view "$run_id" --repo "$repo" --json url --jq .url)
+echo "Run: $run_url"
+
+# --- helpers ------------------------------------------------------------
+
+# Poll for the ssh-command artifact (uploaded early, downloadable while the
+# run is still in progress) and print its contents.
+download_ssh_command() {
+  local dir
+  dir=$(mktemp -d)
+  for _ in $(seq 1 60); do
+    if gh run download "$run_id" --repo "$repo" -n ssh-command -D "$dir" >/dev/null 2>&1 && [ -s "$dir/ssh-command.txt" ]; then
+      tr -d '\r\n' <"$dir/ssh-command.txt"
+      rm -rf "$dir"
+      return 0
+    fi
+    sleep 5
+  done
+  rm -rf "$dir"
+  echo "Timed out waiting for the ssh-command artifact" >&2
+  return 1
+}
+
+# Join the session as the operator (see the header comment on identity).
+# Sends a computed marker (an expression only the guest's own shell can
+# evaluate: "echo J_$((6*7))") as soon as the connection is up, and waits -
+# bounded to marker_bound seconds - until "J_42" is echoed back in the
+# captured output. That proves the join actually completed (SSH handshake,
+# auth, and the session channel), not just that ssh was invoked; a short
+# hold can otherwise end before all of that finishes. Only once the marker
+# is proven does it send input (if any) and hold for hold_seconds - or
+# until the remote side closes first, e.g. after input="exit\n" - then
+# disconnect. Prints the guest's captured output on stdout, always. Returns
+# 0 only when the marker was proven and the hold then ran its course
+# (whether ended by us or by a deliberate remote exit); returns non-zero -
+# the marker-wait timeout, or ssh's own exit status when ssh gave up early
+# (e.g. "Permission denied", 255) - if the join was never proven. A caller
+# running under `set -e` must capture that status explicitly rather than
+# call this bare.
+join_session() {
+  local target=$1 hold_seconds=$2 input=${3:-}
+  local marker_bound=30
+  local out fifo status=0 waited=0 joined=false
+  out=$(mktemp)
+  fifo=$(mktemp -u)
+  mkfifo "$fifo"
+  exec 3<>"$fifo"
+  rm -f "$fifo"
+
+  ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+    -o ForwardAgent=no -o ClearAllForwardings=yes \
+    "$target" <&3 >"$out" 2>&1 &
+  local ssh_pid=$!
+
+  local marker=$'echo J_$((6*7))\n'
+  printf '%s' "$marker" >&3
+
+  while [ "$waited" -lt "$marker_bound" ]; do
+    if grep -q 'J_42' "$out" 2>/dev/null; then
+      joined=true
+      break
+    fi
+    if ! kill -0 "$ssh_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if [ "$joined" = true ]; then
+    if [ -n "$input" ]; then
+      printf '%s' "$input" >&3
+    fi
+    waited=0
+    while kill -0 "$ssh_pid" 2>/dev/null && [ "$waited" -lt "$hold_seconds" ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+  fi
+
+  exec 3>&-
+  if kill -0 "$ssh_pid" 2>/dev/null; then
+    # Either the marker never showed up within the bound and we're giving
+    # up, or the hold ran its course; either way we're ending it ourselves -
+    # not a failure, whatever status a killed ssh reports.
+    kill -TERM "$ssh_pid" 2>/dev/null || true
+    wait "$ssh_pid" 2>/dev/null || true
+  else
+    # ssh already exited on its own: either a deliberate remote exit (e.g.
+    # after "exit", which exits 0), or ssh itself failed (e.g. permission
+    # denied, connection refused) - capture its real status.
+    wait "$ssh_pid" 2>/dev/null || status=$?
+  fi
+
+  if [ "$joined" != true ] && [ "$status" -eq 0 ]; then
+    # The marker never appeared and ssh didn't report a failure status
+    # either (e.g. it was still connected when the bound ran out) - still a
+    # failed proof.
+    status=1
+  fi
+
+  cat "$out"
+  rm -f "$out"
+  return "$status"
+}
+
+# Poll until a jq boolean filter over `gh run view --json jobs` is true.
+wait_for_status() {
+  local jq_filter=$1 v
+  for _ in $(seq 1 120); do
+    v=$(gh run view "$run_id" --repo "$repo" --json jobs --jq "$jq_filter" 2>/dev/null || true)
+    if [ "$v" = "true" ]; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+wait_for_completion() {
+  local status
+  for _ in $(seq 1 90); do
+    status=$(gh run view "$run_id" --repo "$repo" --json status --jq .status) || true
+    if [ "$status" = "completed" ]; then
+      return 0
+    fi
+    sleep 10
+  done
+  echo "Timed out waiting for the run to complete" >&2
+  return 1
+}
+
+# The named step's conclusion (e.g. "success", "skipped", "cancelled"), or
+# empty if no such step exists.
+step_conclusion() {
+  local name=$1
+  gh run view "$run_id" --repo "$repo" --json jobs \
+    --jq ".jobs[0].steps[] | select(.name==\"$name\") | .conclusion"
+}
+
+# Job logs are only available once the job has completed; retry a few times
+# for GitHub's own lag between "completed" and the log becoming downloadable.
+fetch_log() {
+  local log tries=0
+  log=$(mktemp)
+  while [ "$tries" -lt 12 ]; do
+    if gh run view "$run_id" --repo "$repo" --log >"$log" 2>/dev/null && [ -s "$log" ]; then
+      echo "$log"
+      return 0
+    fi
+    tries=$((tries + 1))
+    sleep 5
+  done
+  echo "$log"
+}
+
+# --- per-scenario driving -------------------------------------------------
+
+case "$scenario" in
+  cancel)
+    ssh_command=$(download_ssh_command)
+    target=$(printf '%s' "$ssh_command" | sed -E 's/^ssh +//')
+    echo "Join command: $ssh_command"
+    if [ "$with_guest" = true ]; then
+      echo "Joining as the actor for 5s before cancelling..."
+      # Prove the join itself rather than discarding its output: a silent
+      # auth/connection failure here would otherwise still let the run get
+      # cancelled and the orphan-sweep assertions pass, having tested nothing
+      # about a guest actually being present. join_session proves the join
+      # itself (marker echoed back) before counting the hold, and returns
+      # non-zero - with the captured output - if that proof never completes.
+      guest_out=$(join_session "$target" 5) && guest_status=0 || guest_status=$?
+      if [ "$guest_status" -ne 0 ]; then
+        echo "FATAL: guest join failed (ssh exit ${guest_status}): $guest_out" >&2
+        exit 1
+      fi
+      echo "Guest joined and proved itself (J_42)"
+    fi
+    echo "Cancelling $run_id..."
+    gh run cancel "$run_id" --repo "$repo"
+    wait_for_completion
+    log=$(fetch_log)
+    assert_contains "runner's sweep terminated the orphaned upterm process" \
+      'Terminate orphan process: pid \([0-9]+\) \(upterm' "$log"
+    # The runner still logs a debug trace evaluating the post-if condition for
+    # a skipped step (its name appears in the log either way), so the log
+    # text alone can't tell "skipped" from "ran" - the step's own conclusion
+    # can: post-if "!cancelled()" makes a cancelled job skip it outright.
+    post_conclusion=$(step_conclusion "Post Start upterm session") || true
+    if [ "$post_conclusion" = "skipped" ]; then
+      pass "the post step (Post Start upterm session) did not run (conclusion: skipped)"
+    else
+      fail "the post step (Post Start upterm session) did not run (conclusion: ${post_conclusion:-<none>})"
+    fi
+    ;;
+
+  long-build)
+    wait_for_completion
+    log=$(fetch_log)
+    assert_order "BUILD_FINISHED, then the countdown, then the timeout warning" "$log" \
+      "$build_finished_runtime_pattern" \
+      'Waiting for client to connect \(at most 60 more second\(s\)\)' \
+      'Timed out waiting for client to connect'
+    conclusion=$(gh run view "$run_id" --repo "$repo" --json conclusion --jq .conclusion) || true
+    if [ "$conclusion" = "success" ]; then
+      pass "job succeeded"
+    else
+      fail "job succeeded (conclusion: $conclusion)"
+    fi
+    ;;
+
+  guest-before-post)
+    ssh_command=$(download_ssh_command)
+    target=$(printf '%s' "$ssh_command" | sed -E 's/^ssh +//')
+    echo "Join command: $ssh_command"
+    echo "Joining for 3s during the build, then leaving..."
+    # join_session proves the join (marker echoed back) before counting the
+    # 3s hold; a failure here is a FAIL with the output, not a script
+    # crash - it's already covered by the log assertions below, but a
+    # bare nonzero return would otherwise abort the whole script under
+    # `set -e` before those assertions ever ran.
+    guest_out=$(join_session "$target" 3) && join_status=0 || join_status=$?
+    if [ "$join_status" -ne 0 ]; then
+      fail "the build-time guest join proved itself (J_42) before its hold (ssh exit ${join_status}): $guest_out"
+    fi
+
+    echo "Waiting for the post step to be in_progress..."
+    wait_for_status '(.jobs[0].steps[] | select(.name=="Post Start upterm session") | .status) == "in_progress"'
+
+    echo "Joining again, sending exit to end the session..."
+    # Same as above: this is now a bare join_session call whose non-zero
+    # status would otherwise abort the script under `set -e` instead of
+    # reporting a FAIL and letting it reach the summary.
+    guest_out=$(join_session "$target" 20 $'exit\n') && join_status=0 || join_status=$?
+    if [ "$join_status" -ne 0 ]; then
+      fail "the post-step guest join proved itself (J_42) and sent exit (ssh exit ${join_status}): $guest_out"
+    fi
+
+    wait_for_completion
+    log=$(fetch_log)
+    assert_contains "a guest joined" 'A guest joined at' "$log"
+    assert_contains "the post step waited for the session to end" 'Waiting for session to end' "$log"
+    assert_not_contains "no client-connect timeout" 'Timed out waiting for client to connect' "$log"
+    # If the build-time join silently failed (e.g. a race, not necessarily
+    # auth), the post step would still count down - printing this - until the
+    # second, end-of-build join (which sends "exit") satisfies it, and the
+    # three assertions above would all still pass without the build-time join
+    # having been proven at all. A silent failure there must show up here.
+    assert_not_contains "the post step never counted down (the build-time join was already recorded)" \
+      'Waiting for client to connect \(at most' "$log"
+    assert_join_precedes_build "the recorded join happened during the build, before BUILD_FINISHED" "$log"
+    ;;
+esac
+
+echo
+if [ "$failures" -eq 0 ]; then
+  echo "All assertions passed ($run_url)"
+  exit 0
+else
+  echo "$failures assertion(s) failed ($run_url)"
+  exit 1
+fi

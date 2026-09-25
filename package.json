@@ -2,7 +2,7 @@
   "name": "action-upterm",
   "version": "0.0.0",
   "private": true,
-  "description": "Debug your GitHub Actions via SSH by using upterm/tmux to get access to the runner system itself.",
+  "description": "Debug your GitHub Actions via SSH by using upterm to get access to the runner system itself.",
   "main": "src/main.ts",
   "scripts": {
     "build": "ncc build --source-map --minify --license LICENSE -o lib",
