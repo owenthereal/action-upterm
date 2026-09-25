@@ -505,7 +505,11 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   }
 
   const session = parseSessionInfo(output);
-  if (!session.sshCommand) {
+  // A terminal status must fail even with an sshCommand: upterm's printStarted
+  // can report "disconnected" - the record's status the instant the tunnel
+  // dropped - alongside a claim captured moments earlier that still carries an
+  // sshCommand. A connect string for a session already gone can never connect.
+  if (isTerminal(session.status) || !session.sshCommand) {
     throw new Error(await collectDiagnostics(session));
   }
   return session;

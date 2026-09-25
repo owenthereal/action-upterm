@@ -1011,6 +1011,25 @@ describe('upterm GitHub integration', () => {
       await run();
       expect(core.setFailed).toHaveBeenCalled();
     });
+
+    it('fails when the launch itself reports a terminal status, even with an ssh command, and never publishes it', async () => {
+      // upterm's printStarted can report "disconnected" (the record's status
+      // the instant the tunnel dropped) alongside a claim that still carries
+      // an sshCommand (host/api response captured moments earlier) -
+      // spawned.go:298-327. A connect string for a session already gone can
+      // never connect, so a terminal status must fail the run even though
+      // sshCommand is non-empty.
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('upterm host')) return JSON.stringify({name: 'gha-x', status: 'disconnected', sshCommand: 'ssh x@y'});
+        if (cmd.includes('session info')) return JSON.stringify({name: 'gha-x', status: 'disconnected', sshCommand: 'ssh x@y'});
+        return '';
+      });
+      await run();
+      expect(core.setFailed).toHaveBeenCalled();
+      expect(core.setOutput).not.toHaveBeenCalledWith('ssh-command', expect.anything());
+    });
   });
 
   describe('teardown', () => {
