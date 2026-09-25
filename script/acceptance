@@ -125,6 +125,15 @@ to_epoch() {
   date -u -d "$ts" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || true
 }
 
+# GitHub Actions echoes a step's own script back to the log at step start
+# (ANSI-colored, e.g. '^[[36;1mecho "BUILD_FINISHED"^[[0m'), so a bare
+# 'BUILD_FINISHED' grep matches that echo - which always precedes the actual
+# runtime output - instead of the line the running script prints. Anchored to
+# "<timestamp>Z BUILD_FINISHED<end of line>" so it can only match the runtime
+# line; the echo has ANSI escapes between "Z " and "BUILD_FINISHED" and more
+# text (the closing escape) after it, so it can't match this pattern.
+build_finished_runtime_pattern='[0-9]Z BUILD_FINISHED[[:space:]]*$'
+
 # The post step prints "A guest joined at <firstGuestJoinedAt>", upterm's own
 # recorded join time - not the log line's own print time, which is always
 # later (the post step only starts after Build finishes, so a plain line-order
@@ -135,7 +144,7 @@ assert_join_precedes_build() {
   local desc=$1 log=$2
   local join_ts build_ts join_epoch build_epoch
   join_ts=$(grep -E 'A guest joined at' "$log" | head -1 | sed -E 's/.*A guest joined at ([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z).*/\1/') || true
-  build_ts=$(grep -E 'BUILD_FINISHED' "$log" | head -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' | head -1) || true
+  build_ts=$(grep -E -- "$build_finished_runtime_pattern" "$log" | head -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' | head -1) || true
   if [ -z "$join_ts" ] || [ -z "$build_ts" ]; then
     fail "$desc (could not find both timestamps: join=${join_ts:-<none>} build=${build_ts:-<none>})"
     return
@@ -386,7 +395,7 @@ case "$scenario" in
     wait_for_completion
     log=$(fetch_log)
     assert_order "BUILD_FINISHED, then the countdown, then the timeout warning" "$log" \
-      'BUILD_FINISHED' \
+      "$build_finished_runtime_pattern" \
       'Waiting for client to connect \(at most 60 more second\(s\)\)' \
       'Timed out waiting for client to connect'
     conclusion=$(gh run view "$run_id" --repo "$repo" --json conclusion --jq .conclusion) || true
