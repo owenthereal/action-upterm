@@ -155,7 +155,11 @@ cd $GITHUB_WORKSPACE && touch continue
 sudo touch /continue
 ```
 
-Closing the SSH connection (for example with `Ctrl-D`, or just closing your terminal) disconnects without resuming the workflow — only the continue file resumes it.
+How you leave the SSH connection matters:
+
+- ssh's own `~.` escape sequence (or just closing your terminal window) only disconnects your terminal — the session itself keeps running and waiting for a client, and the workflow does not resume. Reconnect with the same SSH command to pick up where you left off.
+- Typing `exit` or pressing `Ctrl-D` sends EOF to the session's shell, which quits. That ends the session, and the workflow resumes immediately as a result.
+- Touching the continue file resumes the workflow the same way `exit`/`Ctrl-D` does, but without ending the session: it keeps running, reachable over SSH, until the job's post step stops it at the end of the job — the same cleanup that stops any session still up when the job finishes.
 
 ## Usage Tips
 
@@ -182,7 +186,8 @@ touch /c/msys64/continue
 
 ## Migrating from v1
 
-- **No more tmux.** v1 hosted the session inside a nested tmux, with its own keybindings (`C-b` prefix) for detaching and resizing. v2 lets upterm host the session directly: there is no tmux prefix, the shared terminal follows the connecting guest's size (v1 pinned it to 132x43), and closing the SSH connection is how you detach without resuming the workflow.
+- **No more tmux.** v1 hosted the session inside a nested tmux, with its own keybindings (`C-b` prefix) for detaching and resizing. v2 lets upterm host the session directly: there is no tmux prefix, the shared terminal follows the connecting guest's size (v1 pinned it to 132x43), and ssh's own escape sequence (or closing the terminal window) is how you detach without resuming the workflow — see [Continue a Workflow](#continue-a-workflow) above for how that differs from ending the session.
+- **The hosted shell is now upterm's own default, not tmux's login shell.** v1's tmux started a login shell; v2 runs `$SHELL` directly (non-login), falling back to `/bin/sh` if `SHELL` is unset — which some self-hosted runners don't set. On Windows the hosted command is unchanged: MSYS2's login bash (`bash -l`).
 - **Requires upterm v0.31.0 or newer.** See [Requirements](#requirements) above; pin `@v1` if you need an older upterm.
 - **`upterm session current` works inside the session** — upterm itself injects `UPTERM_ADMIN_SOCKET` and `UPTERM_SESSION_NAME`, so no wrapper configuration is needed for it to resolve.
 - **Windows no longer uses WMI to launch the session.** See [ARCHITECTURE.md](ARCHITECTURE.md#why-no-wmi) for why.

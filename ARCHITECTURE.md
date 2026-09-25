@@ -26,7 +26,7 @@ action-upterm's own footprint is three `upterm` invocations, all run through `ex
    Polled every 5 seconds by the wait loop (below) to read the session's status and `firstGuestJoinedAt`. A `no session named ...` error is treated as "the session is gone"; any other failure is treated as "unknown" and never spends the countdown or ends the wait, because a lookup failure says nothing about who is connected.
 
 3. **`upterm session stop <name>`** (`stopSession()`, src/index.ts)
-   Asks upterm to end this run's session. Called from three places: the countdown when it expires unanswered, the post step's normal teardown, and the post step's SIGINT/SIGTERM handler. Never throws - a session that is already gone still exits 0, and a transient failure is only warned about, because none of its three callers may fail the job over it.
+   Asks upterm to end this run's session. Called from three places: the countdown when it expires unanswered, the post step's normal teardown, and the post step's SIGINT/SIGTERM handler. Never throws: `session stop` itself exits 0 and reports "has already ended" for a session whose record is still there but no longer held (an ordinary completed session); it exits 1 with "no session named" only when no record exists at all (a launch that failed before any record was written, or a fully reaped session) - that case is a quiet no-op (`core.debug`), exactly like `getSession()`'s treatment of a "not found" lookup. Any other failure is only warned about; none of the three callers may fail the job over it.
 
 ### The wait loop and its `firstGuestJoinedAt` latch
 
@@ -34,7 +34,7 @@ action-upterm's own footprint is three `upterm` invocations, all run through `ex
 
 1. Checks for the continue file (`/continue` or `$GITHUB_WORKSPACE/continue`) - if present, the wait ends immediately with no session lookup.
 2. Polls `upterm session info`. A terminal status (`disconnected`, `ending`, `ended`) ends the wait. A live session updates the join latch.
-3. **The join latch**: `hasGuestJoined()` reads `session.firstGuestJoinedAt`, a field upterm itself sets from its own join events (present only from upterm v0.31.0+, which is why older upterm is refused). Once this has been true once for a session, the loop stops spending the countdown - the countdown never re-arms, and a guest who joins and immediately disconnects still latches it, because the daemon recorded the join, not the current connection count. `guestCount` is never used for this decision: it is `0` both when nobody has connected and when the admin query failed, so treating it as a live count would risk stopping a session someone is attached to.
+3. **The join latch**: `hasGuestJoined()` reads `session.firstGuestJoinedAt`, a field upterm itself sets from its own join events (present only from upterm v0.31.0+, which is why older upterm is refused). Once this has been true once for a session, the loop stops spending the countdown - the countdown never re-arms, and a guest who joins and immediately disconnects still latches it, because the daemon recorded the join, not the current connection count. `guestCount` is never used for this decision, for two binding reasons: it counts forwarding-only presence, which is not a qualifying join, and it is a current count rather than an event - it misses a guest who joined and left again between two polls, exactly the case `firstGuestJoinedAt` exists to catch.
 4. If the countdown is still armed (`wait-timeout-minutes` was set and no guest has ever joined) and it has reached zero, the loop does one last poll - because a guest may have joined, or the session may have ended, since the last check - and only then calls `stopSession()` and returns.
 
 ### Teardown order
@@ -44,11 +44,11 @@ action-upterm's own footprint is three `upterm` invocations, all run through `ex
 1. `stopSession()` (guarded by the `sessionStarted` state key, so a run that never reached `launchSession()` - a failed download, a rejected upterm version - doesn't try to stop a session it never started).
 2. `cleanupUptermData()` - removes this run's private directories (`uptermBaseDir`, `uptermRuntimeDir`) unconditionally.
 
-The order matters: the runtime directory holds the session's live sockets, so it must not be removed out from under a session that is still being asked to stop. The post step also installs a SIGINT/SIGTERM handler that runs `stopSession()` before exiting, because the runner interrupts a post step it is cancelling and `post-if: "!cancelled()"` already means the post step never runs at all when the *main* step was cancelled.
+The order matters: the runtime directory holds the session's live sockets, so it must not be removed out from under a session that is still being asked to stop. Only detached mode's post step installs a SIGINT/SIGTERM handler that runs `stopSession()` before exiting - it is set up after the `message` state check that also gates whether there is a wait to run, so attached mode's post step (which saves no `message` and goes straight to teardown) never installs one; it has no wait to interrupt. The handler exists because the runner interrupts a post step it is cancelling, and `post-if: "!cancelled()"` already means the post step never runs at all when the *main* step was cancelled.
 
 ### Why No WMI
 
-v1 launched the Windows session through WMI (`Invoke-CimMethod`) to detach it from the launching process tree. v2 does not, on the strength of a Windows probe (see `probe-evidence.md` in this plan) that ran `upterm host --detach` exactly as v2 does, on `windows-latest` and `windows-2022`:
+v1 launched the Windows session through WMI (`Invoke-CimMethod`) to detach it from the launching process tree. v2 does not: a probe ran `upterm host --detach` exactly as v2 does, on `windows-latest` and `windows-2022`, and found:
 
 - **The daemon needs no WMI to survive.** It outlived its launching step ending, a sibling step's `timeout-minutes` firing, the cancelled step's Ctrl-C, and `if: always()` steps running after cancellation. It holds none of the launching step's pipes, so that step returns immediately once `upterm host --detach` prints its ready record.
 - **The runner's own orphan sweep reaps it** at "Complete job", on every OS, after both normal completion and cancellation, whether or not a guest ever joined - on Windows it kills `upterm` and its ConPTY `conhost`; on Linux/macOS, `upterm` and the hosted shell.
@@ -66,7 +66,7 @@ Three path formats are used depending on the context:
 | Format | Example | Use Case |
 |--------|---------|----------|
 | **Windows** | `C:/Users/foo/bar` | Native Windows executables, bash commands |
-| **POSIX** | `/c/Users/foo/bar` | MSYS2 utilities, XDG environment variables, spawned processes |
+| **POSIX** | `/c/Users/foo/bar` | XDG environment variables, and any path handed to a bash command that will itself launch a native Windows child process |
 | **Backslash** | `C:\Users\foo\bar` | Node.js path.join() output (converted before use) |
 
 ### Path Conversion Functions
@@ -91,8 +91,7 @@ Converts Windows paths to MSYS2/Cygwin POSIX-style paths.
 
 **Use for:**
 - XDG environment variables (XDG_RUNTIME_DIR, XDG_STATE_HOME, XDG_CONFIG_HOME)
-- Shell redirects and pipes (`>`, `2>`, `|`)
-- MSYS2 utilities (cat, tee, echo)
+- A path bash will hand to a native Windows child process it launches (e.g. the `cp` source path when copying upterm.exe into MSYS2's `/usr/bin`) - MSYS2's bash converts it to Windows form automatically for that child, so the value bash itself sees must be POSIX-style
 
 **Examples:**
 ```typescript
@@ -114,27 +113,6 @@ Wraps strings in single quotes and escapes internal single quotes.
 ```typescript
 shellEscape("hello world")    // => "'hello world'"
 shellEscape("user's file")    // => "'user'\''s file'"
-```
-
-### Decision Tree for Path Conversion
-
-```
-Need to convert a path?
-│
-├─ Is it for a native Windows executable? (upterm.exe)
-│  └─ Use toShellPath() for arguments, toMsys2Path() for XDG environment variables
-│
-├─ Is it for bash invoked from bash?
-│  └─ Use toShellPath() (bash accepts both formats on Windows)
-│
-├─ Is it for a process spawned BY a native Windows executable?
-│  └─ Use toMsys2Path() (spawned processes expect POSIX on Windows)
-│
-├─ Is it for shell redirection (>, 2>, |) or MSYS2 utilities (cat, tee)?
-│  └─ Use toMsys2Path()
-│
-└─ Is it a user-provided string going into a shell command?
-   └─ Use shellEscape()
 ```
 
 ## Platform-Specific Considerations
@@ -202,7 +180,7 @@ action-upterm follows the [XDG Base Directory Specification](https://specificati
 | `XDG_STATE_HOME` | State data, logs | `{RUNNER_TEMP}/upterm-action-XXXXXX/state` | `/c/.../Temp/upterm-action-XXXXXX/state` |
 | `XDG_CONFIG_HOME` | Configuration files | `{RUNNER_TEMP}/upterm-action-XXXXXX/config` | `/c/.../Temp/upterm-action-XXXXXX/config` |
 
-On Windows these are exported in MSYS-form (`/c/...`), never `C:/...` - that's the form upterm.exe itself expects in its environment, and it's what every `execShellCommand` call inherits via `process.env`.
+On Windows these are exported in MSYS-form (`/c/...`), never `C:/...`. Not because upterm.exe expects MSYS-form itself - it doesn't, being a native Windows executable - but because MSYS2's bash automatically converts POSIX-style environment values to Windows form when it launches a native (non-MSYS) executable as a child process. That automatic conversion is exactly why every upterm call, including on Windows, goes through bash rather than invoking upterm.exe directly; `process.env` is what every `execShellCommand` call inherits.
 
 **Why XDG Variables:**
 - Platform defaults may not exist in CI environments
