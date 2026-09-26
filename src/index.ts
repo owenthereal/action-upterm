@@ -5,7 +5,7 @@ import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
 import {execShellCommand, shellEscape, sleep} from './helpers';
-import {generateSessionName, getSession, hasGuestJoined, isTerminal, isUptermVersionSupported, parseUptermVersion, parseSessionInfo, SessionInfo, formatVersion, UPTERM_MIN_VERSION} from './session';
+import {generateSessionName, getSession, hasGuestJoined, isNoSuchSession, isTerminal, isUptermVersionSupported, parseUptermVersion, parseSessionInfo, SessionInfo, formatVersion, UPTERM_MIN_VERSION} from './session';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
@@ -693,10 +693,10 @@ function continueFileExists(): boolean {
  *
  * `session stop` itself exits 0 and prints "has already ended" for a session
  * whose record is still there but no longer held (an ordinary completed
- * session); it exits 1 with "no session named" only when no record exists at
- * all - which a launch that failed before any record was written, or a fully
- * reaped session, both produce. That case is expected, not a failure: treated
- * as a quiet no-op (core.debug), exactly as getSession() does for lookups.
+ * session); it exits 4 only when no record exists at all - which a launch
+ * that failed before any record was written, or a fully reaped session, both
+ * produce. That case is expected, not a failure: treated as a quiet no-op
+ * (core.debug), exactly as getSession() does for lookups.
  */
 async function stopSession(): Promise<void> {
   const name = getSessionName();
@@ -705,7 +705,7 @@ async function stopSession(): Promise<void> {
     // characters, shell-safe by construction.
     await execShellCommand(`upterm session stop ${name}`, {quiet: true});
   } catch (error) {
-    if (/no session named/i.test(String(error))) {
+    if (isNoSuchSession(error)) {
       core.debug(`upterm session ${name} was never started or is already fully gone: ${error}`);
       return;
     }

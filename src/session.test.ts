@@ -1,5 +1,5 @@
 import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion} from './session';
-import {execShellCommand} from './helpers';
+import {execShellCommand, ShellCommandError} from './helpers';
 
 jest.mock('./helpers', () => ({
   ...jest.requireActual('./helpers'),
@@ -118,9 +118,15 @@ describe('getSession', () => {
     expect(mockedExec).toHaveBeenCalledWith("upterm session info 'gha-3f9a1c05' -o json", {quiet: true});
   });
 
-  it('returns null when the session name is not found', async () => {
-    mockedExec.mockRejectedValue(new Error('Command failed with exit code 1\nStderr: Error: no session named "gha-3f9a1c05"'));
+  it('returns null when upterm says no session has the name (exit 4)', async () => {
+    mockedExec.mockRejectedValue(new ShellCommandError('Command failed with exit code 4: upterm session info gha-3f9a1c05 -o json\nStderr: no session named "gha-3f9a1c05"', 4));
     await expect(getSession('gha-3f9a1c05')).resolves.toBeNull();
+  });
+
+  it('does not read "no session named" text on another exit code as not-found', async () => {
+    // Only the exit code is upterm's contract; text can appear in any failure.
+    mockedExec.mockRejectedValue(new ShellCommandError('Command failed with exit code 1\nStderr: no session named "gha-3f9a1c05"', 1));
+    await expect(getSession('gha-3f9a1c05')).rejects.toThrow('no session named');
   });
 
   it('propagates any other failure instead of reporting not-found', async () => {

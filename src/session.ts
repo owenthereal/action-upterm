@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import {execShellCommand, shellEscape} from './helpers';
+import {execShellCommand, shellEscape, ShellCommandError} from './helpers';
 
 /**
  * Session statuses.
@@ -96,11 +96,22 @@ export function parseSessionInfo(raw: string): SessionInfo {
 }
 
 /**
+ * upterm's exit status for "no session has this name", from `session info`,
+ * `session stop` and `session set` (v0.32.0+). Every other failure exits 1.
+ */
+export const NO_SESSION_EXIT_CODE = 4;
+
+/** Whether a failed upterm call said there is no session by that name. */
+export function isNoSuchSession(error: unknown): boolean {
+  return error instanceof ShellCommandError && error.exitCode === NO_SESSION_EXIT_CODE;
+}
+
+/**
  * Look up the action's session by name.
  *
- * Returns null ONLY for a genuine not-found (no record within retained
- * history). Every other failure propagates: a lookup that failed must not be
- * indistinguishable from a session that finished.
+ * Returns null ONLY for a genuine not-found: upterm's exit 4, no record
+ * within retained history. Every other failure propagates: a lookup that
+ * failed must not be indistinguishable from a session that finished.
  */
 export async function getSession(name: string): Promise<SessionInfo | null> {
   let raw: string;
@@ -109,7 +120,7 @@ export async function getSession(name: string): Promise<SessionInfo | null> {
     // as someone is connected, and each call would dump its JSON into the log.
     raw = await execShellCommand(`upterm session info ${shellEscape(name)} -o json`, {quiet: true});
   } catch (error) {
-    if (/no session named/i.test(String(error))) return null;
+    if (isNoSuchSession(error)) return null;
     throw error;
   }
   return parseSessionInfo(raw);

@@ -8,7 +8,7 @@ jest.mock('child_process', () => ({
 }));
 
 import {spawn} from 'child_process';
-import {execShellCommand} from './helpers';
+import {execShellCommand, ShellCommandError} from './helpers';
 
 const mockSpawn = spawn as jest.MockedFunction<typeof spawn>;
 
@@ -88,6 +88,31 @@ describe('execShellCommand', () => {
     });
 
     await expect(execShellCommand(command)).rejects.toThrow('Command failed with exit code 1: false\nStderr: command failed');
+  });
+
+  it('rejects with the exit code, so callers need not match its text', async () => {
+    mockProcess.on.mockImplementation((event, callback) => {
+      if (event === 'exit') callback(4);
+    });
+
+    const error = await execShellCommand('upterm session info gha-x -o json').catch(e => e);
+
+    expect(error).toBeInstanceOf(ShellCommandError);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.exitCode).toBe(4);
+    // The message is unchanged: logs and existing callers still read it.
+    expect(error.message).toBe('Command failed with exit code 4: upterm session info gha-x -o json');
+  });
+
+  it('reports a null exit code when the process was ended by a signal', async () => {
+    mockProcess.on.mockImplementation((event, callback) => {
+      if (event === 'exit') callback(null, 'SIGTERM');
+    });
+
+    const error = await execShellCommand('sleep 100').catch(e => e);
+
+    expect(error).toBeInstanceOf(ShellCommandError);
+    expect(error.exitCode).toBeNull();
   });
 
   describe('quiet mode', () => {

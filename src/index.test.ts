@@ -81,6 +81,7 @@ let mockFs: jest.Mocked<typeof import('fs')>;
 let mockedToolCache: jest.Mocked<typeof import('@actions/tool-cache')>;
 let mockedExecShellCommand: jest.MockedFunction<typeof import('./helpers').execShellCommand>;
 let mockedSleep: jest.MockedFunction<typeof import('./helpers').sleep>;
+let ShellCommandError: typeof import('./helpers').ShellCommandError;
 let run: typeof import('.').run;
 let getUptermArchitecture: typeof import('.').getUptermArchitecture;
 let getUptermDownloadUrl: typeof import('.').getUptermDownloadUrl;
@@ -95,6 +96,7 @@ function loadAction(): void {
   const helpers = require('./helpers');
   mockedExecShellCommand = helpers.execShellCommand;
   mockedSleep = helpers.sleep;
+  ShellCommandError = helpers.ShellCommandError;
 
   ({run, getUptermArchitecture, getUptermDownloadUrl} = require('.'));
 }
@@ -1091,21 +1093,32 @@ describe('upterm GitHub integration', () => {
       expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
     });
 
-    it('treats "no session named" from session stop as a quiet no-op, like getSession does for lookups', async () => {
+    it('treats exit 4 from session stop as a quiet no-op, like getSession does for lookups', async () => {
       // A launch that failed part-way (sessionStarted saved, but the record
       // never got written) leaves nothing for `session stop` to find; upterm
-      // reports that with "no session named" and exit 1. Warning about it
-      // every time is noise for an expected case - debug only, same
-      // treatment getSession() gives a "not found" lookup.
+      // says so with exit 4. Warning about it every time is noise for an
+      // expected case - debug only, same treatment getSession() gives a
+      // "not found" lookup.
       postState({message: ''});
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('session stop')) throw new Error('Command failed: no session named "gha-3f9a1c05"');
+        if (cmd.includes('session stop')) throw new ShellCommandError('Command failed with exit code 4: upterm session stop gha-3f9a1c05\nStderr: no session named "gha-3f9a1c05"', 4);
         return '';
       });
       await run();
       expect(core.warning).not.toHaveBeenCalled();
       expect(core.setFailed).not.toHaveBeenCalled();
       expect(core.debug).toHaveBeenCalledWith(expect.stringContaining('no session named'));
+    });
+
+    it('warns when session stop fails any other way, even with "no session named" in its text', async () => {
+      postState({message: ''});
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('session stop')) throw new ShellCommandError('Command failed with exit code 1: upterm session stop gha-3f9a1c05\nStderr: no session named "gha-3f9a1c05"', 1);
+        return '';
+      });
+      await run();
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Could not stop upterm session gha-3f9a1c05'));
+      expect(core.setFailed).not.toHaveBeenCalled();
     });
 
     it('stops the session through bash when the post step is interrupted', async () => {
