@@ -218,6 +218,11 @@ describe('waitStatusLine', () => {
     expect(waitStatusLine(s, false, NOW)).toBe('Waiting for client to connect (at most 43 more second(s))');
   });
 
+  it('handles a nanosecond-precision deadline, as upterm writes RFC 3339 with up to 9 fractional digits', () => {
+    const s = live({joinStateSource: 'daemon', joinTimeout: '1m', joinDeadline: '2026-09-26T10:00:42.123456789Z'});
+    expect(waitStatusLine(s, false, NOW)).toBe('Waiting for client to connect (at most 43 more second(s))');
+  });
+
   it('shows 0, never a negative count, once the deadline has passed', () => {
     // Teardown after the deadline fires can still show it for ~16 s.
     const s = live({joinStateSource: 'daemon', joinTimeout: '1m', joinDeadline: '2026-09-26T09:59:44Z'});

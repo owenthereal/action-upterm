@@ -151,8 +151,8 @@ function fsWithoutExitFiles(): void {
 
 /**
  * State the POST action needs to see itself as the post half of a run main
- * already started. Shared by the POST action tests and the countdown tests,
- * both of which exercise runPost().
+ * already started. Shared by the POST action tests and the join timeout
+ * (upterm owns the deadline) tests, both of which exercise runPost().
  */
 function postState(overrides: Record<string, string> = {}): void {
   when(core.getState).calledWith('isPost').mockReturnValue('true');
@@ -813,7 +813,6 @@ describe('upterm GitHub integration', () => {
       // invisible at default verbosity, so the only symptom was a log that
       // never moved. The failure just has to be VISIBLE.
       postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
 
       let polls = 0;
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
@@ -821,9 +820,7 @@ describe('upterm GitHub integration', () => {
         polls++;
         throw new Error('Command failed with exit code 2\nStderr: registry unavailable');
       });
-      // Run past the 12 waits a 1-minute timeout would take, so the countdown
-      // assertion below is a real one, and past the 12th consecutive failure so
-      // the periodic repeat fires too.
+      // Run past the 12th consecutive failure so the periodic repeat warning fires.
       mockFs.existsSync.mockImplementation(() => polls >= 18);
 
       await run();
@@ -852,7 +849,7 @@ describe('upterm GitHub integration', () => {
         polls++;
         throw new Error('Command failed with exit code 2\nStderr: registry unavailable');
       });
-      // A thrown lookup is UNKNOWN, which defers the countdown - so the loop needs
+      // A thrown lookup is UNKNOWN, which ends nothing - so the loop needs
       // the continue file to end, or this test would never return.
       mockFs.existsSync.mockImplementation(() => polls >= 3);
 
@@ -979,6 +976,14 @@ describe('upterm GitHub integration', () => {
       Object.defineProperty(process, 'arch', {value: 'x64'});
       await run();
       expect(launchCall()).toMatch(/ -- bash -l$/);
+    });
+
+    it('places --join-timeout before -- bash -l on Windows, so bash never sees it', async () => {
+      Object.defineProperty(process, 'platform', {value: 'win32'});
+      Object.defineProperty(process, 'arch', {value: 'x64'});
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
+      await run();
+      expect(launchCall()).toMatch(/ --join-timeout 5m -- bash -l$/);
     });
 
     it('publishes the ssh command from the launch output without polling for readiness', async () => {
@@ -1244,6 +1249,12 @@ describe('upterm GitHub integration', () => {
         const gone = new ShellCommandError('Command failed with exit code 4: upterm session set gha-3f9a1c05 --join-timeout 10m\nStderr: no session named "gha-3f9a1c05"', 4);
         mockedExecShellCommand.mockImplementation(async (cmd: string) => {
           if (cmd.includes('session set') || cmd.includes('session stop')) throw gone;
+          // A regression that ignored armJoinTimeout()'s false would call
+          // waitForSession() anyway; answering `session info` with a terminal
+          // status here makes that regression fail the assertion below after
+          // one poll instead of spinning forever (mocked sleep resolves at
+          // once, so an unanswered loop would hang/OOM rather than fail).
+          if (cmd.includes('session info')) return endedResponse;
           return '';
         });
 
