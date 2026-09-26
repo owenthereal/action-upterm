@@ -1,6 +1,6 @@
 # Architecture
 
-This document explains the technical architecture of action-upterm, with a focus on the three `upterm` calls that drive a session and cross-platform path handling.
+This document explains the technical architecture of action-upterm, with a focus on the four `upterm` calls that drive a session and cross-platform path handling.
 
 ## Table of Contents
 
@@ -15,27 +15,32 @@ This document explains the technical architecture of action-upterm, with a focus
 
 ## Command Execution Flow
 
-action-upterm's own footprint is three `upterm` invocations, all run through `execShellCommand` (bash on every platform, including Windows via `C:\msys64\usr\bin\bash.exe -lc`). Everything else - the wait loop, the countdown, teardown - is action code deciding when to make the next call.
+action-upterm's own footprint is four `upterm` invocations, all run through `execShellCommand` (bash on every platform, including Windows via `C:\msys64\usr\bin\bash.exe -lc`). Everything else - the wait loop and teardown - is action code deciding when to make the next call. The join deadline is not action code: upterm's daemon enforces it.
 
-### The three calls
+### The four calls
 
-1. **`upterm host --detach --accept --output json --name gha-XXXXXXXX --skip-host-key-check --server <server> [--authorized-user github:NAME ...] [-- bash -l]`** (`launchSession()`, src/index.ts)
-   Starts upterm's own daemon and returns once it has started the hosted command and written its ready record - the JSON on stdout is the same shape `session info -o json` prints, so there is no separate readiness poll. On Windows, the hosted command is MSYS2's login bash (`bash -l`); everywhere else upterm runs `$SHELL` with no suffix. The daemon is not a child the launching step waits on: it detaches and outlives the step that started it.
+1. **`upterm host --detach --accept --output json --name gha-XXXXXXXX --skip-host-key-check --server <server> [--authorized-user github:NAME ...] [--join-timeout Nm] [-- bash -l]`** (`launchSession()`, src/index.ts)
+   Starts upterm's own daemon and returns once it has started the hosted command and written its ready record - the JSON on stdout is the same shape `session info -o json` prints, so there is no separate readiness poll. On Windows, the hosted command is MSYS2's login bash (`bash -l`); everywhere else upterm runs `$SHELL` with no suffix. The daemon is not a child the launching step waits on: it detaches and outlives the step that started it. Attached mode passes `--join-timeout Nm` when `wait-timeout-minutes` is above 0; upterm counts it from readiness. Detached mode never does: a window counted from launch would end the session mid-build.
 
-2. **`upterm session info <name> -o json`** (`getSession()`, src/session.ts)
-   Polled every 5 seconds by the wait loop (below) to read the session's status and `firstGuestJoinedAt`. A `no session named ...` error is treated as "the session is gone"; any other failure is treated as "unknown" and never spends the countdown or ends the wait, because a lookup failure says nothing about who is connected.
+2. **`upterm session set <name> --join-timeout Nm`** (`armJoinTimeout()`, src/index.ts)
+   Detached mode's post step only, once every regular step has finished: starts the no-guest window from now (N = `wait-timeout-minutes`, 10 when unset or 0). upterm's one-line answer is logged as is (counting, claimed, ending, or already ended). Exit 4 means the session is already gone, so there is nothing to wait for. Any other failure - in practice "could not confirm", a daemon that did not answer in time - may or may not have taken effect; it is warned about and the wait runs anyway, bounded by the job's `timeout-minutes`. It is not retried.
 
-3. **`upterm session stop <name>`** (`stopSession()`, src/index.ts)
-   Asks upterm to end this run's session. Called from three places: the countdown when it expires unanswered, the post step's normal teardown, and the post step's SIGINT/SIGTERM handler. Never throws: `session stop` itself exits 0 and reports "has already ended" for a session whose record is still there but no longer held (an ordinary completed session); it exits 1 with "no session named" only when no record exists at all (a launch that failed before any record was written, or a fully reaped session) - that case is a quiet no-op (`core.debug`), exactly like `getSession()`'s treatment of a "not found" lookup. Any other failure is only warned about; none of the three callers may fail the job over it.
+3. **`upterm session info <name> -o json`** (`getSession()`, src/session.ts)
+   Polled every 5 seconds by the wait loop (below) to read the session's status and join state (`joinDeadline`, `joinStateSource`, `firstGuestJoinedAt`). Exit 4 ("no session named") is "the session is gone"; any other failure is "unknown" and never ends the wait, because a lookup failure says nothing about who is connected.
 
-### The wait loop and its `firstGuestJoinedAt` latch
+4. **`upterm session stop <name>`** (`stopSession()`, src/index.ts)
+   Asks upterm to end this run's session. Called from two places: the post step's normal teardown and its SIGINT/SIGTERM handler - never from the wait loop, which only observes. Never throws: `session stop` itself exits 0 and reports "has already ended" for a session whose record is still there but no longer held (an ordinary completed session); it exits 4 only when no record exists at all (a launch that failed before any record was written, or a fully reaped session) - that case is a quiet no-op (`core.debug`), exactly like `getSession()`'s treatment of a "not found" lookup. Any other failure is only warned about; neither caller may fail the job over it.
 
-`waitForSession()` (src/index.ts) is the one loop used by both attached mode and detached mode's post step; only the timeout and the log message differ. Each iteration:
+### The wait loop and its join latch
+
+`waitForSession()` (src/index.ts) is the one loop used by both attached mode and detached mode's post step. It only observes: upterm alone ends a session nobody joined, at its own deadline, so a guest can never be kicked between a read and a stop. Each pass, every 5 seconds:
 
 1. Checks for the continue file (`/continue` or `$GITHUB_WORKSPACE/continue`) - if present, the wait ends immediately with no session lookup.
-2. Polls `upterm session info`. A terminal status (`disconnected`, `ending`, `ended`) ends the wait. A live session updates the join latch.
-3. **The join latch**: `hasGuestJoined()` reads `session.firstGuestJoinedAt`, a field upterm itself sets from its own join events (present only from upterm v0.31.0+, which is why older upterm is refused). Once this has been true once for a session, the loop stops spending the countdown - the countdown never re-arms, and a guest who joins and immediately disconnects still latches it, because the daemon recorded the join, not the current connection count. `guestCount` is never used for this decision, for two binding reasons: it counts forwarding-only presence, which is not a qualifying join, and it is a current count rather than an event - it misses a guest who joined and left again between two polls, exactly the case `firstGuestJoinedAt` exists to catch.
-4. If the countdown is still armed (`wait-timeout-minutes` was set and no guest has ever joined) and it has reached zero, the loop does one last poll - because a guest may have joined, or the session may have ended, since the last check - and only then calls `stopSession()` and returns.
+2. Polls `upterm session info`. Exit 4 or a terminal status (`disconnected`, `ending`, `ended`) ends the wait; an end by upterm's join timeout (reason `join_timeout`) is logged as "Timed out waiting for client to connect". A failed lookup is warned about and ends nothing.
+3. Logs one status line (`waitStatusLine()`, src/session.ts): the seconds left before `joinDeadline`, clamped at 0 (teardown after the deadline fires can show a past deadline for ~16 s), or "Waiting for session to end". Join state upterm read from its record rather than from the daemon (`joinStateSource` other than `daemon`) may be stale - a record's deadline may no longer be counting, and a record without one does not prove there is no window - so it is marked unconfirmed.
+4. **The join latch**: once `firstGuestJoinedAt` appears (`hasGuestJoined()`), the loop logs "A guest joined at T; automatic join timeout disabled" once, and from then on always "Waiting for session to end", whatever later responses say: upterm disables the timeout for good at the first join, so a stale response must not bring the countdown back. `guestCount` is never used for this decision, for two binding reasons: it counts forwarding-only presence, which is not a qualifying join, and it is a current count rather than an event - it misses a guest who joined and left again between two polls, exactly the case `firstGuestJoinedAt` exists to catch.
+
+`upterm session wait` is deliberately not used: its exit cannot end the wait by itself (it exits 125 on its own lookup failures and never returns for a `disconnected` session), restarting it would need a back-off, and on Windows killing it through MSYS2's bash would leave upterm.exe holding Node's output pipes, which keeps an attached step from finishing. One 5 s poll is enough to notice the end.
 
 ### Teardown order
 
@@ -204,13 +209,13 @@ On Windows these are exported in MSYS-form (`/c/...`), never `C:/...`. Not becau
 3. **Monitoring** (`waitForSession()`)
    - Polls session status every 5 seconds
    - Checks for the continue file
-   - Tracks `firstGuestJoinedAt` to decide whether the countdown is still armed (see [The wait loop and its firstGuestJoinedAt latch](#the-wait-loop-and-its-firstguestjoinedat-latch))
-   - A failed lookup ("unknown") never ends the wait and never spends the countdown
+   - Logs the time left before upterm's join deadline, and the first join (see [The wait loop and its join latch](#the-wait-loop-and-its-join-latch))
+   - A failed lookup ("unknown") never ends the wait
 
 4. **Termination** - the wait ends when:
    - The continue file is created
-   - The session reaches a terminal status (`disconnected`, `ending`, `ended`)
-   - The countdown expires while no guest has ever joined (`stopSession()` is called)
+   - The session reaches a terminal status (`disconnected`, `ending`, `ended`) - including upterm ending it at its join deadline
+   - upterm reports no session by that name (exit 4)
 
 5. **Post-Step Teardown** (`finalizeSession()`, run inside a `finally` in `runPost()`) - see [Teardown order](#teardown-order)
    - Runs on both success and failure paths, since `post-if` is `!cancelled()`. On an outright cancellation of the main step, the post step does not run at all; the runner's orphan sweep is what ends the session (see [Why No WMI](#why-no-wmi))
@@ -302,14 +307,14 @@ the measured paths and how to shorten them.
 
 2. **Session Creation Errors**
    - Upterm not available
-   - Unsupported upterm version (`< v0.31.0`, or an unparseable version), caught by `assertSupportedUptermVersion()` before a session is even attempted
+   - Unsupported upterm version (`< v0.32.0`, or an unparseable version), caught by `assertSupportedUptermVersion()` before a session is even attempted
    - Network connectivity to upterm server
    - Permission issues
 
 3. **Runtime Errors**
    - `upterm host --detach` exits without a usable `sshCommand`
    - Connection refused (unexpected termination)
-   - Timeout reached while no guest ever joined
+   - upterm ended the session at its join deadline (no guest joined)
 
 ### Error Message Design
 

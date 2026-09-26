@@ -15,7 +15,7 @@ This GitHub Action enables direct interaction with the host system running your 
 
 ## Requirements
 
-This action installs [upterm](https://upterm.dev/) v0.31.0 or newer automatically. If you pin an older release with `upterm-version`, the action refuses to start (including a version string it cannot parse) — pin `owenthereal/action-upterm@v1` instead if you need an older upterm.
+This action installs [upterm](https://upterm.dev/) v0.32.0 or newer automatically. If you pin an older release with `upterm-version`, the action refuses to start (including a version string it cannot parse) — pin `owenthereal/action-upterm@v2.0.0` to keep using upterm v0.31, or `owenthereal/action-upterm@v1` for anything older.
 
 ## Getting Started
 
@@ -78,7 +78,7 @@ jobs:
 
 ## Pin a Specific Upterm Version
 
-By default, the action downloads the latest Upterm release directly from GitHub. To pin a specific release (for example, `v0.31.0`), provide the optional `upterm-version` input:
+By default, the action downloads the latest Upterm release directly from GitHub. To pin a specific release (for example, `v0.32.0`), provide the optional `upterm-version` input:
 
 ```yaml
 name: CI
@@ -91,11 +91,11 @@ jobs:
     - name: Setup upterm session
       uses: owenthereal/action-upterm@v2
       with:
-        upterm-version: v0.31.0
+        upterm-version: v0.32.0
 ```
 
 - Works on all platforms (Linux, macOS, and Windows).
-- **Upterm versions below `v0.31.0` are refused.** v0.31.0 is the first release that reports whether a guest has joined a session, which the timeout behavior below depends on; the action fails fast at startup against an older (or unparseable) version. If you need an older Upterm, pin `owenthereal/action-upterm@v1` instead of `@v2`.
+- **Upterm versions below `v0.32.0` are refused.** v0.32.0 is the first release whose daemon enforces a join timeout set after the session started (`upterm session set`), which the timeout behavior below depends on; the action fails fast at startup against an older (or unparseable) version. For upterm v0.31, pin `owenthereal/action-upterm@v2.0.0`; for anything older, `@v1`.
 
 ## Shut Down the Server if No User Connects
 
@@ -117,7 +117,7 @@ jobs:
         wait-timeout-minutes: 5
 ```
 
-The countdown is disarmed the moment upterm records that a guest has joined — even a guest who joined and left again between polls, or (in detached mode) joined and left while the rest of the job was still running. Once that has happened, the countdown does not run again: the session stays up until it ends on its own.
+upterm itself enforces the timeout: it ends the session when the time is up unless a guest has joined. The first guest to join — even one who joined and left again at once, or (in detached mode) joined and left while the rest of the job was still running — claims the session for good: the timeout is disabled, and the session stays up until it ends on its own or the job finishes. The log shows the time left, and says `A guest joined at …; automatic join timeout disabled` once someone has.
 
 ## Detached Mode
 
@@ -139,7 +139,7 @@ jobs:
       run: npm test
 ```
 
-By default, detached mode's countdown starts after all regular steps finish, and waits for a guest to join before terminating the session. If no guest joins within the timeout period (default 10 minutes), it terminates the session gracefully. If the job is cancelled, the post step that runs this countdown does not run at all — the runner's own orphan sweep ends the session once the job finishes.
+By default, detached mode's timeout starts after all regular steps finish: that is when the post step gives it to upterm (`upterm session set`). If no guest joins within the timeout period (default 10 minutes), upterm ends the session. If the job is cancelled, the post step does not run at all — the runner's own orphan sweep ends the session once the job finishes.
 
 As this mode has turned out to be so useful as to having the potential for being the default mode once time travel becomes available, it is also available as `owenthereal/action-upterm/detached` for convenience.
 
@@ -188,7 +188,7 @@ touch /c/msys64/continue
 
 - **No more tmux.** v1 hosted the session inside a nested tmux, with its own keybindings (`C-b` prefix) for detaching and resizing. v2 lets upterm host the session directly: there is no tmux prefix, the shared terminal follows the connecting guest's size (v1 pinned it to 132x43), and ssh's own escape sequence (or closing the terminal window) is how you detach without resuming the workflow — see [Continue a Workflow](#continue-a-workflow) above for how that differs from ending the session.
 - **The hosted shell is now upterm's own default, not tmux's login shell.** v1's tmux started a login shell; v2 runs `$SHELL` directly (non-login), falling back to `/bin/sh` if `SHELL` is unset — which some self-hosted runners don't set. On Windows the hosted command is unchanged: MSYS2's login bash (`bash -l`).
-- **Requires upterm v0.31.0 or newer.** See [Requirements](#requirements) above; pin `@v1` if you need an older upterm.
+- **Requires upterm v0.32.0 or newer** (action-upterm v2.1.0 and later; v2.0.0 required v0.31.0). See [Requirements](#requirements) above.
 - **`upterm session current` works inside the session** — upterm itself injects `UPTERM_ADMIN_SOCKET` and `UPTERM_SESSION_NAME`, so no wrapper configuration is needed for it to resolve.
 - **Windows no longer uses WMI to launch the session.** See [ARCHITECTURE.md](ARCHITECTURE.md#why-no-wmi) for why.
 
