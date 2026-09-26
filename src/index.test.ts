@@ -123,7 +123,7 @@ function baselineInputs(): void {
 function baselineShell(...sessionResponses: string[]): void {
   const queue = sessionResponses.length ? [...sessionResponses] : [readySession()];
   mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-    if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+    if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
     if (cmd.includes('upterm host') || cmd.includes('session info')) return queue.length > 1 ? (queue.shift() as string) : queue[0];
     return 'foobar';
   });
@@ -226,13 +226,15 @@ describe('upterm GitHub integration', () => {
 
   describe('upterm version gate', () => {
     it('fails with an actionable message when the pinned upterm is too old', async () => {
-      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.30.0');
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('upterm version') ? 'Upterm version 0.30.0\n' : ''));
+      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.31.0');
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => (cmd.includes('upterm version') ? 'Upterm version 0.31.0\n' : ''));
 
       await run();
 
-      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('requires upterm >= v0.31.0'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('requires upterm >= v0.32.0 (found v0.31.0)'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('owenthereal/action-upterm@v2.0.0'));
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('owenthereal/action-upterm@v1'));
+      expect(mockedExecShellCommand).not.toHaveBeenCalledWith(expect.stringContaining('upterm host'), expect.anything());
     });
 
     it('refuses a version string it cannot read instead of guessing', async () => {
@@ -557,7 +559,7 @@ describe('upterm GitHub integration', () => {
     // The launch succeeds; every monitoring lookup after it fails.
     let polls = 0;
     mockedExecShellCommand.mockImplementation((cmd: string) => {
-      if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.31.0\n');
+      if (cmd.includes('upterm version')) return Promise.resolve('Upterm version v0.32.0\n');
       if (cmd.includes('upterm host')) return Promise.resolve(readySession());
       if (cmd.includes('session info')) {
         polls++;
@@ -946,7 +948,7 @@ describe('upterm GitHub integration', () => {
     beforeEach(() => {
       fsWithoutExitFiles();
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
         if (cmd.includes('upterm host')) return readySession();
         if (cmd.includes('session info')) return endedResponse;
         return '';
@@ -993,7 +995,7 @@ describe('upterm GitHub integration', () => {
     it('reports upterm’s own error and the session diagnostics when the launch fails', async () => {
       Object.defineProperty(process, 'platform', {value: 'linux'});
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
         if (cmd.includes('upterm host')) throw new Error('Command failed with exit code 1\nStderr: Error: session gha-x could not start: dial tcp: connection refused');
         if (cmd.includes('session info')) return JSON.stringify({name: 'gha-x', status: 'ended', reason: 'startup_failed'});
         return '';
@@ -1007,7 +1009,7 @@ describe('upterm GitHub integration', () => {
     it('fails when upterm reports a session with no ssh command', async () => {
       Object.defineProperty(process, 'platform', {value: 'linux'});
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
         if (cmd.includes('upterm host')) return noDetail;
         if (cmd.includes('session info')) return noDetail;
         return '';
@@ -1025,7 +1027,7 @@ describe('upterm GitHub integration', () => {
       // sshCommand is non-empty.
       Object.defineProperty(process, 'platform', {value: 'linux'});
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
         if (cmd.includes('upterm host')) return JSON.stringify({name: 'gha-x', status: 'disconnected', sshCommand: 'ssh x@y'});
         if (cmd.includes('session info')) return JSON.stringify({name: 'gha-x', status: 'disconnected', sshCommand: 'ssh x@y'});
         return '';
@@ -1363,7 +1365,7 @@ describe('upterm GitHub integration', () => {
       when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
       let polls = 0;
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
         if (cmd.includes('upterm host')) return readySession();
         if (!cmd.includes('session info')) return '';
         polls++;
@@ -1382,7 +1384,7 @@ describe('upterm GitHub integration', () => {
       when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
       let polls = 0;
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('upterm version')) return 'Upterm version 0.31.0\n';
+        if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
         if (cmd.includes('upterm host')) return readySession();
         if (!cmd.includes('session info')) return '';
         polls++;

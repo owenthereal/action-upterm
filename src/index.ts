@@ -427,13 +427,14 @@ async function installDependencies(): Promise<void> {
 }
 
 /**
- * Refuse to run against an upterm older than v0.31.0.
+ * Refuse to run against an upterm older than v0.32.0.
  *
- * v0.31.0 is the first upterm that publishes firstGuestJoinedAt. v2 decides
- * whether to stop an unanswered session from this field, and an older upterm
- * always omits it, which would read as "nobody joined" and stop a session
- * somebody is in. Older versions are refused, not guessed at - including a
- * version string that cannot be parsed, which v1 only warned about.
+ * v0.32.0 is the first upterm whose daemon takes a join timeout after launch
+ * (`upterm session set`) and exits 4 for a session that does not exist.
+ * Against an older one the post step could not open the join window, and a
+ * session that had gone would read as a failed lookup for ever. Older
+ * versions are refused, not guessed at - including a version string that
+ * cannot be parsed, which v1 only warned about.
  */
 async function assertSupportedUptermVersion(): Promise<void> {
   let output: string;
@@ -446,15 +447,17 @@ async function assertSupportedUptermVersion(): Promise<void> {
   const version = parseUptermVersion(output);
   const floor = formatVersion(UPTERM_MIN_VERSION);
 
-  // Refused, not warned about: v2 decides whether to stop a session from a
-  // field older upterms never publish, and an unknown version is an unknown
-  // answer to "can this upterm say whether anyone joined?".
+  // Refused, not warned about: an unknown version is an unknown answer to
+  // "can this upterm enforce the join timeout the action gives it?".
   if (!version) {
-    throw new Error(`Could not determine the installed upterm version from: ${output.trim()}. action-upterm v2 requires upterm >= ${floor}.`);
+    throw new Error(`Could not determine the installed upterm version from: ${output.trim()}. This version of action-upterm requires upterm >= ${floor}.`);
   }
 
   if (!isUptermVersionSupported(version)) {
-    throw new Error(`action-upterm v2 requires upterm >= ${floor} (found ${formatVersion(version)}). ` + `Remove the upterm-version input to use the latest release, or pin owenthereal/action-upterm@v1 to keep using an older upterm.`);
+    throw new Error(
+      `This version of action-upterm requires upterm >= ${floor} (found ${formatVersion(version)}). ` +
+        'Remove the upterm-version input to use the latest release, or pin owenthereal/action-upterm@v2.0.0 to keep using upterm v0.31, or owenthereal/action-upterm@v1 for anything older.'
+    );
   }
 }
 

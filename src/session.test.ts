@@ -194,15 +194,16 @@ describe('formatVersion', () => {
 });
 
 describe('isUptermVersionSupported', () => {
-  it('accepts 0.31.0 and newer', () => {
-    expect(isUptermVersionSupported({major: 0, minor: 31, patch: 0})).toBe(true);
-    expect(isUptermVersionSupported({major: 0, minor: 31, patch: 4})).toBe(true);
+  it('accepts 0.32.0 and newer', () => {
     expect(isUptermVersionSupported({major: 0, minor: 32, patch: 0})).toBe(true);
+    expect(isUptermVersionSupported({major: 0, minor: 32, patch: 4})).toBe(true);
+    expect(isUptermVersionSupported({major: 0, minor: 33, patch: 0})).toBe(true);
     expect(isUptermVersionSupported({major: 1, minor: 0, patch: 0})).toBe(true);
   });
 
-  it('rejects 0.30.x, which cannot report whether a guest ever joined', () => {
-    expect(isUptermVersionSupported({major: 0, minor: 30, patch: 9})).toBe(false);
-    expect(isUptermVersionSupported({major: 0, minor: 29, patch: 0})).toBe(false);
+  it('rejects 0.31.x and older, which cannot take a join timeout after launch', () => {
+    expect(isUptermVersionSupported({major: 0, minor: 31, patch: 9})).toBe(false);
+    expect(isUptermVersionSupported({major: 0, minor: 31, patch: 0})).toBe(false);
+    expect(isUptermVersionSupported({major: 0, minor: 30, patch: 0})).toBe(false);
   });
 });

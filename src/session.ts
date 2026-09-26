@@ -127,11 +127,14 @@ export async function getSession(name: string): Promise<SessionInfo | null> {
 }
 
 /**
- * v0.31.0 is the first upterm that publishes firstGuestJoinedAt. Below it the
- * field is always absent, which v2 would read as "nobody has joined" and stop a
- * session someone is sitting in — so older versions are refused, not guessed at.
+ * v0.32.0 is the first upterm with `upterm session set --join-timeout`, which
+ * the detached post step uses to open the join window; the daemon-owned
+ * deadline and its joinDeadline/joinStateSource fields, which the wait loop
+ * reports; and exit 4 for "no session named", which is how the action tells a
+ * session that is gone from a lookup that failed. Older versions are refused,
+ * not guessed at.
  */
-export const UPTERM_MIN_VERSION = {major: 0, minor: 31, patch: 0};
+export const UPTERM_MIN_VERSION = {major: 0, minor: 32, patch: 0};
 
 export interface UptermVersion {
   major: number;
