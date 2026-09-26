@@ -807,13 +807,11 @@ describe('upterm GitHub integration', () => {
       expect(core.info).not.toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
     });
 
-    it('warns about a persistently failing lookup without spending the countdown', async () => {
-      // 'unknown' skips every break AND the countdown, so a lookup that fails on
-      // every iteration leaves the loop with no exit at all. core.debug is
-      // invisible at default verbosity, so the only symptom was a number that
-      // never moved. The deferral stays (spending the countdown could kill a
-      // session someone attached to before any poll succeeded) - the failure
-      // just has to be VISIBLE.
+    it('warns about a persistently failing lookup and keeps waiting', async () => {
+      // 'unknown' ends nothing, so a lookup that fails on every iteration
+      // leaves the loop with no exit but the continue file. core.debug is
+      // invisible at default verbosity, so the only symptom was a log that
+      // never moved. The failure just has to be VISIBLE.
       postState();
       when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
 
@@ -839,7 +837,7 @@ describe('upterm GitHub integration', () => {
       // the log it exists to make readable.
       expect(lookupWarnings.length).toBeGreaterThanOrEqual(2);
       expect(lookupWarnings.length).toBeLessThan(polls);
-      // The countdown still does NOT advance on an unknown.
+      // An unknown is never read as the session having ended by its timeout.
       expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
     });
 
@@ -1149,253 +1147,251 @@ describe('upterm GitHub integration', () => {
     });
   });
 
-  describe('countdown (both modes)', () => {
+  describe('join timeout (upterm owns the deadline)', () => {
+    const NOW = Date.parse('2026-09-26T10:00:00Z');
+    const IN_42S = '2026-09-26T10:00:42Z';
+    const SSH_LINE = 'SSH: ssh user@session.upterm.dev';
     const sessionStops = () => mockedExecShellCommand.mock.calls.filter(c => c[0].includes('session stop')).length;
+    const commands = () => mockedExecShellCommand.mock.calls.map(c => c[0]);
+    const joinLines = () => core.info.mock.calls.map(c => String(c[0])).filter(l => l.startsWith('A guest joined at'));
+    const counting = (fields: Record<string, unknown> = {}) => readySession({joinStateSource: 'daemon', joinTimeout: '1m', joinDeadline: IN_42S, ...fields});
+    const endedByTimeout = JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', reason: 'join_timeout', joinTimeout: '1m', joinDeadline: IN_42S, joinStateSource: 'record'});
 
-    // Collect console.log lines: the loop reports progress there, not via core.*.
-    function captureLog(): {lines: string[]; restore: () => void} {
+    /** Runs run() with console.log captured, and returns the wait's progress lines. */
+    async function runCapturingProgress(): Promise<string[]> {
       const lines: string[] = [];
       const spy = jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
         lines.push(String(args[0]));
       });
-      return {lines, restore: () => spy.mockRestore()};
+      try {
+        await run();
+      } finally {
+        spy.mockRestore();
+      }
+      return lines.filter(l => l.startsWith('Waiting'));
     }
+
+    /** Post-step shell: `session set` answers setAnswer (or throws it); `session info` walks infoResponses, the last repeating. */
+    function postShell(setAnswer: string | Error, ...infoResponses: string[]): {polls: () => number} {
+      let polls = 0;
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('session set')) {
+          if (setAnswer instanceof Error) throw setAnswer;
+          return setAnswer;
+        }
+        if (cmd.includes('session info')) return infoResponses[Math.min(polls++, infoResponses.length - 1)];
+        return '';
+      });
+      return {polls: () => polls};
+    }
+
+    let dateNow: jest.SpyInstance;
 
     beforeEach(() => {
       Object.defineProperty(process, 'platform', {value: 'linux'});
       Object.defineProperty(process, 'arch', {value: 'x64'});
       fsWithoutExitFiles();
+      dateNow = jest.spyOn(Date, 'now').mockReturnValue(NOW);
     });
 
-    it('detached: with nobody ever joining, stops the session when the countdown runs out', async () => {
-      postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        // Backstop: a regression that stops the countdown from firing must
-        // fail an assertion below, not hang the suite forever.
-        return polls < 500 ? readySession() : endedResponse;
-      });
+    afterEach(() => dateNow.mockRestore());
 
-      await run();
+    describe('detached post step', () => {
+      beforeEach(() => postState());
 
-      expect(sessionStops()).toBeGreaterThanOrEqual(1);
-      expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('upterm session stop gha-3f9a1c05'), expect.anything());
-      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
-    });
+      it("opens the window with session set before its first poll, and logs upterm's answer", async () => {
+        when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+        postShell('session gha-3f9a1c05 ends at 2026-09-26T10:01:00Z unless a guest joins\n', endedResponse);
 
-    it('detached: a join published before the post step disarms the countdown for good', async () => {
-      // A guest joined during the build and left before the post step: guestCount
-      // is 0 now, but upterm recorded the join.
-      postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        // Far past the 12 waits a 1-minute countdown would need, then end.
-        return polls < 30 ? readySession({guestCount: 0, firstGuestJoinedAt: '2026-09-23T04:12:15Z'}) : endedResponse;
-      });
-      const log = captureLog();
-      try {
         await run();
-      } finally {
-        log.restore();
-      }
 
-      expect(polls).toBeGreaterThanOrEqual(30);
-      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
-      expect(log.lines.some(l => l.startsWith('Waiting for session to end'))).toBe(true);
-      expect(log.lines.some(l => l.includes('Waiting for client to connect'))).toBe(false);
-    });
-
-    it('detached: a guest who came and went between two polls still disarms it', async () => {
-      postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        if (polls <= 3) return readySession({guestCount: 0});
-        // Never observed present (guestCount 0 on every poll), only recorded.
-        if (polls < 40) return readySession({guestCount: 0, firstGuestJoinedAt: '2026-09-23T04:12:15Z'});
-        return endedResponse;
+        const set = commands().indexOf('upterm session set gha-3f9a1c05 --join-timeout 1m');
+        expect(set).toBeGreaterThanOrEqual(0);
+        expect(set).toBeLessThan(commands().findIndex(c => c.includes('session info')));
+        expect(core.info).toHaveBeenCalledWith('session gha-3f9a1c05 ends at 2026-09-26T10:01:00Z unless a guest joins');
       });
 
-      await run();
+      it.each(['', '0'])('opens a 10-minute window when wait-timeout-minutes is %p', async input => {
+        when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue(input);
+        postShell('', endedResponse);
 
-      expect(polls).toBeGreaterThanOrEqual(40);
-      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
-      expect(core.info).toHaveBeenCalledWith(expect.stringContaining('A guest joined'));
-    });
+        await run();
 
-    it('never treats guestCount as a join', async () => {
-      postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        // Forwarding-only presence: counted, never a qualifying join. Backstop
-        // at 500 so a regression fails an assertion instead of hanging.
-        return polls < 500 ? readySession({guestCount: 1}) : endedResponse;
+        expect(commands()).toContain('upterm session set gha-3f9a1c05 --join-timeout 10m');
       });
 
-      await run();
+      it("logs only upterm's own line when the Windows login shell prints before and after it", async () => {
+        postShell('/etc/profile: sourcing /etc/profile.d/msys2.sh\r\nsession gha-3f9a1c05 ends at 2026-09-26T10:10:00Z unless a guest joins\r\nlogout: bye\r\n\r\n', endedResponse);
 
-      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
-    });
+        await run();
 
-    it('re-checks right before stopping, and does not stop a session a guest just joined', async () => {
-      postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        // 12 no-guest polls spend the minute; the 13th regular poll still sees
-        // nobody and finds the countdown at zero; the 14th lookup is the final
-        // re-check, and it is the one that sees the join. (Were the 13th to see
-        // it, the ordinary poll would disarm and this would not test the re-check.)
-        if (polls <= 13) return readySession();
-        if (polls < 20) return readySession({firstGuestJoinedAt: '2026-09-23T04:13:00Z'});
-        return endedResponse;
+        expect(core.info).toHaveBeenCalledWith('session gha-3f9a1c05 ends at 2026-09-26T10:10:00Z unless a guest joins');
+        expect(core.info).not.toHaveBeenCalledWith(expect.stringContaining('/etc/profile'));
+        expect(core.info).not.toHaveBeenCalledWith(expect.stringContaining('logout'));
       });
 
-      await run();
+      it("picks upterm's line by this session's name, not by position, for its colon-form answers too", async () => {
+        postShell('noise\nsession gha-3f9a1c05: join timeout disabled\nmore noise\n', endedResponse);
 
-      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
-      // Exactly one: teardown's own unconditional stop, never a second one from
-      // the countdown itself - the re-check saw the join and disarmed it.
-      expect(sessionStops()).toBe(1);
-      expect(polls).toBeGreaterThanOrEqual(20);
-    });
+        await run();
 
-    it('does not stop when the final re-check itself fails, and tries again once a later lookup succeeds', async () => {
-      // A failed lookup never spends the countdown and never ends the wait -
-      // that includes the final re-check right before stopping. A regular poll
-      // that fails is already covered elsewhere; this is the re-check specifically.
-      postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        // 12 no-guest polls spend the minute; the 13th (regular) and 14th
-        // (re-check) both fail; a guest is then seen joined, then the session ends.
-        if (polls <= 12) return readySession();
-        if (polls <= 14) throw new Error('Command failed with exit code 2\nStderr: registry unavailable');
-        if (polls < 20) return readySession({firstGuestJoinedAt: '2026-09-23T04:14:00Z'});
-        return endedResponse;
+        expect(core.info).toHaveBeenCalledWith('session gha-3f9a1c05: join timeout disabled');
+        expect(core.info).not.toHaveBeenCalledWith('noise');
+        expect(core.info).not.toHaveBeenCalledWith('more noise');
       });
 
-      await run();
+      it('skips the wait when upterm has no session by that name (exit 4)', async () => {
+        const gone = new ShellCommandError('Command failed with exit code 4: upterm session set gha-3f9a1c05 --join-timeout 10m\nStderr: no session named "gha-3f9a1c05"', 4);
+        mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+          if (cmd.includes('session set') || cmd.includes('session stop')) throw gone;
+          return '';
+        });
 
-      // Exactly one: teardown's own unconditional stop, never a second one from
-      // the countdown itself - the re-check's retry saw the join and disarmed it.
-      expect(sessionStops()).toBe(1);
-      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
-      expect(polls).toBeGreaterThanOrEqual(20);
-    });
+        await run();
 
-    it('does not stop or warn when the final re-check finds the session already ended', async () => {
-      postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        // 12 no-guest polls spend the minute; the 13th regular poll still sees
-        // nobody and finds the countdown at zero; the 14th lookup is the final
-        // re-check, and it is the one that finds the session already ended.
-        if (polls <= 13) return readySession();
-        return endedResponse;
+        expect(sessionInfoCalls()).toBe(0);
+        expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+        expect(core.warning).not.toHaveBeenCalled();
+        expect(mockFs.rmSync).toHaveBeenCalledWith('/runner/_temp/upterm-action-abc', {recursive: true, force: true});
       });
 
-      await run();
+      it('warns when upterm could not confirm the window, then waits anyway without retrying', async () => {
+        const unconfirmed = new ShellCommandError('Command failed with exit code 1: upterm session set gha-3f9a1c05 --join-timeout 10m\nStderr: could not confirm the change to session gha-3f9a1c05', 1);
+        const shell = postShell(unconfirmed, counting(), counting(), endedByTimeout);
 
-      // Exactly one: teardown's own unconditional stop, never a second one from
-      // the countdown itself - the re-check found the session already ended.
-      expect(sessionStops()).toBe(1);
-      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
-      expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
-      expect(polls).toBe(14);
-    });
+        await run();
 
-    it('does not spend the countdown on lookups that fail', async () => {
-      postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        if (polls < 30) throw new Error('Command failed with exit code 2\nStderr: registry unavailable');
-        return endedResponse;
+        expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('could not confirm the change to session gha-3f9a1c05'));
+        expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("job's timeout-minutes"));
+        expect(shell.polls()).toBe(3);
+        expect(commands().filter(c => c.includes('session set'))).toHaveLength(1);
       });
 
-      await run();
+      it('ends at once, without a warning, when the session already ended during the build', async () => {
+        postShell('session gha-3f9a1c05 has already ended (exited)\n', JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', reason: 'exited', exitCode: 0}));
 
-      expect(polls).toBeGreaterThanOrEqual(30);
-      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
+        await run();
+
+        expect(sessionInfoCalls()).toBe(1);
+        expect(core.info).toHaveBeenCalledWith('session gha-3f9a1c05 has already ended (exited)');
+        expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+        expect(core.warning).not.toHaveBeenCalled();
+      });
     });
 
-    it('detached: defaults to 10 minutes when wait-timeout-minutes is unset', async () => {
-      postState();
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        // Backstop: a regression that stops the countdown from firing must
-        // fail an assertion below, not hang the suite forever.
-        return polls < 500 ? readySession() : endedResponse;
+    describe('launch', () => {
+      const launch = () => commands().find(c => c.includes('upterm host')) as string;
+
+      beforeEach(() => baselineShell(readySession(), endedResponse));
+
+      it.each([
+        ['5', " --server 'ssh://myserver:22' --join-timeout 5m"],
+        ['', " --server 'ssh://myserver:22'"],
+        ['0', " --server 'ssh://myserver:22'"]
+      ])('attached: wait-timeout-minutes %p ends the launch line with %p', async (input, tail) => {
+        when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue(input);
+
+        await run();
+
+        expect(launch().endsWith(tail)).toBe(true);
+        expect(commands().some(c => c.includes('session set'))).toBe(false);
       });
 
-      await run();
+      it('never passes --join-timeout in detached mode, whose window opens after the build', async () => {
+        // A window counted from launch would end the session mid-build.
+        when(core.getInput).calledWith('detached').mockReturnValue('true');
+        when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
 
-      // 120 polls spend 10 minutes at 5 s each; the 121st finds the countdown
-      // at zero; the 122nd is the final re-check before stopping.
-      expect(polls).toBe(122);
-      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
+        await run();
+
+        expect(launch()).not.toContain('--join-timeout');
+      });
     });
 
-    it('attached: counts down from readiness only when wait-timeout-minutes is set', async () => {
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
-        if (cmd.includes('upterm host')) return readySession();
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        // Backstop: a regression that stops the countdown from firing must
-        // fail an assertion below, not hang the suite forever.
-        return polls < 500 ? readySession() : endedResponse;
+    describe('the wait', () => {
+      it('never stops the session itself, however long past the deadline; upterm ends it', async () => {
+        when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
+        let polls = 0;
+        mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+          if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
+          if (cmd.includes('upterm host')) return counting();
+          if (!cmd.includes('session info')) return '';
+          polls++;
+          return polls < 200 ? counting({joinDeadline: '2026-09-26T09:50:00Z'}) : endedByTimeout;
+        });
+
+        await run();
+
+        expect(polls).toBe(200);
+        expect(sessionStops()).toBe(0);
+        expect(core.warning).toHaveBeenCalledWith('Timed out waiting for client to connect (join timeout 1m)');
+        expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
       });
 
-      await run();
+      it('reports a join timeout without a duration when the record has none', async () => {
+        postState();
+        postShell('', JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', reason: 'join_timeout'}));
 
-      expect(mockedExecShellCommand).toHaveBeenCalledWith(expect.stringContaining('upterm session stop gha-'), expect.anything());
-      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Timed out waiting for client to connect'));
-    });
+        await run();
 
-    it('attached: without wait-timeout-minutes, waits for the session to end and never stops it itself', async () => {
-      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
-      let polls = 0;
-      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
-        if (cmd.includes('upterm host')) return readySession();
-        if (!cmd.includes('session info')) return '';
-        polls++;
-        return polls < 200 ? readySession() : endedResponse;
+        expect(core.warning).toHaveBeenCalledWith('Timed out waiting for client to connect');
       });
 
-      await run();
+      it("shows the seconds left before upterm's deadline, and 0 once it has passed", async () => {
+        postState();
+        postShell('', counting(), counting({joinDeadline: '2026-09-26T09:59:59Z'}), endedByTimeout);
 
-      expect(polls).toBe(200);
-      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('Timed out'));
-      expect(sessionStops()).toBe(0);
+        const lines = await runCapturingProgress();
+
+        expect(lines).toEqual([`Waiting for client to connect (at most 42 more second(s))\n${SSH_LINE}`, `Waiting for client to connect (at most 0 more second(s))\n${SSH_LINE}`]);
+      });
+
+      it('announces the first join once, and a later stale response cannot bring the countdown back', async () => {
+        postState();
+        const joined = readySession({joinStateSource: 'daemon', firstGuestJoinedAt: '2026-09-26T09:58:00Z'});
+        // A record written before the join, served while the daemon did not answer.
+        const stale = counting({joinStateSource: 'record'});
+        postShell('session gha-3f9a1c05: a guest joined at 2026-09-26T09:58:00Z; automatic join timeout disabled\n', joined, joined, stale, stale, endedResponse);
+
+        const lines = await runCapturingProgress();
+
+        expect(joinLines()).toEqual(['A guest joined at 2026-09-26T09:58:00Z; automatic join timeout disabled']);
+        expect(lines).toEqual(Array(4).fill(`Waiting for session to end\n${SSH_LINE}`));
+      });
+
+      it('announces a join upterm read from its record: a recorded join is never stale', async () => {
+        postState();
+        postShell('', readySession({joinStateSource: 'record', firstGuestJoinedAt: '2026-09-26T09:58:00Z'}), endedResponse);
+
+        const lines = await runCapturingProgress();
+
+        expect(joinLines()).toEqual(['A guest joined at 2026-09-26T09:58:00Z; automatic join timeout disabled']);
+        expect(lines).toEqual([`Waiting for session to end\n${SSH_LINE}`]);
+      });
+
+      it('labels join state that upterm read from its record, or did not attribute, as unconfirmed', async () => {
+        postState();
+        // readySession() carries no joinStateSource at all.
+        postShell('', counting({joinStateSource: 'record'}), readySession(), endedResponse);
+
+        const lines = await runCapturingProgress();
+
+        expect(lines).toEqual([
+          `Waiting for client to connect (at most 42 more second(s), unconfirmed: upterm answered from its record)\n${SSH_LINE}`,
+          `Waiting for session to end (join timeout unconfirmed: upterm answered from its record)\n${SSH_LINE}`
+        ]);
+      });
+
+      it('never treats guestCount as a join', async () => {
+        // guestCount counts forwarding-only presence, and is a current count, not an event.
+        postState();
+        postShell('', counting({guestCount: 1}), endedResponse);
+
+        const lines = await runCapturingProgress();
+
+        expect(joinLines()).toEqual([]);
+        expect(lines).toEqual([`Waiting for client to connect (at most 42 more second(s))\n${SSH_LINE}`]);
+      });
     });
   });
 
