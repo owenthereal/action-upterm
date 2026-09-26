@@ -134,8 +134,8 @@ to_epoch() {
 # text (the closing escape) after it, so it can't match this pattern.
 build_finished_runtime_pattern='[0-9]Z BUILD_FINISHED[[:space:]]*$'
 
-# The post step prints "A guest joined at <firstGuestJoinedAt>", upterm's own
-# recorded join time - not the log line's own print time, which is always
+# The post step prints "A guest joined at <firstGuestJoinedAt>; automatic join timeout disabled",
+# upterm's own recorded join time - not the log line's own print time, which is always
 # later (the post step only starts after Build finishes, so a plain line-order
 # check can't tell a build-time join from a post-step-time one; both always
 # print after BUILD_FINISHED in the raw log). Compares the recorded VALUE
@@ -394,10 +394,11 @@ case "$scenario" in
   long-build)
     wait_for_completion
     log=$(fetch_log)
-    assert_order "BUILD_FINISHED, then the countdown, then the timeout warning" "$log" \
+    assert_order "BUILD_FINISHED, then upterm's window, the countdown, and the timeout" "$log" \
       "$build_finished_runtime_pattern" \
-      'Waiting for client to connect \(at most 60 more second\(s\)\)' \
-      'Timed out waiting for client to connect'
+      'session gha-[0-9a-f]{8} ends at [^ ]+ unless a guest joins' \
+      'Waiting for client to connect \(at most (5[0-9]|60) more second\(s\)\)' \
+      'Timed out waiting for client to connect \(join timeout 1m\)'
     conclusion=$(gh run view "$run_id" --repo "$repo" --json conclusion --jq .conclusion) || true
     if [ "$conclusion" = "success" ]; then
       pass "job succeeded"
@@ -436,6 +437,9 @@ case "$scenario" in
     wait_for_completion
     log=$(fetch_log)
     assert_contains "a guest joined" 'A guest joined at' "$log"
+    assert_contains "the join disabled the automatic timeout" 'A guest joined at [^ ]+; automatic join timeout disabled' "$log"
+    assert_contains "upterm's session set answered that the session was already claimed" \
+      'session gha-[0-9a-f]{8}: a guest joined at [^ ]+; automatic join timeout disabled' "$log"
     assert_contains "the post step waited for the session to end" 'Waiting for session to end' "$log"
     assert_not_contains "no client-connect timeout" 'Timed out waiting for client to connect' "$log"
     # If the build-time join silently failed (e.g. a race, not necessarily

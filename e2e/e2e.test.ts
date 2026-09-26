@@ -32,7 +32,7 @@ const SSH_COMMAND_PATTERN = /^ssh\s+\S+@uptermd\.upterm\.dev$/;
  */
 const BUILD_45_MS = 45000; // e2e-fixture-detached.yml's "Build" step
 const BUILD_90_MS = 90000; // e2e-fixture-long-build.yml's "Build longer than the countdown" step
-const COUNTDOWN_MS = 60000; // wait-timeout-minutes: 1 on every detached fixture used here
+const COUNTDOWN_MS = 60000; // wait-timeout-minutes: 1 on every timeout fixture used here (detached and attached)
 const STEP_OVERHEAD_MS = 30000; // slack per hop: step setup/teardown, docker exec spawn, poll granularity
 const TEARDOWN_SLACK_MS = 60000; // headroom between a chain's own ceiling and the it() timeout that must outlive it
 
@@ -137,7 +137,7 @@ describe('E2E: long build, then the post step gets the full countdown', () => {
       // happen after the SSH line before that pattern can appear, plus one
       // STEP_OVERHEAD_MS per intervening hop.
       const buildFinished = waitForOutput(/\|\s*BUILD_FINISHED\b/, SSH_COMMAND_TIMEOUT_MS + BUILD_90_MS + STEP_OVERHEAD_MS);
-      const fullWindow = waitForOutput(/Waiting for client to connect \(at most 60 more second\(s\)\)/, SSH_COMMAND_TIMEOUT_MS + BUILD_90_MS + STEP_OVERHEAD_MS * 2);
+      const fullWindow = waitForOutput(/Waiting for client to connect \(at most (5\d|60) more second\(s\)\)/, SSH_COMMAND_TIMEOUT_MS + BUILD_90_MS + STEP_OVERHEAD_MS * 2);
       const timedOut = waitForOutput(/Timed out waiting for client to connect/, SSH_COMMAND_TIMEOUT_MS + BUILD_90_MS + STEP_OVERHEAD_MS * 2 + COUNTDOWN_MS);
 
       const sshCommand = await sshCommandPromise;
@@ -148,10 +148,11 @@ describe('E2E: long build, then the post step gets the full countdown', () => {
       console.log('BUILD_FINISHED observed');
 
       const fullWindowAt = await fullWindow.then(() => Date.now());
-      console.log('Post step started counting down with the full 60s available');
+      console.log("Post step shows (nearly) the full 60s left on upterm's deadline");
 
-      // The whole minute is still available after the 90s build: the countdown
-      // starts once the post step begins, not when the main step launched it.
+      // Nearly the whole minute is still available after the 90s build: upterm
+      // counts from the post step's 'session set', not from launch (a window
+      // counted from launch would have ended the session during the build).
       expect(buildFinishedAt).toBeLessThan(fullWindowAt);
 
       // Nobody joins in this scenario, so the countdown must eventually expire.
@@ -162,7 +163,7 @@ describe('E2E: long build, then the post step gets the full countdown', () => {
   );
 });
 
-describe('E2E: a guest who leaves before the post step disarms the countdown', () => {
+describe('E2E: a guest who leaves before the post step claims the session', () => {
   let killActProcess: (() => void) | null = null;
 
   afterAll(async () => {
@@ -179,7 +180,7 @@ describe('E2E: a guest who leaves before the post step disarms the countdown', (
   });
 
   it(
-    'firstGuestJoinedAt survives a join that happened before the post step ever polled',
+    'session set answers claimed, and the post step never counts down',
     async () => {
       const {sshCommandPromise, waitForOutput, killProcess} = runActWorkflow({
         workflowFile: '.github/workflows/e2e-fixture-detached.yml'
@@ -194,11 +195,13 @@ describe('E2E: a guest who leaves before the post step disarms the countdown', (
       // rest also need the 45s build to finish first, plus a hop per hurdle.
       const continued = waitForOutput(/\|\s*DETACHED_WORKFLOW_CONTINUED\b/, SSH_COMMAND_TIMEOUT_MS + STEP_OVERHEAD_MS);
       const guestJoinedMsg = waitForOutput(/A guest joined at/, SSH_COMMAND_TIMEOUT_MS + BUILD_45_MS + STEP_OVERHEAD_MS * 2);
+      const claimedBySet = waitForOutput(/session gha-[0-9a-f]{8}: a guest joined at \S+; automatic join timeout disabled/, SSH_COMMAND_TIMEOUT_MS + BUILD_45_MS + STEP_OVERHEAD_MS * 2);
       const waitingForSessionEnd = waitForOutput(/Waiting for session to end/, SSH_COMMAND_TIMEOUT_MS + BUILD_45_MS + STEP_OVERHEAD_MS * 2);
-      // Since the daemon already recorded the join before the post step's first
-      // poll, "Waiting for client to connect" (the counting message) must never
-      // appear at all. Covers the whole scenario, including touching /continue
-      // and the post step noticing it, so one hop more than the above.
+      // upterm recorded the join during the build, so 'session set' changes
+      // nothing and the first poll latches: "Waiting for client to connect"
+      // (the counting message) must never appear at all. Covers the whole
+      // scenario, including touching /continue and the post step noticing it,
+      // so one hop more than the above.
       const neverCounting = assertNeverPrints(waitForOutput, /Waiting for client to connect/, SSH_COMMAND_TIMEOUT_MS + BUILD_45_MS + STEP_OVERHEAD_MS * 3);
 
       const sshCommand = await sshCommandPromise;
@@ -213,6 +216,7 @@ describe('E2E: a guest who leaves before the post step disarms the countdown', (
       await joinAsGuest(sshCommand, 3000);
       console.log('Guest joined and left during the build step');
 
+      await claimedBySet;
       await guestJoinedMsg;
       await waitingForSessionEnd;
       console.log('Post step recognized the earlier join on its very first poll');
@@ -227,7 +231,7 @@ describe('E2E: a guest who leaves before the post step disarms the countdown', (
   );
 });
 
-describe('E2E: a join shorter than one poll interval still disarms the countdown', () => {
+describe('E2E: a join shorter than one poll interval still claims the session', () => {
   let killActProcess: (() => void) | null = null;
 
   afterAll(async () => {
@@ -270,15 +274,15 @@ describe('E2E: a join shorter than one poll interval still disarms the countdown
       console.log('Post step began counting down; joining briefly now');
 
       // Shorter than the 5s poll interval: no single poll can observe the guest
-      // mid-connection. Only the daemon's own recorded firstGuestJoinedAt makes
-      // the next poll see the join.
+      // mid-connection. upterm's daemon records the join and disables its own
+      // deadline; the next poll reports it via firstGuestJoinedAt.
       await joinAsGuest(sshCommand, 1500);
       console.log('Guest joined and left between two polls');
 
       await guestJoinedMsg;
       console.log('Post step picked up the join on its next poll');
 
-      // Past the 60s countdown: it must not have timed out.
+      // Past the 60s window: upterm must not have ended it.
       const timedOutDuringWindow = await waitForOutput(/Timed out waiting for client to connect/, COUNTDOWN_MS + 10000).then(
         () => true,
         () => false
@@ -291,5 +295,47 @@ describe('E2E: a join shorter than one poll interval still disarms the countdown
       console.log('Touched /continue');
     },
     SSH_COMMAND_TIMEOUT_MS + BUILD_45_MS + STEP_OVERHEAD_MS * 3 + COUNTDOWN_MS + 10000 + TEARDOWN_SLACK_MS
+  );
+});
+
+describe('E2E: attached mode, nobody joins, upterm ends the session at its deadline', () => {
+  let killActProcess: (() => void) | null = null;
+
+  afterAll(async () => {
+    if (killActProcess) {
+      console.log('Cleaning up: killing act process...');
+      killActProcess();
+      // Longer than killProcess's 5000ms SIGKILL fallback: see the first describe.
+      await sleep(6000);
+    }
+  });
+
+  it(
+    "the attached step ends by upterm's own join timeout and the job carries on",
+    async () => {
+      const {sshCommandPromise, waitForOutput, killProcess} = runActWorkflow({
+        workflowFile: '.github/workflows/e2e-fixture-attached-timeout.yml'
+      });
+      killActProcess = killProcess;
+
+      // Register before any of these can fire. --join-timeout counts from
+      // readiness, which is about when the SSH line prints.
+      const counting = waitForOutput(/Waiting for client to connect \(at most \d+ more second\(s\)\)/, SSH_COMMAND_TIMEOUT_MS + STEP_OVERHEAD_MS);
+      const timedOut = waitForOutput(/Timed out waiting for client to connect \(join timeout 1m\)/, SSH_COMMAND_TIMEOUT_MS + COUNTDOWN_MS + STEP_OVERHEAD_MS);
+      // Same reasoning as buildFinished: the "| " prefix skips act's dump of the step's script.
+      const nextStep = waitForOutput(/\|\s*ATTACHED_STEP_FINISHED\b/, SSH_COMMAND_TIMEOUT_MS + COUNTDOWN_MS + STEP_OVERHEAD_MS * 2);
+
+      const sshCommand = await sshCommandPromise;
+      console.log(`Found SSH command: ${sshCommand}`);
+      expect(sshCommand).toMatch(SSH_COMMAND_PATTERN);
+
+      await counting;
+      console.log("Attached step is counting down to upterm's deadline");
+      await timedOut;
+      console.log('upterm ended the session at its deadline');
+      await nextStep;
+      console.log('The job carried on past the attached step');
+    },
+    SSH_COMMAND_TIMEOUT_MS + COUNTDOWN_MS + STEP_OVERHEAD_MS * 2 + TEARDOWN_SLACK_MS
   );
 });

@@ -4,6 +4,23 @@ import {spawn} from 'child_process';
 export const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
+ * A shell command that did not exit 0.
+ *
+ * The message is the one execShellCommand has always rejected with. exitCode
+ * lets a caller act on a documented exit status - upterm's 4, "no session has
+ * this name" - instead of matching stderr text. null when the process was
+ * ended by a signal rather than exiting.
+ */
+export class ShellCommandError extends Error {
+  constructor(
+    message: string,
+    readonly exitCode: number | null
+  ) {
+    super(message);
+  }
+}
+
+/**
  * Executes a shell command and returns the output as a Promise.
  *
  * @param cmd - The shell command to execute
@@ -12,7 +29,7 @@ export const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, 
  *   the log. Only where the output goes changes: stdout is still returned, and
  *   stderr is still included in the rejection.
  * @returns Promise that resolves with the command's stdout output
- * @throws Error if the command fails or if cmd is empty
+ * @throws ShellCommandError if the command exits non-zero; Error if cmd is empty or cannot be spawned
  */
 export function execShellCommand(cmd: string, options: {quiet?: boolean} = {}): Promise<string> {
   core.debug(`Executing shell command: [${cmd}]`);
@@ -54,7 +71,7 @@ export function execShellCommand(cmd: string, options: {quiet?: boolean} = {}): 
       if (code !== 0) {
         const errorMsg = `Command failed with exit code ${code}: ${cmd}`;
         const fullError = stderr ? `${errorMsg}\nStderr: ${stderr}` : errorMsg;
-        reject(new Error(fullError));
+        reject(new ShellCommandError(fullError, code));
         return;
       }
       resolve(stdout);

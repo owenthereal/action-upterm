@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import {execShellCommand, shellEscape} from './helpers';
+import {execShellCommand, shellEscape, ShellCommandError} from './helpers';
 
 /**
  * Session statuses.
@@ -38,6 +38,17 @@ export interface SessionInfo {
    * Absent until a guest joins. Forwarding-only connections never set it.
    */
   firstGuestJoinedAt?: string;
+  /** The join timeout upterm holds, compact (e.g. "10m"); absent when none is set, and once a guest has joined (v0.32.0+). */
+  joinTimeout?: string;
+  /** When upterm ends the session unless a guest joins first, RFC 3339; absent until counting, and once a guest has joined (v0.32.0+). */
+  joinDeadline?: string;
+  /**
+   * Where the join fields came from (v0.32.0+): "daemon" when the session
+   * itself answered for this launch; "record" when upterm fell back to the
+   * last values written, which may be stale - a record's deadline may no longer
+   * be counting, and a record without one does not prove there is no window.
+   */
+  joinStateSource?: 'daemon' | 'record';
   /**
    * True when upterm's admin query succeeded and the detail fields above are
    * trustworthy.
@@ -96,11 +107,22 @@ export function parseSessionInfo(raw: string): SessionInfo {
 }
 
 /**
+ * upterm's exit status for "no session has this name", from `session info`,
+ * `session stop` and `session set` (v0.32.0+). Every other failure exits 1.
+ */
+export const NO_SESSION_EXIT_CODE = 4;
+
+/** Whether a failed upterm call said there is no session by that name. */
+export function isNoSuchSession(error: unknown): boolean {
+  return error instanceof ShellCommandError && error.exitCode === NO_SESSION_EXIT_CODE;
+}
+
+/**
  * Look up the action's session by name.
  *
- * Returns null ONLY for a genuine not-found (no record within retained
- * history). Every other failure propagates: a lookup that failed must not be
- * indistinguishable from a session that finished.
+ * Returns null ONLY for a genuine not-found: upterm's exit 4, no record
+ * within retained history. Every other failure propagates: a lookup that
+ * failed must not be indistinguishable from a session that finished.
  */
 export async function getSession(name: string): Promise<SessionInfo | null> {
   let raw: string;
@@ -109,18 +131,21 @@ export async function getSession(name: string): Promise<SessionInfo | null> {
     // as someone is connected, and each call would dump its JSON into the log.
     raw = await execShellCommand(`upterm session info ${shellEscape(name)} -o json`, {quiet: true});
   } catch (error) {
-    if (/no session named/i.test(String(error))) return null;
+    if (isNoSuchSession(error)) return null;
     throw error;
   }
   return parseSessionInfo(raw);
 }
 
 /**
- * v0.31.0 is the first upterm that publishes firstGuestJoinedAt. Below it the
- * field is always absent, which v2 would read as "nobody has joined" and stop a
- * session someone is sitting in — so older versions are refused, not guessed at.
+ * v0.32.0 is the first upterm with `upterm session set --join-timeout`, which
+ * the detached post step uses to open the join window; the daemon-owned
+ * deadline and its joinDeadline/joinStateSource fields, which the wait loop
+ * reports; and exit 4 for "no session named", which is how the action tells a
+ * session that is gone from a lookup that failed. Older versions are refused,
+ * not guessed at.
  */
-export const UPTERM_MIN_VERSION = {major: 0, minor: 31, patch: 0};
+export const UPTERM_MIN_VERSION = {major: 0, minor: 32, patch: 0};
 
 export interface UptermVersion {
   major: number;
@@ -148,6 +173,30 @@ export function parseUptermVersion(output: string): UptermVersion | null {
 /** Whether upterm has recorded a qualifying guest join for this session. */
 export function hasGuestJoined(session: SessionInfo): boolean {
   return typeof session.firstGuestJoinedAt === 'string' && session.firstGuestJoinedAt.length > 0;
+}
+
+const UNCONFIRMED = 'unconfirmed: upterm answered from its record';
+
+/**
+ * The wait loop's progress line for a live session.
+ *
+ * `joined` is the caller's latch, not this response's firstGuestJoinedAt: the
+ * first join claims the session for good, so once one has been seen no later
+ * response - a stale record included - may bring the countdown back.
+ *
+ * Only a daemon answer confirms the join state; anything else is labelled.
+ * The seconds left are clamped at 0: teardown after the deadline fires can
+ * still show it for ~16 s.
+ */
+export function waitStatusLine(session: SessionInfo, joined: boolean, now: number): string {
+  if (joined) return 'Waiting for session to end';
+  const confirmed = session.joinStateSource === 'daemon';
+  const deadline = session.joinDeadline ? Date.parse(session.joinDeadline) : NaN;
+  if (!isNaN(deadline)) {
+    const seconds = Math.max(0, Math.ceil((deadline - now) / 1000));
+    return `Waiting for client to connect (at most ${seconds} more second(s)${confirmed ? '' : `, ${UNCONFIRMED}`})`;
+  }
+  return confirmed ? 'Waiting for session to end' : `Waiting for session to end (join timeout ${UNCONFIRMED})`;
 }
 
 export function formatVersion(v: UptermVersion): string {

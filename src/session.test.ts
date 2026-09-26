@@ -1,5 +1,5 @@
-import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion} from './session';
-import {execShellCommand} from './helpers';
+import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion, waitStatusLine} from './session';
+import {execShellCommand, ShellCommandError} from './helpers';
 
 jest.mock('./helpers', () => ({
   ...jest.requireActual('./helpers'),
@@ -118,9 +118,15 @@ describe('getSession', () => {
     expect(mockedExec).toHaveBeenCalledWith("upterm session info 'gha-3f9a1c05' -o json", {quiet: true});
   });
 
-  it('returns null when the session name is not found', async () => {
-    mockedExec.mockRejectedValue(new Error('Command failed with exit code 1\nStderr: Error: no session named "gha-3f9a1c05"'));
+  it('returns null when upterm says no session has the name (exit 4)', async () => {
+    mockedExec.mockRejectedValue(new ShellCommandError('Command failed with exit code 4: upterm session info gha-3f9a1c05 -o json\nStderr: no session named "gha-3f9a1c05"', 4));
     await expect(getSession('gha-3f9a1c05')).resolves.toBeNull();
+  });
+
+  it('does not read "no session named" text on another exit code as not-found', async () => {
+    // Only the exit code is upterm's contract; text can appear in any failure.
+    mockedExec.mockRejectedValue(new ShellCommandError('Command failed with exit code 1\nStderr: no session named "gha-3f9a1c05"', 1));
+    await expect(getSession('gha-3f9a1c05')).rejects.toThrow('no session named');
   });
 
   it('propagates any other failure instead of reporting not-found', async () => {
@@ -188,15 +194,70 @@ describe('formatVersion', () => {
 });
 
 describe('isUptermVersionSupported', () => {
-  it('accepts 0.31.0 and newer', () => {
-    expect(isUptermVersionSupported({major: 0, minor: 31, patch: 0})).toBe(true);
-    expect(isUptermVersionSupported({major: 0, minor: 31, patch: 4})).toBe(true);
+  it('accepts 0.32.0 and newer', () => {
     expect(isUptermVersionSupported({major: 0, minor: 32, patch: 0})).toBe(true);
+    expect(isUptermVersionSupported({major: 0, minor: 32, patch: 4})).toBe(true);
+    expect(isUptermVersionSupported({major: 0, minor: 33, patch: 0})).toBe(true);
     expect(isUptermVersionSupported({major: 1, minor: 0, patch: 0})).toBe(true);
   });
 
-  it('rejects 0.30.x, which cannot report whether a guest ever joined', () => {
-    expect(isUptermVersionSupported({major: 0, minor: 30, patch: 9})).toBe(false);
-    expect(isUptermVersionSupported({major: 0, minor: 29, patch: 0})).toBe(false);
+  it('rejects 0.31.x and older, which cannot take a join timeout after launch', () => {
+    expect(isUptermVersionSupported({major: 0, minor: 31, patch: 9})).toBe(false);
+    expect(isUptermVersionSupported({major: 0, minor: 31, patch: 0})).toBe(false);
+    expect(isUptermVersionSupported({major: 0, minor: 30, patch: 0})).toBe(false);
+  });
+});
+
+describe('waitStatusLine', () => {
+  const NOW = Date.parse('2026-09-26T10:00:00Z');
+  const live = (fields: Record<string, unknown>) => parseSessionInfo(JSON.stringify({name: 'gha-1', status: 'ready', sshCommand: 'ssh x@y', ...fields}));
+  const UNCONFIRMED = 'unconfirmed: upterm answered from its record';
+
+  it('counts down to a deadline the daemon confirms, rounding up', () => {
+    const s = live({joinStateSource: 'daemon', joinTimeout: '1m', joinDeadline: '2026-09-26T10:00:42.300Z'});
+    expect(waitStatusLine(s, false, NOW)).toBe('Waiting for client to connect (at most 43 more second(s))');
+  });
+
+  it('handles a nanosecond-precision deadline, as upterm writes RFC 3339 with up to 9 fractional digits', () => {
+    const s = live({joinStateSource: 'daemon', joinTimeout: '1m', joinDeadline: '2026-09-26T10:00:42.123456789Z'});
+    expect(waitStatusLine(s, false, NOW)).toBe('Waiting for client to connect (at most 43 more second(s))');
+  });
+
+  it('shows 0, never a negative count, once the deadline has passed', () => {
+    // Teardown after the deadline fires can still show it for ~16 s.
+    const s = live({joinStateSource: 'daemon', joinTimeout: '1m', joinDeadline: '2026-09-26T09:59:44Z'});
+    expect(waitStatusLine(s, false, NOW)).toBe('Waiting for client to connect (at most 0 more second(s))');
+  });
+
+  it('waits for the end when the daemon confirms there is no deadline', () => {
+    expect(waitStatusLine(live({joinStateSource: 'daemon'}), false, NOW)).toBe('Waiting for session to end');
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ['record', {joinStateSource: 'record'}],
+    ['absent', {}]
+  ])('labels a deadline as unconfirmed when joinStateSource is %s', (_source, fields) => {
+    const s = live({...fields, joinTimeout: '1m', joinDeadline: '2026-09-26T10:00:30Z'});
+    expect(waitStatusLine(s, false, NOW)).toBe(`Waiting for client to connect (at most 30 more second(s), ${UNCONFIRMED})`);
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ['record', {joinStateSource: 'record'}],
+    ['absent', {}]
+  ])('does not claim there is no window when joinStateSource is %s and there is no deadline', (_source, fields) => {
+    expect(waitStatusLine(live(fields), false, NOW)).toBe(`Waiting for session to end (join timeout ${UNCONFIRMED})`);
+  });
+
+  it('always waits for the end once a join has been seen, whatever this response says', () => {
+    // The first join claims the session for good; a stale response must not bring the countdown back.
+    expect(waitStatusLine(live({joinStateSource: 'daemon', joinTimeout: '1m', joinDeadline: '2026-09-26T10:00:30Z'}), true, NOW)).toBe('Waiting for session to end');
+    expect(waitStatusLine(live({joinStateSource: 'record', joinDeadline: '2026-09-26T10:00:30Z'}), true, NOW)).toBe('Waiting for session to end');
+    expect(waitStatusLine(live({}), true, NOW)).toBe('Waiting for session to end');
+  });
+
+  it('treats an unparseable deadline as no deadline, never printing NaN', () => {
+    const line = waitStatusLine(live({joinStateSource: 'daemon', joinDeadline: 'soon'}), false, NOW);
+    expect(line).toBe('Waiting for session to end');
+    expect(line).not.toContain('NaN');
   });
 });
