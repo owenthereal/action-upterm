@@ -119,6 +119,8 @@ jobs:
 
 upterm itself enforces the timeout: it ends the session when the time is up unless a guest has joined. The first guest to join — even one who joined and left again at once, or (in detached mode) joined and left while the rest of the job was still running — claims the session for good: the timeout is disabled, and the session stays up until it ends on its own or the job finishes. The log shows the time left, and says `A guest joined at …; automatic join timeout disabled` once someone has.
 
+Unset or `0` means no timeout in attached mode; in detached mode it means the default of 10 minutes.
+
 ## Detached Mode
 
 By default, this Action starts an `upterm` session and waits for it to end. In detached mode, the Action starts the session, prints the connection details, and continues with the next step(s) of the workflow's job. At the end of the job, the Action waits for the session to exit.

@@ -63,7 +63,7 @@ See ARCHITECTURE.md for the full picture (the four `upterm` calls, the wait loop
 - `limit-access-to-actor`: Restrict to workflow triggerer's SSH keys
 - `limit-access-to-users`: Comma-separated list of authorized GitHub users
 - `upterm-server`: Server address (required, default: ssh://uptermd.upterm.dev:22)
-- `wait-timeout-minutes`: Join timeout: upterm ends the session if no guest has joined by then; in detached mode, it starts after all regular steps finish
+- `wait-timeout-minutes`: Join timeout: upterm ends the session if no guest has joined by then; in detached mode, it starts after all regular steps finish; unset or 0: no timeout attached, 10 minutes detached
 - `upterm-version`: Version/tag to install; requires v0.32.0 or newer
 - `detached`: If `true`, the workflow continues after the session starts, and the wait moves to the post step
 
