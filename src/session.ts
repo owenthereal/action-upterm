@@ -38,6 +38,17 @@ export interface SessionInfo {
    * Absent until a guest joins. Forwarding-only connections never set it.
    */
   firstGuestJoinedAt?: string;
+  /** The join timeout upterm holds, compact (e.g. "10m"); absent when none is set, and once a guest has joined (v0.32.0+). */
+  joinTimeout?: string;
+  /** When upterm ends the session unless a guest joins first, RFC 3339; absent until counting, and once a guest has joined (v0.32.0+). */
+  joinDeadline?: string;
+  /**
+   * Where the join fields came from (v0.32.0+): "daemon" when the session
+   * itself answered for this launch; "record" when upterm fell back to the
+   * last values written, which may be stale - a record's deadline may no longer
+   * be counting, and a record without one does not prove there is no window.
+   */
+  joinStateSource?: 'daemon' | 'record';
   /**
    * True when upterm's admin query succeeded and the detail fields above are
    * trustworthy.
@@ -162,6 +173,30 @@ export function parseUptermVersion(output: string): UptermVersion | null {
 /** Whether upterm has recorded a qualifying guest join for this session. */
 export function hasGuestJoined(session: SessionInfo): boolean {
   return typeof session.firstGuestJoinedAt === 'string' && session.firstGuestJoinedAt.length > 0;
+}
+
+const UNCONFIRMED = 'unconfirmed: upterm answered from its record';
+
+/**
+ * The wait loop's progress line for a live session.
+ *
+ * `joined` is the caller's latch, not this response's firstGuestJoinedAt: the
+ * first join claims the session for good, so once one has been seen no later
+ * response - a stale record included - may bring the countdown back.
+ *
+ * Only a daemon answer confirms the join state; anything else is labelled.
+ * The seconds left are clamped at 0: teardown after the deadline fires can
+ * still show it for ~16 s.
+ */
+export function waitStatusLine(session: SessionInfo, joined: boolean, now: number): string {
+  if (joined) return 'Waiting for session to end';
+  const confirmed = session.joinStateSource === 'daemon';
+  const deadline = session.joinDeadline ? Date.parse(session.joinDeadline) : NaN;
+  if (!isNaN(deadline)) {
+    const seconds = Math.max(0, Math.ceil((deadline - now) / 1000));
+    return `Waiting for client to connect (at most ${seconds} more second(s)${confirmed ? '' : `, ${UNCONFIRMED}`})`;
+  }
+  return confirmed ? 'Waiting for session to end' : `Waiting for session to end (join timeout ${UNCONFIRMED})`;
 }
 
 export function formatVersion(v: UptermVersion): string {

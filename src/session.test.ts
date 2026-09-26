@@ -1,4 +1,4 @@
-import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion} from './session';
+import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion, waitStatusLine} from './session';
 import {execShellCommand, ShellCommandError} from './helpers';
 
 jest.mock('./helpers', () => ({
@@ -205,5 +205,54 @@ describe('isUptermVersionSupported', () => {
     expect(isUptermVersionSupported({major: 0, minor: 31, patch: 9})).toBe(false);
     expect(isUptermVersionSupported({major: 0, minor: 31, patch: 0})).toBe(false);
     expect(isUptermVersionSupported({major: 0, minor: 30, patch: 0})).toBe(false);
+  });
+});
+
+describe('waitStatusLine', () => {
+  const NOW = Date.parse('2026-09-26T10:00:00Z');
+  const live = (fields: Record<string, unknown>) => parseSessionInfo(JSON.stringify({name: 'gha-1', status: 'ready', sshCommand: 'ssh x@y', ...fields}));
+  const UNCONFIRMED = 'unconfirmed: upterm answered from its record';
+
+  it('counts down to a deadline the daemon confirms, rounding up', () => {
+    const s = live({joinStateSource: 'daemon', joinTimeout: '1m', joinDeadline: '2026-09-26T10:00:42.300Z'});
+    expect(waitStatusLine(s, false, NOW)).toBe('Waiting for client to connect (at most 43 more second(s))');
+  });
+
+  it('shows 0, never a negative count, once the deadline has passed', () => {
+    // Teardown after the deadline fires can still show it for ~16 s.
+    const s = live({joinStateSource: 'daemon', joinTimeout: '1m', joinDeadline: '2026-09-26T09:59:44Z'});
+    expect(waitStatusLine(s, false, NOW)).toBe('Waiting for client to connect (at most 0 more second(s))');
+  });
+
+  it('waits for the end when the daemon confirms there is no deadline', () => {
+    expect(waitStatusLine(live({joinStateSource: 'daemon'}), false, NOW)).toBe('Waiting for session to end');
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ['record', {joinStateSource: 'record'}],
+    ['absent', {}]
+  ])('labels a deadline as unconfirmed when joinStateSource is %s', (_source, fields) => {
+    const s = live({...fields, joinTimeout: '1m', joinDeadline: '2026-09-26T10:00:30Z'});
+    expect(waitStatusLine(s, false, NOW)).toBe(`Waiting for client to connect (at most 30 more second(s), ${UNCONFIRMED})`);
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ['record', {joinStateSource: 'record'}],
+    ['absent', {}]
+  ])('does not claim there is no window when joinStateSource is %s and there is no deadline', (_source, fields) => {
+    expect(waitStatusLine(live(fields), false, NOW)).toBe(`Waiting for session to end (join timeout ${UNCONFIRMED})`);
+  });
+
+  it('always waits for the end once a join has been seen, whatever this response says', () => {
+    // The first join claims the session for good; a stale response must not bring the countdown back.
+    expect(waitStatusLine(live({joinStateSource: 'daemon', joinTimeout: '1m', joinDeadline: '2026-09-26T10:00:30Z'}), true, NOW)).toBe('Waiting for session to end');
+    expect(waitStatusLine(live({joinStateSource: 'record', joinDeadline: '2026-09-26T10:00:30Z'}), true, NOW)).toBe('Waiting for session to end');
+    expect(waitStatusLine(live({}), true, NOW)).toBe('Waiting for session to end');
+  });
+
+  it('treats an unparseable deadline as no deadline, never printing NaN', () => {
+    const line = waitStatusLine(live({joinStateSource: 'daemon', joinDeadline: 'soon'}), false, NOW);
+    expect(line).toBe('Waiting for session to end');
+    expect(line).not.toContain('NaN');
   });
 });
