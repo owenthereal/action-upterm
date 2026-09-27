@@ -488,6 +488,9 @@ describe('upterm GitHub integration', () => {
     await run();
 
     expect(core.setFailed).toHaveBeenCalledWith('wait-timeout-minutes must be a valid positive integer not exceeding 1440 (24 hours)');
+    // Saved before validation, so the post step cleans up rather than
+    // re-running validation and reporting the same failure twice.
+    expect(core.saveState).toHaveBeenCalledWith('isPost', 'true');
   });
 
   it('should handle wait-timeout-minutes exceeding 24 hours', async () => {
@@ -503,6 +506,7 @@ describe('upterm GitHub integration', () => {
     await run();
 
     expect(core.setFailed).toHaveBeenCalledWith('wait-timeout-minutes must be a valid positive integer not exceeding 1440 (24 hours)');
+    expect(core.saveState).toHaveBeenCalledWith('isPost', 'true');
   });
 
   it('should handle missing upterm-server', async () => {
@@ -518,6 +522,7 @@ describe('upterm GitHub integration', () => {
     await run();
 
     expect(core.setFailed).toHaveBeenCalledWith('upterm-server is required');
+    expect(core.saveState).toHaveBeenCalledWith('isPost', 'true');
   });
 
   it('should handle shell command failures during installation', async () => {

@@ -325,12 +325,13 @@ export async function run() {
       return;
     }
 
-    validateInputs();
-
     // Mark that the main action has run (for POST action detection)
-    // This must happen before any fallible setup so the post action
-    // always runs cleanup instead of re-entering the main path.
+    // This must happen before any fallible setup - input validation included -
+    // so the post action always runs cleanup instead of re-entering the main
+    // path and reporting the same failure twice.
     core.saveState('isPost', 'true');
+
+    validateInputs();
 
     await installDependencies();
     await assertSupportedUptermVersion();
