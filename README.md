@@ -74,7 +74,17 @@ jobs:
       with:
         ## Use the deployed Upterm server via Websocket or SSH
         upterm-server: wss://YOUR_HEROKU_APP_URL
+        ## Required for any upterm-server other than the default: the
+        ## server's known_hosts entry, so the action can verify its host key
+        ## instead of trusting whatever answers.
+        known-hosts: "@cert-authority YOUR_HEROKU_APP_URL ssh-ed25519 AAAA..."
 ```
+
+## Pin the Upterm Server's Host Key
+
+The action always verifies the upterm server's host key before connecting — it never falls back to trusting whatever answers. For the default server (`ssh://uptermd.upterm.dev:22`), the key ships with the action, so no configuration is needed. For any other `upterm-server`, the `known-hosts` input is **required**; the action fails fast at startup without it.
+
+Provide the server's `known_hosts` line(s) as the `known-hosts` input. A relay that presents an SSH host certificate (as uptermd does) needs an `@cert-authority <host> <type> <key>` line rather than a plain `ssh-keyscan` key line — the key is the certificate's signing authority, not the certificate itself.
 
 ## Pin a Specific Upterm Version
 

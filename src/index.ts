@@ -6,6 +6,7 @@ import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
 import {execShellCommand, shellEscape, sleep} from './helpers';
 import {generateSessionName, getSession, hasGuestJoined, isNoSuchSession, isTerminal, isUptermVersionSupported, parseUptermVersion, parseSessionInfo, SessionInfo, formatVersion, UPTERM_MIN_VERSION, waitStatusLine} from './session';
+import {knownHostsFor} from './knownHosts';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
@@ -514,11 +515,24 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   fs.mkdirSync(dirs.runtime, {recursive: true});
   fs.mkdirSync(dirs.state, {recursive: true});
   fs.mkdirSync(dirs.config, {recursive: true});
-  exportXdgEnvironment();
+  const xdg = exportXdgEnvironment();
+
+  const knownHosts = knownHostsFor(uptermServer, core.getInput('known-hosts'));
+  if (knownHosts instanceof Error) throw knownHosts;
+  // Written into the action's own config directory, not ~/.ssh: the runner's
+  // file belongs to the job, and upterm is told exactly which file to trust.
+  //
+  // Two spellings of one path, deliberately: the native one for this process's
+  // own write, and xdg.config's already-converted one for the command line,
+  // because every upterm call goes through bash. exportXdgEnvironment owns that
+  // conversion and its comment says so -- do not add a second
+  // `win32 ? toMsys2Path : toShellPath` here.
+  fs.writeFileSync(path.join(dirs.config, 'known_hosts'), knownHosts + '\n', {mode: 0o600});
+  const knownHostsArg = `${xdg.config}/known_hosts`;
 
   const auth = allowedUsers.map(user => ` --authorized-user ${shellEscape(`github:${user}`)}`).join('');
   // getSessionName() is gha- + 8 hex characters: shell-safe by construction.
-  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --skip-host-key-check --server ${shellEscape(uptermServer)}${auth}${launchJoinTimeoutFlag()}${hostedCommand()}`;
+  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${launchJoinTimeoutFlag()}${hostedCommand()}`;
 
   core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
   // Evidence for the post step that there may be a session to stop. Saved

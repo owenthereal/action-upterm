@@ -1,5 +1,6 @@
 import {when} from 'jest-when';
 import path from 'path';
+import {DEFAULT_UPTERM_SERVER} from './knownHosts';
 
 jest.mock('@actions/core');
 jest.mock('@actions/tool-cache', () => ({
@@ -103,6 +104,7 @@ function loadAction(): void {
 
 function baselineInputs(): void {
   when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
+  when(core.getInput).calledWith('known-hosts').mockReturnValue('@cert-authority myserver ssh-ed25519 AAAATEST');
   when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('');
   when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
   when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
@@ -959,7 +961,7 @@ describe('upterm GitHub integration', () => {
       Object.defineProperty(process, 'platform', {value: 'linux'});
       await run();
       const cmd = launchCall();
-      expect(cmd).toMatch(/^upterm host --detach --accept --output json --name gha-[0-9a-f]{8} --skip-host-key-check --server 'ssh:\/\/myserver:22'$/);
+      expect(cmd).toMatch(/^upterm host --detach --accept --output json --name gha-[0-9a-f]{8} --known-hosts '[^']+' --server 'ssh:\/\/myserver:22'$/);
       const all = mockedExecShellCommand.mock.calls.map(c => c[0]).join('\n');
       expect(all).not.toMatch(/tmux|ssh-keygen|Invoke-CimMethod/);
       expect(mockFs.appendFileSync).not.toHaveBeenCalledWith(expect.stringContaining('.ssh'), expect.anything());
@@ -1043,6 +1045,48 @@ describe('upterm GitHub integration', () => {
       await run();
       expect(core.setFailed).toHaveBeenCalled();
       expect(core.setOutput).not.toHaveBeenCalledWith('ssh-command', expect.anything());
+    });
+  });
+
+  describe('host key pinning', () => {
+    beforeEach(() => {
+      fsWithoutExitFiles();
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
+        if (cmd.includes('upterm host')) return readySession();
+        if (cmd.includes('session info')) return endedResponse;
+        return '';
+      });
+    });
+
+    it('never passes --skip-host-key-check', async () => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      await run();
+      const all = mockedExecShellCommand.mock.calls.map(c => c[0]).join('\n');
+      expect(all).not.toContain('--skip-host-key-check');
+    });
+
+    it('writes the supplied known_hosts and points upterm at it', async () => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      when(core.getInput).calledWith('known-hosts').mockReturnValue('@cert-authority myserver ssh-ed25519 AAAAMINE');
+      await run();
+      expect(mockFs.writeFileSync).toHaveBeenCalledWith(expect.stringContaining('known_hosts'), '@cert-authority myserver ssh-ed25519 AAAAMINE\n', expect.objectContaining({mode: 0o600}));
+    });
+
+    it('uses the bundled key for the default server with no input', async () => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      when(core.getInput).calledWith('upterm-server').mockReturnValue(DEFAULT_UPTERM_SERVER);
+      when(core.getInput).calledWith('known-hosts').mockReturnValue('');
+      await run();
+      expect(mockFs.writeFileSync).toHaveBeenCalledWith(expect.stringContaining('known_hosts'), expect.stringContaining('@cert-authority uptermd.upterm.dev '), expect.objectContaining({mode: 0o600}));
+    });
+
+    it('fails for a custom server with no known-hosts input', async () => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://relay.example:22');
+      when(core.getInput).calledWith('known-hosts').mockReturnValue('');
+      await run();
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('known-hosts'));
     });
   });
 
