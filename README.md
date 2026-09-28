@@ -89,6 +89,8 @@ Provide the server's `known_hosts` line(s) as the `known-hosts` input. A relay t
 
 A bare host pattern (`@cert-authority host ...`) matches port 22 only; any other port needs the bracketed form, `@cert-authority [host]:port ...` — `wss://` is `:443`, `ws://` is `:80`. A server reachable over more than one protocol needs one line per port, which is why the bundled default ships two: one for `ssh://uptermd.upterm.dev:22`, one for `[uptermd.upterm.dev]:443`.
 
+`upterm-server` itself has its own port rule, separate from `known-hosts`: upterm requires an explicit port for `ssh://` and rejects a portless one at launch ("missing port in address"), while it fills in `:80`/`:443` for `ws://`/`wss://` when the port is omitted.
+
 ## Pin a Specific Upterm Version
 
 By default, the action downloads the latest Upterm release directly from GitHub. To pin a specific release (for example, `v0.32.0`), provide the optional `upterm-version` input:

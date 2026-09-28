@@ -47,6 +47,14 @@ function pinnedKnownHostsFor(server: string): string | null {
   switch (u.protocol) {
     case 'ssh:':
       // Non-special scheme: an explicit :22 is preserved rather than normalized.
+      // A portless ssh:// is recognized here as this host - upterm's own
+      // `--server` parsing (cmd/upterm/command/host.go) requires an explicit
+      // port for ssh:// and rejects a portless one with "missing port in
+      // address", unlike ws:// and wss://, which it fills in as :80/:443.
+      // That rejection is upterm's own, and clearer than anything this
+      // matcher could substitute, so a portless ssh:// still resolves to the
+      // bundled pin here and is left to fail at launch on the missing port,
+      // not here.
       return u.port === '' || u.port === '22' ? DEFAULT_KNOWN_HOSTS : null;
     case 'wss:':
       // Special scheme: URL normalizes the default :443 away to ''.

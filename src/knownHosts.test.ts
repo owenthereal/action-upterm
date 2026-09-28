@@ -9,12 +9,19 @@ describe('knownHostsFor', () => {
     expect(knownHostsFor('ssh://anything.example:22', '  @cert-authority x ssh-ed25519 AAAA  \n')).toBe('@cert-authority x ssh-ed25519 AAAA');
   });
 
-  describe('with no known-hosts input, accepts every spelling of the bundled public relay', () => {
+  describe('with no known-hosts input, the matcher recognizes every spelling of the bundled public relay', () => {
+    // These assert that pinnedKnownHostsFor() identifies the host from the
+    // parsed URL, not that upterm would actually launch against it: upterm's
+    // own --server parsing (cmd/upterm/command/host.go) requires an explicit
+    // port for ssh:// and rejects a portless one with "missing port in
+    // address", even though the matcher (correctly) still resolves it to
+    // this host. wss:// has no such requirement - upterm fills in :443 - so
+    // portless wss:// both matches here and launches.
     it.each([
       ['default ssh with explicit :22', 'ssh://uptermd.upterm.dev:22'],
-      ['ssh with the port omitted', 'ssh://uptermd.upterm.dev'],
+      ['ssh with the port omitted - upterm itself still requires one at launch', 'ssh://uptermd.upterm.dev'],
       ['ssh with a trailing slash', 'ssh://uptermd.upterm.dev/'],
-      ['wss with the port omitted', 'wss://uptermd.upterm.dev'],
+      ['wss with the port omitted, which upterm fills in as :443', 'wss://uptermd.upterm.dev'],
       ['wss with explicit :443, which URL normalizes away', 'wss://uptermd.upterm.dev:443'],
       ['wss with a trailing slash', 'wss://uptermd.upterm.dev/']
     ])('%s (%s)', (_label, server) => {
