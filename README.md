@@ -76,8 +76,9 @@ jobs:
         upterm-server: wss://YOUR_HEROKU_APP_URL
         ## Required for any upterm-server other than the default: the
         ## server's known_hosts entry, so the action can verify its host key
-        ## instead of trusting whatever answers.
-        known-hosts: "@cert-authority YOUR_HEROKU_APP_URL ssh-ed25519 AAAA..."
+        ## instead of trusting whatever answers. wss:// is keyed as
+        ## [host]:443, not a bare host (that means port 22).
+        known-hosts: "@cert-authority [YOUR_HEROKU_APP_URL]:443 ssh-ed25519 AAAA..."
 ```
 
 ## Pin the Upterm Server's Host Key
@@ -85,6 +86,8 @@ jobs:
 The action always verifies the upterm server's host key before connecting — it never falls back to trusting whatever answers. For the default server (`ssh://uptermd.upterm.dev:22`), the key ships with the action, so no configuration is needed. For any other `upterm-server`, the `known-hosts` input is **required**; the action fails fast at startup without it.
 
 Provide the server's `known_hosts` line(s) as the `known-hosts` input. A relay that presents an SSH host certificate (as uptermd does) needs an `@cert-authority <host> <type> <key>` line rather than a plain `ssh-keyscan` key line — the key is the certificate's signing authority, not the certificate itself.
+
+A bare host pattern (`@cert-authority host ...`) matches port 22 only; any other port needs the bracketed form, `@cert-authority [host]:port ...` — `wss://` is `:443`, `ws://` is `:80`. A server reachable over more than one protocol needs one line per port, which is why the bundled default ships two: one for `ssh://uptermd.upterm.dev:22`, one for `[uptermd.upterm.dev]:443`.
 
 ## Pin a Specific Upterm Version
 

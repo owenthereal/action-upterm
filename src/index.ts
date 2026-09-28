@@ -316,6 +316,11 @@ function validateInputs(): void {
   if (!uptermServer) {
     throw new Error('upterm-server is required');
   }
+
+  // Before installDependencies() downloads anything: a missing pin is a
+  // configuration error, and the README promises it surfaces at startup.
+  const knownHosts = knownHostsFor(uptermServer, core.getInput('known-hosts'));
+  if (knownHosts instanceof Error) throw knownHosts;
 }
 
 export async function run() {
@@ -517,6 +522,11 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   fs.mkdirSync(dirs.config, {recursive: true});
   const xdg = exportXdgEnvironment();
 
+  // validateInputs() already rejected the Error case at startup, before
+  // installDependencies() downloaded anything; this call cannot disagree,
+  // since it is a pure function of the same two inputs. It is re-run here
+  // (rather than threaded through as a parameter) only to get its string
+  // result, not to re-check it.
   const knownHosts = knownHostsFor(uptermServer, core.getInput('known-hosts'));
   if (knownHosts instanceof Error) throw knownHosts;
   // Written into the action's own config directory, not ~/.ssh: the runner's

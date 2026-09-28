@@ -1088,6 +1088,20 @@ describe('upterm GitHub integration', () => {
       await run();
       expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('known-hosts'));
     });
+
+    it('fails before installing anything, so a missing pin never downloads or runs upterm', async () => {
+      // Pins the check to validateInputs(), which runs before
+      // installDependencies(): a regression back into launchSession() would
+      // still fail the run, but only after a pointless download and version
+      // check, silently reordering past this assertion.
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://relay.example:22');
+      when(core.getInput).calledWith('known-hosts').mockReturnValue('');
+      await run();
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('known-hosts'));
+      expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+      expect(mockedExecShellCommand).not.toHaveBeenCalled();
+    });
   });
 
   describe('teardown', () => {
