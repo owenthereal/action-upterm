@@ -19,6 +19,43 @@ export const DEFAULT_KNOWN_HOSTS = [
 /** The default `upterm-server` input, from action.yml. */
 export const DEFAULT_UPTERM_SERVER = 'ssh://uptermd.upterm.dev:22';
 
+/** The relay whose certificate authority is bundled above. */
+const PINNED_HOST = 'uptermd.upterm.dev';
+
+/**
+ * pinnedKnownHostsFor returns the bundled pin when server is the public relay,
+ * in any spelling this action ships an entry for, and null otherwise.
+ *
+ * Matching is on the parsed host and scheme, not the literal string: the same
+ * relay is legitimately written `ssh://uptermd.upterm.dev:22`,
+ * `ssh://uptermd.upterm.dev` or `wss://uptermd.upterm.dev`, and refusing a
+ * spelling we hold the key for would send the user looking for a key they do
+ * not need.
+ *
+ * `ws://` is excluded deliberately: there is no `[host]:80` entry in the bundle,
+ * and the public relay redirects port 80 to HTTPS, so it is not a working way
+ * to reach it.
+ */
+function pinnedKnownHostsFor(server: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(server.trim());
+  } catch {
+    return null;
+  }
+  if (u.hostname.toLowerCase() !== PINNED_HOST) return null;
+  switch (u.protocol) {
+    case 'ssh:':
+      // Non-special scheme: an explicit :22 is preserved rather than normalized.
+      return u.port === '' || u.port === '22' ? DEFAULT_KNOWN_HOSTS : null;
+    case 'wss:':
+      // Special scheme: URL normalizes the default :443 away to ''.
+      return u.port === '' ? DEFAULT_KNOWN_HOSTS : null;
+    default:
+      return null;
+  }
+}
+
 /**
  * knownHostsFor returns the known_hosts contents to pin for this server, or an
  * Error explaining what the workflow has to supply.
@@ -30,8 +67,15 @@ export const DEFAULT_UPTERM_SERVER = 'ssh://uptermd.upterm.dev:22';
 export function knownHostsFor(server: string, input: string): string | Error {
   const supplied = input.trim();
   if (supplied) return supplied;
-  if (server.trim() === DEFAULT_UPTERM_SERVER) return DEFAULT_KNOWN_HOSTS;
+
+  const pinned = pinnedKnownHostsFor(server);
+  if (pinned) return pinned;
+
   return new Error(
-    `upterm-server is ${server}, which this action has no host key for. ` + "Set the known-hosts input to that server's known_hosts entry " + '(`@cert-authority <host> <type> <key>` for a relay that presents a host certificate).'
+    `upterm-server is ${server}, which this action has no host key for. ` +
+      "Set the known-hosts input to that server's known_hosts entry " +
+      '(`@cert-authority <host> <type> <key>` for a relay that presents a host ' +
+      'certificate). A host key is bundled only for the public relay at ' +
+      `ssh://${PINNED_HOST}:22 and wss://${PINNED_HOST}.`
   );
 }
