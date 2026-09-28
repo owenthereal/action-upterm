@@ -28,10 +28,10 @@ See ARCHITECTURE.md for the full picture (the four `upterm` calls, the wait loop
 
 ### Main Flow (src/index.ts `run()`)
 1. **Post-step detection** - `core.getState('isPost') === 'true'` routes straight to `runPost()` (teardown) instead of re-running main
-2. **Input validation** - `validateInputs()` checks `wait-timeout-minutes` and requires `upterm-server`
+2. **Input validation** - `validateInputs()` checks `wait-timeout-minutes`, requires `upterm-server`, and rejects a custom server with no usable host key pin (`knownHostsFor()`) - deliberately before `installDependencies()`, so a misconfiguration fails before anything is downloaded; that ordering is pinned by a test and should not be undone by someone tidying the function
 3. **Install upterm** - `installDependencies()` downloads the platform binary; on Windows it's also copied into MSYS2's `/usr/bin` so it's on the hosted login shell's PATH
 4. **Version gate** - `assertSupportedUptermVersion()` refuses upterm `< v0.32.0`, including an unparseable version string
-5. **Start the session** - `launchSession()` runs `upterm host --detach --accept --output json --name gha-XXXXXXXX --skip-host-key-check --server <server> [--authorized-user github:NAME ...] [--join-timeout Nm, attached mode only] [-- bash -l on Windows]`; its JSON stdout is the ready session, so there is no separate readiness poll
+5. **Start the session** - `launchSession()` runs `upterm host --detach --accept --output json --name gha-XXXXXXXX --known-hosts <path> --server <server> [--authorized-user github:NAME ...] [--join-timeout Nm, attached mode only] [-- bash -l on Windows]`; its JSON stdout is the ready session, so there is no separate readiness poll
 6. **Detached or attached** - detached mode publishes the SSH command/notice and returns immediately, letting the job's remaining steps run; the post step then runs `armJoinTimeout()` (`upterm session set <name> --join-timeout Nm`, default 10) and the same wait loop. Attached mode calls the wait loop directly.
 7. **Wait** - `waitForSession()` polls `upterm session info` every 5s, logging the time left before upterm's join deadline, until the continue file appears, the session reaches a terminal status, or upterm reports no such session (exit 4). upterm itself ends a session nobody joined; the wait never stops a session. The post step's teardown runs `upterm session stop <name>`.
 
@@ -43,6 +43,7 @@ See ARCHITECTURE.md for the full picture (the four `upterm` calls, the wait loop
 - **"Gone" is upterm's exit code 4** (`isNoSuchSession()`), never text matched in stderr. Any other lookup failure is "unknown" and never ends the wait.
 - **No `upterm session wait`**: its exit cannot end the wait by itself (125 on its own lookup failures; never returns for `disconnected`), and on Windows killing it through bash leaves upterm.exe holding Node's pipes. The 5 s poll is enough.
 - Deterministic XDG directories (`XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`) are minted per run and exported to `process.env` by `exportXdgEnvironment()`, called by both main and post, so every `upterm` call in either process resolves the same session record
+- **The action always verifies the relay's host key** (`src/knownHosts.ts`): the bundled pin covers the public relay in any spelling `knownHostsFor()` recognizes (`ssh://` and `wss://`, port explicit or default), and a server without a pin is a hard failure in `validateInputs()`, never a fallback to `--skip-host-key-check` or otherwise trusting whatever answers
 
 ## Testing
 
@@ -63,6 +64,7 @@ See ARCHITECTURE.md for the full picture (the four `upterm` calls, the wait loop
 - `limit-access-to-actor`: Restrict to workflow triggerer's SSH keys
 - `limit-access-to-users`: Comma-separated list of authorized GitHub users
 - `upterm-server`: Server address (required, default: ssh://uptermd.upterm.dev:22)
+- `known-hosts`: `known_hosts` entry pinning the server's host key. The default server's certificate authority is bundled in `src/knownHosts.ts`; any other `upterm-server` requires this input, with no `--skip-host-key-check` fallback
 - `wait-timeout-minutes`: Join timeout: upterm ends the session if no guest has joined by then; in detached mode, it starts after all regular steps finish; unset or 0: no timeout attached, 10 minutes detached
 - `upterm-version`: Version/tag to install; requires v0.32.0 or newer
 - `detached`: If `true`, the workflow continues after the session starts, and the wait moves to the post step

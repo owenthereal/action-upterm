@@ -71,6 +71,25 @@ describe('execShellCommand', () => {
     expect(core.debug).toHaveBeenCalledWith(`Executing shell command: [${command}]`);
   });
 
+  it('never leaves stdin open for the child to block on', async () => {
+    // Every command execShellCommand runs is non-interactive. An open stdin
+    // pipe is harmless for a command that never reads it, but
+    // `upterm host --known-hosts` prompts for confirmation on an unrecognized
+    // host key and would hang forever on that pipe instead of reading EOF
+    // and failing fast. This guards against that regression coming back
+    // silently.
+    mockProcess.stdout.on.mockImplementation(() => undefined);
+    mockProcess.on.mockImplementation((event, callback) => {
+      if (event === 'exit') callback(0);
+    });
+
+    await execShellCommand('upterm host --known-hosts /path --server ssh://x:22');
+
+    const spawnCall = mockSpawn.mock.calls[0];
+    const spawnOptions = spawnCall[2] as {stdio?: unknown};
+    expect(spawnOptions.stdio).toEqual(['ignore', 'pipe', 'pipe']);
+  });
+
   it('should handle command failure', async () => {
     const command = 'false'; // Command that always fails
     const stderr = 'command failed';

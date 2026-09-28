@@ -22,6 +22,10 @@ inputs:
     description: "upterm server address (required), supported protocols are ssh, ws, or wss."
     required: true
     default: "ssh://uptermd.upterm.dev:22"
+  known-hosts:
+    description: "known_hosts entry for the upterm server, pinning its host key. Required when upterm-server is not the default. The default server's key is bundled with the action. A relay that presents a host certificate needs an '@cert-authority <host> <type> <key>' line."
+    required: false
+    default: ""
   wait-timeout-minutes:
     description: "Integer number of minutes to wait for a guest to join before upterm ends the session. Attached mode: unset or 0 means no timeout. Detached mode: counted from when all regular steps finish; unset or 0 means 10. Once a guest has joined, the session stays up until it ends."
     required: false

@@ -39,10 +39,21 @@ export function execShellCommand(cmd: string, options: {quiet?: boolean} = {}): 
   }
 
   return new Promise<string>((resolve, reject) => {
+    // Every command this wrapper runs is non-interactive. Without an explicit
+    // stdio, Node gives the child an open stdin pipe that nothing ever writes
+    // to or closes - harmless for a command that never reads it, but
+    // `upterm host --known-hosts` prompts for confirmation on an unrecognized
+    // host key (promptForConfirmation, blocking on bufio.Reader.ReadString)
+    // and would hang on that open pipe forever instead of failing fast.
+    // Ignoring stdin makes it read EOF immediately, so a wrong or missing pin
+    // is a prompt upterm itself refuses at once - "no answer from the
+    // terminal: stdin: EOF" - rather than a job that runs until the
+    // workflow-level timeout.
     const proc =
       process.platform !== 'win32'
-        ? spawn(cmd, [], {shell: 'bash'})
+        ? spawn(cmd, [], {shell: 'bash', stdio: ['ignore', 'pipe', 'pipe']})
         : spawn('C:\\msys64\\usr\\bin\\bash.exe', ['-lc', cmd], {
+            stdio: ['ignore', 'pipe', 'pipe'],
             env: {
               ...process.env,
               MSYS2_PATH_TYPE: 'inherit' /* Inherit previous path */,
