@@ -339,9 +339,18 @@ export async function run() {
 
     validateInputs();
 
+    // Not a failure: this step usually runs under if: failure(), where a Dependabot
+    // run's only actor is a bot. And never a launch: with no --authorized-user,
+    // upterm would let in anyone holding the connect string.
+    const allowedUsers = getAllowedUsers();
+    if (core.getInput('limit-access-to-actor') === 'true' && allowedUsers.length === 0) {
+      core.warning('No upterm session started: limit-access-to-actor left no one to authorize, because bot accounts have no SSH keys. Re-run the job to be authorized yourself, or list users in limit-access-to-users.');
+      return;
+    }
+
     await installDependencies();
     await assertSupportedUptermVersion();
-    const session = await startUptermSession();
+    const session = await startUptermSession(allowedUsers);
 
     if (core.getInput('detached') === 'true') {
       await runDetachedMode(session);
@@ -468,6 +477,17 @@ async function assertSupportedUptermVersion(): Promise<void> {
   }
 }
 
+/**
+ * limit-access-to-users as given, plus - for limit-access-to-actor - the run's
+ * actor and whoever triggered this attempt: on a re-run, github.context.actor
+ * stays the original trigger while GITHUB_TRIGGERING_ACTOR is the person who
+ * clicked re-run.
+ *
+ * Actors that are GitHub App bots (logins ending in [bot], which no user login
+ * can) are left out: they have no SSH keys, and upterm refuses to start if any
+ * user's keys cannot be fetched. Explicit users are passed through untouched,
+ * so a mistake there still fails loudly in upterm.
+ */
 function getAllowedUsers(): string[] {
   const allowedUsers = core
     .getInput('limit-access-to-users')
@@ -475,8 +495,15 @@ function getAllowedUsers(): string[] {
     .filter(Boolean);
 
   if (core.getInput('limit-access-to-actor') === 'true') {
-    core.info(`Adding actor "${github.context.actor}" to allowed users.`);
-    allowedUsers.push(github.context.actor);
+    for (const actor of new Set([github.context.actor, process.env.GITHUB_TRIGGERING_ACTOR])) {
+      if (!actor) continue;
+      if (actor.endsWith('[bot]')) {
+        core.info(`Not adding actor "${actor}": bot accounts have no SSH keys.`);
+        continue;
+      }
+      core.info(`Adding actor "${actor}" to allowed users.`);
+      allowedUsers.push(actor);
+    }
   }
 
   return [...new Set(allowedUsers)];
@@ -703,8 +730,8 @@ async function outputSshCommand(session: SessionInfo): Promise<string | null> {
   return sshCommand;
 }
 
-async function startUptermSession(): Promise<SessionInfo> {
-  const session = await launchSession(core.getInput('upterm-server'), getAllowedUsers());
+async function startUptermSession(allowedUsers: string[]): Promise<SessionInfo> {
+  const session = await launchSession(core.getInput('upterm-server'), allowedUsers);
   await outputSshCommand(session);
   return session;
 }

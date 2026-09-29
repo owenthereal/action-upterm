@@ -54,6 +54,8 @@ jobs:
         limit-access-to-users: githubuser1,githubuser2 # Specific authorized users only
 ```
 
+On a re-run, `limit-access-to-actor` also authorizes whoever re-ran the job. Bot accounts such as `dependabot[bot]` have no SSH keys, so they are skipped. When that leaves no one to authorize, for example a Dependabot pull request with no `limit-access-to-users`, the step logs a warning and starts no session.
+
 If your registered public SSH key differs from your default private SSH key, specify the path manually: `ssh -i <path-to-private-key> <upterm-connection-string>`.
 
 ## Use Custom Upterm Server

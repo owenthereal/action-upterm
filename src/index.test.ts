@@ -1048,6 +1048,66 @@ describe('upterm GitHub integration', () => {
     });
   });
 
+  describe('limit-access-to-actor', () => {
+    const launchCall = () => mockedExecShellCommand.mock.calls.map(c => c[0]).find(c => c.includes('upterm host'));
+    const originalTriggeringActor = process.env.GITHUB_TRIGGERING_ACTOR;
+
+    // github.context reads GITHUB_ACTOR once, when the action is loaded, so the
+    // actor is set on the loaded instance; GITHUB_TRIGGERING_ACTOR is read by
+    // the run itself.
+    function actors(actor: string, triggeringActor: string): void {
+      require('@actions/github').context.actor = actor;
+      process.env.GITHUB_TRIGGERING_ACTOR = triggeringActor;
+    }
+
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      fsWithoutExitFiles();
+      baselineShell(readySession(), endedResponse);
+      when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('true');
+    });
+
+    afterEach(() => {
+      if (originalTriggeringActor === undefined) delete process.env.GITHUB_TRIGGERING_ACTOR;
+      else process.env.GITHUB_TRIGGERING_ACTOR = originalTriggeringActor;
+    });
+
+    it('also authorizes whoever triggered this attempt, so a re-run is joinable by the person who re-ran it', async () => {
+      actors('alice', 'bob');
+      await run();
+      const cmd = launchCall() as string;
+      expect(cmd).toContain("--authorized-user 'github:alice'");
+      expect(cmd).toContain("--authorized-user 'github:bob'");
+    });
+
+    it('leaves a bot actor out: it has no SSH keys, and upterm refuses to start on a user it cannot fetch', async () => {
+      actors('dependabot[bot]', 'evgeni');
+      await run();
+      const cmd = launchCall() as string;
+      expect(cmd).toContain("--authorized-user 'github:evgeni'");
+      expect(cmd).not.toContain('dependabot');
+      expect(core.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('starts nothing when only bots are left, rather than a session anyone could join', async () => {
+      actors('dependabot[bot]', 'dependabot[bot]');
+      await run();
+      expect(launchCall()).toBeUndefined();
+      expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('limit-access-to-users'));
+    });
+
+    it('passes a bot named in limit-access-to-users through to upterm, which rejects it loudly', async () => {
+      // Only actors are filtered. Dropping an explicit entry could leave the
+      // list empty with limit-access-to-actor off - an open session.
+      when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('false');
+      when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('renovate[bot]');
+      await run();
+      expect(launchCall()).toContain("--authorized-user 'github:renovate[bot]'");
+    });
+  });
+
   describe('host key pinning', () => {
     beforeEach(() => {
       fsWithoutExitFiles();

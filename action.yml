@@ -11,7 +11,7 @@ runs:
   post-if: "!cancelled()"
 inputs:
   limit-access-to-actor:
-    description: "If only the public SSH keys of the user triggering the workflow should be authorized"
+    description: "If only the public SSH keys of the user triggering the workflow (and, on a re-run, of whoever re-ran it) should be authorized. Bot accounts such as dependabot[bot] have no SSH keys and are skipped; if that leaves no one to authorize, no session is started"
     required: false
     default: "false"
   limit-access-to-users:
