@@ -1,4 +1,4 @@
-import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion, waitStatusLine} from './session';
+import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion, waitStatusLine, statusLabel} from './session';
 import {execShellCommand, ShellCommandError} from './helpers';
 
 jest.mock('./helpers', () => ({
@@ -100,9 +100,29 @@ describe('isTerminal', () => {
     expect(isTerminal('disconnected')).toBe(true);
   });
 
-  it('does not treat starting or ready as terminal', () => {
+  it('does not treat starting, ready or reconnecting as terminal', () => {
     expect(isTerminal('starting')).toBe(false);
     expect(isTerminal('ready')).toBe(false);
+    // upterm is redialling on its own, and the connect string works again once it is back.
+    expect(isTerminal('reconnecting')).toBe(false);
+  });
+});
+
+describe('statusLabel', () => {
+  const info = (fields: Record<string, unknown>) => parseSessionInfo(JSON.stringify({name: 'gha-1', ...fields}));
+
+  it('is the status itself, whatever the tunnel fields say, unless the session is reconnecting', () => {
+    expect(statusLabel(info({status: 'ready'}))).toBe('ready');
+    expect(statusLabel(info({status: 'ended', tunnelReason: 'network'}))).toBe('ended');
+  });
+
+  it('names why a reconnecting session is down', () => {
+    expect(statusLabel(info({status: 'reconnecting', tunnelReason: 'relay_key_changed'}))).toBe('reconnecting: relay_key_changed');
+  });
+
+  it('is the bare status for a reconnecting answer without a reason', () => {
+    expect(statusLabel(info({status: 'reconnecting'}))).toBe('reconnecting');
+    expect(statusLabel(info({status: 'reconnecting', tunnelReason: ''}))).toBe('reconnecting');
   });
 });
 

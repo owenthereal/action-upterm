@@ -1462,6 +1462,32 @@ describe('upterm GitHub integration', () => {
         expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
       });
 
+      it('keeps waiting while upterm redials, says why each poll, and reports the end once', async () => {
+        const reconnecting = readySession({
+          status: 'reconnecting',
+          reconnect: 'supported',
+          tunnelLostAt: '2026-09-26T09:59:50Z',
+          tunnelReason: 'relay_error',
+          tunnelError: 'ssh: handshake failed',
+          nextAttemptAt: '2026-09-26T10:00:05Z'
+        });
+        let polls = 0;
+        mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+          if (cmd.includes('upterm version')) return 'Upterm version 0.35.0\n';
+          if (cmd.includes('upterm host')) return readySession();
+          if (!cmd.includes('session info')) return '';
+          return polls++ < 5 ? reconnecting : endedResponse;
+        });
+
+        await run();
+
+        const infoLines = core.info.mock.calls.map(c => String(c[0]));
+        expect(polls).toBe(6);
+        expect(infoLines.filter(l => l === 'Session gha-3f9a1c05 (reconnecting: relay_error)')).toHaveLength(5);
+        expect(infoLines.filter(l => l === "Exiting debugging session: 'upterm' quit")).toHaveLength(1);
+        expect(sessionStops()).toBe(0);
+      });
+
       it('reports a join timeout without a duration when the record has none', async () => {
         postState();
         postShell('', JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', reason: 'join_timeout'}));
