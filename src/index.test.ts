@@ -1485,7 +1485,7 @@ describe('upterm GitHub integration', () => {
           reconnect: 'supported',
           tunnelLostAt: '2026-09-26T09:59:50Z',
           tunnelReason: 'relay_error',
-          tunnelError: 'could not initialize session: failed to create session: consul down',
+          tunnelError: 'error creating session: could not initialize session: failed to create session: consul down',
           nextAttemptAt: '2026-09-26T10:00:05Z'
         });
         let polls = 0;
