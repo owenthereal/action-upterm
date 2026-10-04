@@ -59,12 +59,12 @@ export interface SessionInfo {
    * True when upterm's admin query succeeded and the detail fields above are
    * trustworthy.
    *
-   * A "ready" status does NOT imply this: when the admin query fails or the
-   * session ID moved underneath the lookup, upterm returns the record's view
-   * with status still "ready" (cmd/upterm/command/session.go:485-488). What is
+   * A "ready" status does NOT imply this: when the admin socket does not
+   * answer, or answers for another launch, upterm returns the record's view
+   * with status still "ready" (cmd/upterm/command/session.go:899-903). What is
    * absent in that case is `sshCommand`. `clientCount` and `guestCount` are NOT
-   * absent — they are declared without `omitempty` (session.go:395,400) and
-   * infoFromRecord (session.go:494-508) leaves them at their zero value, so
+   * absent — they are declared without `omitempty` (session.go:779,783) and
+   * infoFromRecord (session.go:966-994) leaves them at their zero value, so
    * upterm sends `0`. Therefore `hasLiveDetail` is the ONLY valid gate. Never
    * test `guestCount === undefined` — it will never fire. A `0` with
    * `hasLiveDetail === false` means UNKNOWN, not "nobody connected"; reading
@@ -76,10 +76,15 @@ export interface SessionInfo {
   /** When the current tunnel outage began, RFC 3339 (or the last one an ended session was in); absent while the tunnel is up (v0.35.0+). */
   tunnelLostAt?: string;
   /**
-   * Why the tunnel is down; always set while the status is "reconnecting":
-   * "network" for the loss itself, then why the latest redial failed. A
-   * "disconnected" session carries "reconnect_unsupported", and a session that
-   * ended mid-outage keeps its last value. Absent while the tunnel is up (v0.35.0+).
+   * Why the tunnel is down; always set while a `session info` answer's status
+   * is "reconnecting": "network" for the loss itself, then why the latest
+   * redial failed. A "disconnected" session carries "reconnect_unsupported",
+   * and a session that ended mid-outage keeps its last value. Absent while the
+   * tunnel is up (v0.35.0+).
+   *
+   * The launch JSON can say "reconnecting" too, when the tunnel was lost just
+   * before the daemon reported readiness, but it carries none of the tunnel
+   * fields.
    */
   tunnelReason?: TunnelReason;
   /** The raw error behind tunnelReason: text for people to read, not something to match on; absent while the tunnel is up (v0.35.0+). */

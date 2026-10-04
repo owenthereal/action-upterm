@@ -1002,6 +1002,23 @@ describe('upterm GitHub integration', () => {
       expect(firstInfo).toBeGreaterThan(launchIndex);
     });
 
+    it('accepts a launch that answers reconnecting with an ssh command and no tunnel fields, and publishes the command', async () => {
+      // upterm's printStarted reports the record's status as the daemon last
+      // published it: a tunnel lost just before readiness leaves "reconnecting"
+      // standing, with the connect string that works again once it is back, and
+      // none of the tunnel fields (spawned.go:300-333).
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
+        if (cmd.includes('upterm host')) return readySession({status: 'reconnecting'});
+        if (cmd.includes('session info')) return endedResponse;
+        return '';
+      });
+      await run();
+      expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
+      expect(core.setFailed).not.toHaveBeenCalled();
+    });
+
     it('reports upterm’s own error and the session diagnostics when the launch fails', async () => {
       Object.defineProperty(process, 'platform', {value: 'linux'});
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
@@ -1468,7 +1485,7 @@ describe('upterm GitHub integration', () => {
           reconnect: 'supported',
           tunnelLostAt: '2026-09-26T09:59:50Z',
           tunnelReason: 'relay_error',
-          tunnelError: 'ssh: handshake failed',
+          tunnelError: 'could not initialize session: failed to create session: consul down',
           nextAttemptAt: '2026-09-26T10:00:05Z'
         });
         let polls = 0;
