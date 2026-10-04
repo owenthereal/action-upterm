@@ -75,9 +75,14 @@ export interface SessionInfo {
   reconnect?: 'supported' | 'unsupported';
   /** When the current tunnel outage began, RFC 3339 (or the last one an ended session was in); absent while the tunnel is up (v0.35.0+). */
   tunnelLostAt?: string;
-  /** Why the latest attempt to bring the tunnel back failed; set whenever the status is "reconnecting", absent while the tunnel is up (v0.35.0+). */
+  /**
+   * Why the tunnel is down; always set while the status is "reconnecting":
+   * "network" for the loss itself, then why the latest redial failed. A
+   * "disconnected" session carries "reconnect_unsupported", and a session that
+   * ended mid-outage keeps its last value. Absent while the tunnel is up (v0.35.0+).
+   */
   tunnelReason?: TunnelReason;
-  /** That attempt's raw error text, for the log rather than for matching; absent while the tunnel is up (v0.35.0+). */
+  /** The raw error behind tunnelReason: text for people to read, not something to match on; absent while the tunnel is up (v0.35.0+). */
   tunnelError?: string;
   /** When the next attempt is due, RFC 3339; absent while the tunnel is up (v0.35.0+). */
   nextAttemptAt?: string;

@@ -1479,10 +1479,12 @@ describe('upterm GitHub integration', () => {
           return polls++ < 5 ? reconnecting : endedResponse;
         });
 
-        await run();
+        const lines = await runCapturingProgress();
 
         const infoLines = core.info.mock.calls.map(c => String(c[0]));
         expect(polls).toBe(6);
+        // The progress line is the one a ready session gets: the outage changes only the Session line.
+        expect(lines).toEqual(Array(5).fill(`Waiting for session to end (join timeout unconfirmed: upterm answered from its record)\nSSH: ${READY_SESSION.sshCommand}`));
         expect(infoLines.filter(l => l === 'Session gha-3f9a1c05 (reconnecting: relay_error)')).toHaveLength(5);
         expect(infoLines.filter(l => l === "Exiting debugging session: 'upterm' quit")).toHaveLength(1);
         expect(sessionStops()).toBe(0);
