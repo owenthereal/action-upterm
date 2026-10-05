@@ -4,13 +4,19 @@ import {execShellCommand, shellEscape, ShellCommandError} from './helpers';
 /**
  * Session statuses.
  *
- * The record persists four (host/sessiondir/record.go:16-19); the CLI
- * synthesizes a fifth, "ended", when nobody holds the name - which covers BOTH
+ * The record persists five (host/sessiondir/record.go:16-24); the CLI
+ * synthesizes a sixth, "ended", when nobody holds the name - which covers BOTH
  * an ordinary completed session and a crashed one whose record still says
- * "ready" (cmd/upterm/command/session.go:437-441). Terminating on "ending"
+ * "ready" (cmd/upterm/command/session.go:869-874). Terminating on "ending"
  * alone would miss essentially every real exit.
+ *
+ * "reconnecting" is not terminal: the tunnel is down and upterm is redialling
+ * it on its own, and the connect string works again once it is back.
  */
-export type SessionStatus = 'starting' | 'ready' | 'disconnected' | 'ending' | 'ended';
+export type SessionStatus = 'starting' | 'ready' | 'reconnecting' | 'disconnected' | 'ending' | 'ended';
+
+/** Why upterm's tunnel is down (v0.35.0+): a stable code, safe to match on. */
+export type TunnelReason = 'network' | 'relay_error' | 'agent_unavailable' | 'agent_refused' | 'auth_refused' | 'relay_key_changed' | 'relay_unsupported' | 'proof_refused' | 'reconnect_unsupported';
 
 const TERMINAL_STATUSES: readonly SessionStatus[] = ['disconnected', 'ending', 'ended'];
 
@@ -53,22 +59,51 @@ export interface SessionInfo {
    * True when upterm's admin query succeeded and the detail fields above are
    * trustworthy.
    *
-   * A "ready" status does NOT imply this: when the admin query fails or the
-   * session ID moved underneath the lookup, upterm returns the record's view
-   * with status still "ready" (cmd/upterm/command/session.go:485-488). What is
+   * A "ready" status does NOT imply this: when the admin socket does not
+   * answer, or answers for another launch, upterm returns the record's view
+   * with status still "ready" (cmd/upterm/command/session.go:899-903). What is
    * absent in that case is `sshCommand`. `clientCount` and `guestCount` are NOT
-   * absent — they are declared without `omitempty` (session.go:395,400) and
-   * infoFromRecord (session.go:494-508) leaves them at their zero value, so
+   * absent — they are declared without `omitempty` (session.go:779,783) and
+   * infoFromRecord (session.go:966-994) leaves them at their zero value, so
    * upterm sends `0`. Therefore `hasLiveDetail` is the ONLY valid gate. Never
    * test `guestCount === undefined` — it will never fire. A `0` with
    * `hasLiveDetail === false` means UNKNOWN, not "nobody connected"; reading
    * it as a real count would shut down a session someone is attached to.
    */
   hasLiveDetail: boolean;
+  /** Whether the relay lets a dropped session come back under the same connect string; known after the first connection (v0.35.0+). */
+  reconnect?: 'supported' | 'unsupported';
+  /** When the current tunnel outage began, RFC 3339 (or the last one an ended session was in); absent while the tunnel is up (v0.35.0+). */
+  tunnelLostAt?: string;
+  /**
+   * Why the tunnel is down; always set while a `session info` answer's status
+   * is "reconnecting": "network" for the loss itself, then why the latest
+   * redial failed. A "disconnected" session carries "reconnect_unsupported",
+   * and a session that ended mid-outage keeps its last value. Absent while the
+   * tunnel is up (v0.35.0+).
+   *
+   * The launch JSON can say "reconnecting" too, when the tunnel was lost just
+   * before the daemon reported readiness, but it carries none of the tunnel
+   * fields.
+   */
+  tunnelReason?: TunnelReason;
+  /** The raw error behind tunnelReason: text for people to read, not something to match on; absent while the tunnel is up (v0.35.0+). */
+  tunnelError?: string;
+  /** When the next attempt is due, RFC 3339; absent while the tunnel is up (v0.35.0+). */
+  nextAttemptAt?: string;
 }
 
 export function isTerminal(status: SessionStatus): boolean {
   return TERMINAL_STATUSES.includes(status);
+}
+
+/**
+ * The status as the wait loop logs it: a reconnecting session says why its
+ * tunnel is down. A reconnecting answer that carries no reason is the bare
+ * status, never "reconnecting: undefined".
+ */
+export function statusLabel(session: SessionInfo): string {
+  return session.status === 'reconnecting' && session.tunnelReason ? `reconnecting: ${session.tunnelReason}` : session.status;
 }
 
 /**

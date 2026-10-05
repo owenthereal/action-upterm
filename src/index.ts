@@ -5,7 +5,21 @@ import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
 import {execShellCommand, shellEscape, sleep} from './helpers';
-import {generateSessionName, getSession, hasGuestJoined, isNoSuchSession, isTerminal, isUptermVersionSupported, parseUptermVersion, parseSessionInfo, SessionInfo, formatVersion, UPTERM_MIN_VERSION, waitStatusLine} from './session';
+import {
+  generateSessionName,
+  getSession,
+  hasGuestJoined,
+  isNoSuchSession,
+  isTerminal,
+  isUptermVersionSupported,
+  parseUptermVersion,
+  parseSessionInfo,
+  SessionInfo,
+  formatVersion,
+  UPTERM_MIN_VERSION,
+  statusLabel,
+  waitStatusLine
+} from './session';
 import {knownHostsFor} from './knownHosts';
 
 // Constants
@@ -868,7 +882,7 @@ async function waitForSession(message: string): Promise<WaitEnd> {
         core.info(`A guest joined at ${poll.session.firstGuestJoinedAt}; automatic join timeout disabled`);
       }
       // Evidence in the log that this process resolved the session main published.
-      core.info(`Session ${poll.session.name} (${poll.session.status})`);
+      core.info(`Session ${poll.session.name} (${statusLabel(poll.session)})`);
       console.log(`${waitStatusLine(poll.session, joined, Date.now())}\n${message}`);
     }
 

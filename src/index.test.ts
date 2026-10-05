@@ -1002,6 +1002,23 @@ describe('upterm GitHub integration', () => {
       expect(firstInfo).toBeGreaterThan(launchIndex);
     });
 
+    it('accepts a launch that answers reconnecting with an ssh command and no tunnel fields, and publishes the command', async () => {
+      // upterm's printStarted reports the record's status as the daemon last
+      // published it: a tunnel lost just before readiness leaves "reconnecting"
+      // standing, with the connect string that works again once it is back, and
+      // none of the tunnel fields (spawned.go:300-333).
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
+        if (cmd.includes('upterm host')) return readySession({status: 'reconnecting'});
+        if (cmd.includes('session info')) return endedResponse;
+        return '';
+      });
+      await run();
+      expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
+      expect(core.setFailed).not.toHaveBeenCalled();
+    });
+
     it('reports upterm’s own error and the session diagnostics when the launch fails', async () => {
       Object.defineProperty(process, 'platform', {value: 'linux'});
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
@@ -1460,6 +1477,34 @@ describe('upterm GitHub integration', () => {
         expect(sessionStops()).toBe(0);
         expect(core.warning).toHaveBeenCalledWith('Timed out waiting for client to connect (join timeout 1m)');
         expect(core.info).toHaveBeenCalledWith('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
+      });
+
+      it('keeps waiting while upterm redials, says why each poll, and reports the end once', async () => {
+        const reconnecting = readySession({
+          status: 'reconnecting',
+          reconnect: 'supported',
+          tunnelLostAt: '2026-09-26T09:59:50Z',
+          tunnelReason: 'relay_error',
+          tunnelError: 'error creating session: could not initialize session: failed to create session: consul down',
+          nextAttemptAt: '2026-09-26T10:00:05Z'
+        });
+        let polls = 0;
+        mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+          if (cmd.includes('upterm version')) return 'Upterm version 0.35.0\n';
+          if (cmd.includes('upterm host')) return readySession();
+          if (!cmd.includes('session info')) return '';
+          return polls++ < 5 ? reconnecting : endedResponse;
+        });
+
+        const lines = await runCapturingProgress();
+
+        const infoLines = core.info.mock.calls.map(c => String(c[0]));
+        expect(polls).toBe(6);
+        // The progress line is the one a ready session gets: the outage changes only the Session line.
+        expect(lines).toEqual(Array(5).fill(`Waiting for session to end (join timeout unconfirmed: upterm answered from its record)\nSSH: ${READY_SESSION.sshCommand}`));
+        expect(infoLines.filter(l => l === 'Session gha-3f9a1c05 (reconnecting: relay_error)')).toHaveLength(5);
+        expect(infoLines.filter(l => l === "Exiting debugging session: 'upterm' quit")).toHaveLength(1);
+        expect(sessionStops()).toBe(0);
       });
 
       it('reports a join timeout without a duration when the record has none', async () => {

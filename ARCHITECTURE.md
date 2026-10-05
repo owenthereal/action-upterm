@@ -36,7 +36,7 @@ action-upterm's own footprint is four `upterm` invocations, all run through `exe
 `waitForSession()` (src/index.ts) is the one loop used by both attached mode and detached mode's post step. It only observes: upterm alone ends a session nobody joined, at its own deadline, so a guest can never be kicked between a read and a stop. Each pass, every 5 seconds:
 
 1. Checks for the continue file (`/continue` or `$GITHUB_WORKSPACE/continue`) - if present, the wait ends immediately with no session lookup.
-2. Polls `upterm session info`. Exit 4 or a terminal status (`disconnected`, `ending`, `ended`) ends the wait; an end by upterm's join timeout (reason `join_timeout`) is logged as "Timed out waiting for client to connect". A failed lookup is warned about and ends nothing.
+2. Polls `upterm session info`. Exit 4 or a terminal status (`disconnected`, `ending`, `ended`) ends the wait; an end by upterm's join timeout (reason `join_timeout`) is logged as "Timed out waiting for client to connect". `reconnecting` is deliberately not terminal: upterm is redialling a dropped tunnel on its own, so the wait keeps polling, and its per-poll `Session <name> (reconnecting: <reason>)` log line names why the tunnel is down (`tunnelReason`). A failed lookup is warned about and ends nothing.
 3. Logs one status line (`waitStatusLine()`, src/session.ts): the seconds left before `joinDeadline`, clamped at 0 (teardown after the deadline fires can show a past deadline for ~16 s), or "Waiting for session to end". Join state upterm read from its record rather than from the daemon (`joinStateSource` other than `daemon`) may be stale - a record's deadline may no longer be counting, and a record without one does not prove there is no window - so it is marked unconfirmed.
 4. **The join latch**: once `firstGuestJoinedAt` appears (`hasGuestJoined()`), the loop logs "A guest joined at T; automatic join timeout disabled" once, and from then on always "Waiting for session to end", whatever later responses say: upterm disables the timeout for good at the first join, so a stale response must not bring the countdown back. `guestCount` is never used for this decision, for two binding reasons: it counts forwarding-only presence, which is not a qualifying join, and it is a current count rather than an event - it misses a guest who joined and left again between two polls, exactly the case `firstGuestJoinedAt` exists to catch.
 
@@ -214,7 +214,7 @@ On Windows these are exported in MSYS-form (`/c/...`), never `C:/...`. Not becau
 
 4. **Termination** - the wait ends when:
    - The continue file is created
-   - The session reaches a terminal status (`disconnected`, `ending`, `ended`) - including upterm ending it at its join deadline
+   - The session reaches a terminal status (`disconnected`, `ending`, `ended`; not `reconnecting`, since upterm is redialling on its own) - including upterm ending it at its join deadline
    - upterm reports no session by that name (exit 4)
 
 5. **Post-Step Teardown** (`finalizeSession()`, run inside a `finally` in `runPost()`) - see [Teardown order](#teardown-order)
