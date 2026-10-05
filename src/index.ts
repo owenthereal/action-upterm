@@ -18,6 +18,7 @@ import {
   formatVersion,
   UPTERM_MIN_VERSION,
   statusLabel,
+  tunnelDownLine,
   waitStatusLine
 } from './session';
 import {knownHostsFor} from './knownHosts';
@@ -756,7 +757,7 @@ function logSessionEnded(session: SessionInfo): void {
   if (session.status === 'disconnected') {
     // Unrecoverable: the host keeps running but its connect string cannot
     // connect, and upterm has no path back to ready.
-    core.warning('upterm lost its connection to the server; this session can no longer be reached');
+    core.warning(`upterm lost its connection to the server; this session can no longer be reached${session.tunnelError ? ` (${session.tunnelError})` : ''}`);
     return;
   }
   if (session.reason === 'join_timeout') {
@@ -930,12 +931,17 @@ type WaitEnd = 'continue' | 'ended';
  *
  * A failed lookup ('unknown') ends nothing: it says nothing about who is there.
  *
+ * While upterm redials, logs its raw error each time the reason or the error
+ * changes, not on every poll, and again for a new outage once the tunnel has
+ * been back.
+ *
  * Only a continue file created or touched since the launch (`atLaunch`) ends
  * the wait; one left from before is warned about, once.
  */
 async function waitForSession(message: string, atLaunch: ContinueFilesSnapshot): Promise<WaitEnd> {
   let joined = false;
   let staleReported = false;
+  let lastTunnelDown: string | null = null;
 
   /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
   while (true) {
@@ -962,6 +968,15 @@ async function waitForSession(message: string, atLaunch: ContinueFilesSnapshot):
       if (!joined && hasGuestJoined(poll.session)) {
         joined = true;
         core.info(`A guest joined at ${poll.session.firstGuestJoinedAt}; automatic join timeout disabled`);
+      }
+      if (poll.session.status === 'reconnecting') {
+        const tunnelDown = tunnelDownLine(poll.session);
+        if (tunnelDown && tunnelDown !== lastTunnelDown) {
+          core.info(tunnelDown);
+          lastTunnelDown = tunnelDown;
+        }
+      } else {
+        lastTunnelDown = null;
       }
       // Evidence in the log that this process resolved the session main published.
       core.info(`Session ${poll.session.name} (${statusLabel(poll.session)})`);

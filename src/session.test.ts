@@ -1,4 +1,4 @@
-import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion, waitStatusLine, statusLabel} from './session';
+import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion, waitStatusLine, statusLabel, tunnelDownLine} from './session';
 import {execShellCommand, ShellCommandError} from './helpers';
 
 jest.mock('./helpers', () => ({
@@ -123,6 +123,26 @@ describe('statusLabel', () => {
   it('is the bare status for a reconnecting answer without a reason', () => {
     expect(statusLabel(info({status: 'reconnecting'}))).toBe('reconnecting');
     expect(statusLabel(info({status: 'reconnecting', tunnelReason: ''}))).toBe('reconnecting');
+  });
+});
+
+describe('tunnelDownLine', () => {
+  const info = (fields: Record<string, unknown>) => parseSessionInfo(JSON.stringify({name: 'gha-1', ...fields}));
+
+  it("says why a reconnecting session's tunnel is down, in upterm's own words", () => {
+    expect(tunnelDownLine(info({status: 'reconnecting', tunnelReason: 'relay_error', tunnelError: 'failed to create session: consul down'}))).toBe("Upterm's tunnel is down (relay_error): failed to create session: consul down");
+  });
+
+  it('leaves out a reason the answer does not carry', () => {
+    expect(tunnelDownLine(info({status: 'reconnecting', tunnelError: 'EOF'}))).toBe("Upterm's tunnel is down: EOF");
+  });
+
+  it('is null for a reconnecting answer without an error, and for any other status', () => {
+    expect(tunnelDownLine(info({status: 'reconnecting', tunnelReason: 'network'}))).toBeNull();
+    expect(tunnelDownLine(info({status: 'reconnecting', tunnelReason: 'network', tunnelError: ''}))).toBeNull();
+    // An ended session keeps the last outage it was in; the tunnel is not being redialled.
+    expect(tunnelDownLine(info({status: 'ended', tunnelReason: 'network', tunnelError: 'EOF'}))).toBeNull();
+    expect(tunnelDownLine(info({status: 'ready'}))).toBeNull();
   });
 });
 

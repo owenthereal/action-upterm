@@ -107,6 +107,16 @@ export function statusLabel(session: SessionInfo): string {
 }
 
 /**
+ * Why a reconnecting session's tunnel is down, in upterm's own words: the
+ * developer can't read upterm's log while the tunnel is down. Null unless the
+ * session is reconnecting and the answer carries the raw error.
+ */
+export function tunnelDownLine(session: SessionInfo): string | null {
+  if (session.status !== 'reconnecting' || !session.tunnelError) return null;
+  return `Upterm's tunnel is down${session.tunnelReason ? ` (${session.tunnelReason})` : ''}: ${session.tunnelError}`;
+}
+
+/**
  * Parse `upterm session info -o json` output.
  *
  * execShellCommand resolves with EVERYTHING written to stdout, so the JSON can
