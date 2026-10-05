@@ -364,6 +364,7 @@ export async function run() {
 
     await installDependencies();
     await assertSupportedUptermVersion();
+    const launchedAt = markSessionLaunch();
     const session = await startUptermSession(allowedUsers);
 
     if (core.getInput('detached') === 'true') {
@@ -371,7 +372,7 @@ export async function run() {
       return;
     }
 
-    await waitForSession(`SSH: ${session.sshCommand}`);
+    await waitForSession(`SSH: ${session.sshCommand}`, launchedAt);
   } catch (error: unknown) {
     if (error instanceof Error) {
       core.setFailed(error.message);
@@ -769,9 +770,50 @@ function logSessionEnded(session: SessionInfo): void {
   if (session.signal) core.info(`Signal: ${session.signal}`);
 }
 
-function continueFileExists(): boolean {
-  const continuePath = process.platform === 'win32' ? CONTINUE_FILE_PATHS.win32 : CONTINUE_FILE_PATHS.unix;
-  return fs.existsSync(continuePath) || fs.existsSync(path.join(process.env.GITHUB_WORKSPACE ?? '/', 'continue'));
+/**
+ * Note the moment this run's session is launched: a continue file counts only
+ * if touched at or after it (checkContinueFiles()). Saved for detached mode's
+ * post step, which measures from the launch too - a file touched during the
+ * job's remaining steps has already said not to wait.
+ *
+ * Whole seconds: some filesystems (HFS+, ext3) keep mtime only to the second,
+ * so a file touched later in the launch's own second would otherwise read as
+ * older than it.
+ */
+function markSessionLaunch(): number {
+  const launchedAt = Math.floor(Date.now() / 1000) * 1000;
+  core.saveState('sessionLaunchedAt', String(launchedAt));
+  return launchedAt;
+}
+
+interface ContinueFiles {
+  touched: boolean;
+  // Continue files that exist but were last touched before the launch.
+  stale: string[];
+}
+
+/**
+ * Whether a continue file was touched at or after `since`, the launch.
+ *
+ * Existing is not enough (issue #10): a continue file outlives the session it
+ * resumed - into a later action-upterm step in the same job, and on a
+ * self-hosted runner into later jobs, where a `sudo touch /continue` is not one
+ * the action could delete - and would end a new session's wait before anyone
+ * could join. `touch` refreshes the mtime of a file already there, so touching
+ * a stale one again counts.
+ */
+function checkContinueFiles(since: number): ContinueFiles {
+  const root = process.platform === 'win32' ? CONTINUE_FILE_PATHS.win32 : CONTINUE_FILE_PATHS.unix;
+  // A Set: with GITHUB_WORKSPACE unset, both are /continue.
+  const paths = new Set([root, path.join(process.env.GITHUB_WORKSPACE ?? '/', 'continue')]);
+  const stale: string[] = [];
+  for (const p of paths) {
+    const stat = fs.statSync(p, {throwIfNoEntry: false});
+    if (!stat) continue;
+    if (stat.mtimeMs >= since) return {touched: true, stale: []};
+    stale.push(p);
+  }
+  return {touched: false, stale};
 }
 
 /**
@@ -856,15 +898,24 @@ type WaitEnd = 'continue' | 'ended';
  * no later response - a stale record included - may bring the countdown back.
  *
  * A failed lookup ('unknown') ends nothing: it says nothing about who is there.
+ *
+ * Only a continue file touched since `launchedAt` ends the wait; an older one
+ * is said to be ignored, once.
  */
-async function waitForSession(message: string): Promise<WaitEnd> {
+async function waitForSession(message: string, launchedAt: number): Promise<WaitEnd> {
   let joined = false;
+  let staleReported = false;
 
   /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
   while (true) {
-    if (continueFileExists()) {
+    const continueFiles = checkContinueFiles(launchedAt);
+    if (continueFiles.touched) {
       core.info("Exiting debugging session because '/continue' file was created");
       return 'continue';
+    }
+    if (continueFiles.stale.length && !staleReported) {
+      staleReported = true;
+      core.info(`Ignoring ${continueFiles.stale.join(' and ')}: last touched before this session started. Touch it again to resume the workflow.`);
     }
 
     const poll = await pollSession();
@@ -970,7 +1021,8 @@ async function runPost(): Promise<void> {
 
     core.debug('Waiting for session to end');
 
-    if (await armJoinTimeout()) await waitForSession(message);
+    // 0 if main saved no launch time: every continue file counts, as before.
+    if (await armJoinTimeout()) await waitForSession(message, Number(core.getState('sessionLaunchedAt')) || 0);
   } finally {
     await finalizeSession();
   }
