@@ -1714,6 +1714,17 @@ describe('upterm GitHub integration', () => {
         expect(core.warning).toHaveBeenCalledWith('upterm lost its connection to the server; this session can no longer be reached (EOF)');
       });
 
+      it('logs a new outage whose recovery fell between two polls', async () => {
+        const down = (tunnelLostAt: string) => readySession({status: 'reconnecting', tunnelLostAt, tunnelReason: 'network', tunnelError: 'EOF'});
+        postState();
+        postShell('', down('2026-09-26T09:59:50Z'), down('2026-09-26T09:59:50Z'), down('2026-09-26T09:59:58Z'), endedResponse);
+
+        await runCapturingProgress();
+
+        const lines = core.info.mock.calls.map(c => String(c[0])).filter(l => l.startsWith("Upterm's tunnel"));
+        expect(lines).toEqual(["Upterm's tunnel is down (network): EOF", "Upterm's tunnel is down (network): EOF"]);
+      });
+
       it('keeps the disconnected warning as it was when upterm gives no error', async () => {
         postState();
         postShell('', readySession(), JSON.stringify({name: 'gha-3f9a1c05', status: 'disconnected'}));

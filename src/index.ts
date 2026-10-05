@@ -932,8 +932,8 @@ type WaitEnd = 'continue' | 'ended';
  * A failed lookup ('unknown') ends nothing: it says nothing about who is there.
  *
  * While upterm redials, logs its raw error each time the reason or the error
- * changes, not on every poll, and again for a new outage once the tunnel has
- * been back.
+ * changes, not on every poll, and again for a new outage, even one whose
+ * recovery fell between two polls.
  *
  * Only a continue file created or touched since the launch (`atLaunch`) ends
  * the wait; one left from before is warned about, once.
@@ -941,7 +941,7 @@ type WaitEnd = 'continue' | 'ended';
 async function waitForSession(message: string, atLaunch: ContinueFilesSnapshot): Promise<WaitEnd> {
   let joined = false;
   let staleReported = false;
-  let lastTunnelDown: string | null = null;
+  let lastOutage: string | null = null;
 
   /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
   while (true) {
@@ -971,12 +971,14 @@ async function waitForSession(message: string, atLaunch: ContinueFilesSnapshot):
       }
       if (poll.session.status === 'reconnecting') {
         const tunnelDown = tunnelDownLine(poll.session);
-        if (tunnelDown && tunnelDown !== lastTunnelDown) {
+        // An outage is told apart by when it began.
+        const outage = tunnelDown && `${poll.session.tunnelLostAt ?? ''} ${tunnelDown}`;
+        if (tunnelDown && outage !== lastOutage) {
           core.info(tunnelDown);
-          lastTunnelDown = tunnelDown;
+          lastOutage = outage;
         }
       } else {
-        lastTunnelDown = null;
+        lastOutage = null;
       }
       // Evidence in the log that this process resolved the session main published.
       core.info(`Session ${poll.session.name} (${statusLabel(poll.session)})`);

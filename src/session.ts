@@ -110,10 +110,13 @@ export function statusLabel(session: SessionInfo): string {
  * Why a reconnecting session's tunnel is down, in upterm's own words: the
  * developer can't read upterm's log while the tunnel is down. Null unless the
  * session is reconnecting and the answer carries the raw error.
+ *
+ * One line: CR and LF fold into a space. The error can carry a relay's own
+ * text, and a line of it that began with "::" would be a workflow command.
  */
 export function tunnelDownLine(session: SessionInfo): string | null {
   if (session.status !== 'reconnecting' || !session.tunnelError) return null;
-  return `Upterm's tunnel is down${session.tunnelReason ? ` (${session.tunnelReason})` : ''}: ${session.tunnelError}`;
+  return `Upterm's tunnel is down${session.tunnelReason ? ` (${session.tunnelReason})` : ''}: ${session.tunnelError}`.replace(/[\r\n]+/g, ' ');
 }
 
 /**

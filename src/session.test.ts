@@ -137,6 +137,12 @@ describe('tunnelDownLine', () => {
     expect(tunnelDownLine(info({status: 'reconnecting', tunnelError: 'EOF'}))).toBe("Upterm's tunnel is down: EOF");
   });
 
+  it('keeps the error on one line, so text from the relay cannot start a workflow command', () => {
+    expect(tunnelDownLine(info({status: 'reconnecting', tunnelReason: 'relay_error', tunnelError: 'refused\n::stop-commands::x\r\n::add-mask::y\rz'}))).toBe(
+      "Upterm's tunnel is down (relay_error): refused ::stop-commands::x ::add-mask::y z"
+    );
+  });
+
   it('is null for a reconnecting answer without an error, and for any other status', () => {
     expect(tunnelDownLine(info({status: 'reconnecting', tunnelReason: 'network'}))).toBeNull();
     expect(tunnelDownLine(info({status: 'reconnecting', tunnelReason: 'network', tunnelError: ''}))).toBeNull();
