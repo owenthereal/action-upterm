@@ -174,7 +174,7 @@ cd $GITHUB_WORKSPACE && touch continue
 sudo touch /continue
 ```
 
-Only a touch after the session started counts. A `continue` file left over from an earlier session — an earlier `action-upterm` step in the same job, or an earlier job on a self-hosted runner — is ignored (the log says so); touch it again to resume. To let the workflow carry on while the session stays up, use [Detached Mode](#detached-mode) rather than creating `continue` ahead of time.
+Only a `continue` file created or touched after the session started counts. One left over from an earlier session — an earlier `action-upterm` step in the same job, or an earlier job on a self-hosted runner — is ignored (the log warns about it); touch it again to resume. To let the workflow carry on while the session stays up, use [Detached Mode](#detached-mode) rather than creating `continue` ahead of time.
 
 How you leave the SSH connection matters:
 

@@ -168,15 +168,29 @@ function postState(overrides: Record<string, string> = {}): void {
 }
 
 /**
+ * A statSync mock from a path's mtime. undefined means the path does not
+ * exist, which throws ENOENT unless throwIfNoEntry is false - as fs does.
+ */
+function statSyncFrom(mtimeOf: (p: string) => number | undefined): typeof fs.statSync {
+  return ((p: fs.PathLike, options?: fs.StatSyncOptions) => {
+    const mtimeMs = mtimeOf(p.toString());
+    if (mtimeMs !== undefined) return {mtimeMs} as fs.Stats;
+    if (options?.throwIfNoEntry === false) return undefined;
+    throw Object.assign(new Error(`ENOENT: no such file or directory, stat '${p}'`), {code: 'ENOENT'});
+  }) as unknown as typeof fs.statSync;
+}
+
+/**
  * Continue files by path, with their mtimes (or a function giving the mtime at
  * each look); a path not listed does not exist.
  */
 function continueFiles(mtimes: Record<string, number | (() => number)>): void {
-  mockFs.statSync.mockImplementation(((p: fs.PathLike) => {
-    const mtime = mtimes[p.toString()];
-    if (mtime === undefined) return undefined;
-    return {mtimeMs: typeof mtime === 'function' ? mtime() : mtime} as fs.Stats;
-  }) as unknown as typeof fs.statSync);
+  mockFs.statSync.mockImplementation(
+    statSyncFrom(p => {
+      const mtime = mtimes[p];
+      return typeof mtime === 'function' ? mtime() : mtime;
+    })
+  );
 }
 
 describe('upterm GitHub integration', () => {
@@ -198,11 +212,13 @@ describe('upterm GitHub integration', () => {
     mockedToolCache.extractTar.mockResolvedValue(EXTRACT_DIR);
     // Reset fs mocks - everything exists by default (directories, the /continue file, etc.)
     mockFs.existsSync.mockImplementation(() => true);
-    // The wait stats the continue file. Route that through existsSync, which is
-    // how these tests control the file, and model a file that exists as one
-    // touched just now - after the launch, so it counts. continueFiles() sets
-    // real mtimes for the tests that care.
-    mockFs.statSync.mockImplementation(((p: fs.PathLike) => (mockFs.existsSync(p) ? ({mtimeMs: Date.now()} as fs.Stats) : undefined)) as unknown as typeof fs.statSync);
+    // The action stats the continue files at launch and on every poll, and
+    // counts one whose mtime changed. Route that through existsSync, which is
+    // how these tests control the files, and give a file that exists a new
+    // mtime at every look, so it always reads as just touched and counts.
+    // continueFiles() sets real mtimes for the tests that care.
+    let mtime = 0;
+    mockFs.statSync.mockImplementation(statSyncFrom(p => (mockFs.existsSync(p) ? ++mtime : undefined)));
 
     baselineInputs();
     baselineShell();
@@ -884,17 +900,15 @@ describe('upterm GitHub integration', () => {
     });
 
     it('tears down even when the post loop throws', async () => {
-      // Unlike pollSession(), which swallows a lookup failure into 'unknown',
-      // checkContinueFiles() calls fs.statSync unguarded but for ENOENT - a real
-      // fs error there (e.g. an intermittent read failure) escapes the try
-      // untouched. (The harness routes statSync through existsSync.)
-      // This is the case the try/finally exists for: without it, deleting the
-      // finally and simply appending finalizeSession() after the loop would
-      // never run, because the loop itself never returns normally.
+      // pollSession() and the continue-file check both swallow their own
+      // failures, so the loop's sleep rejecting stands in for anything
+      // unexpected that escapes the try. This is the case the try/finally
+      // exists for: without it, deleting the finally and simply appending
+      // finalizeSession() after the loop would never run, because the loop
+      // itself never returns normally.
       postState();
-      mockFs.existsSync.mockImplementation(() => {
-        throw new Error("EIO: i/o error, stat '/continue'");
-      });
+      fsWithoutExitFiles();
+      mockedSleep.mockRejectedValue(new Error('unexpected failure in the wait'));
 
       await run();
 
@@ -967,81 +981,131 @@ describe('upterm GitHub integration', () => {
     // Issue #10: a continue file outlives the session it resumed - into a later
     // action-upterm step in the same job, and on a self-hosted runner into
     // later jobs - and must not end a new session's wait before anyone joins.
-    const LAUNCHED_AT = 1_700_000_000_000;
-    const IGNORED = 'Ignoring /continue: last touched before this session started. Touch it again to resume the workflow.';
-    const ignoredLines = () => core.info.mock.calls.filter(c => c[0] === IGNORED).length;
-
-    let dateNow: jest.SpyInstance | undefined;
+    const RESUMED = "Exiting debugging session because '/continue' file was created";
+    const ignored = (paths: string) => `Ignoring ${paths}: it was there before this session started. Touch it again to resume the workflow.`;
+    const IGNORED = ignored('/continue');
+    const originalWorkspace = process.env.GITHUB_WORKSPACE;
+    // The session up for `polls` lookups, then ended: a wait that fails to
+    // resume ends on its own instead of spinning for ever on the mocked sleep.
+    const readyThenEnded = (polls: number) => [...Array(polls).fill(readySession()), endedResponse];
 
     beforeEach(() => {
       Object.defineProperty(process, 'platform', {value: 'linux'});
       Object.defineProperty(process, 'arch', {value: 'x64'});
+      process.env.GITHUB_WORKSPACE = '/work';
     });
 
     afterEach(() => {
-      dateNow?.mockRestore();
-      dateNow = undefined;
+      if (originalWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
+      else process.env.GITHUB_WORKSPACE = originalWorkspace;
     });
 
-    it('saves the launch time for the post step, in whole seconds', async () => {
-      // Whole seconds: some filesystems (HFS+, ext3) keep mtime only to the
-      // second, so a file touched later in the launch's own second would
-      // otherwise read as older than it.
-      dateNow = jest.spyOn(Date, 'now').mockReturnValue(LAUNCHED_AT + 456);
-      fsWithoutExitFiles();
+    it('saves the continue files as they were at launch, for the post step', async () => {
+      continueFiles({'/continue': 5});
       baselineShell(readySession(), endedResponse);
 
       await run();
 
-      expect(core.saveState).toHaveBeenCalledWith('sessionLaunchedAt', String(LAUNCHED_AT));
+      expect(core.saveState).toHaveBeenCalledWith('continueFilesAtLaunch', JSON.stringify({'/continue': 5, '/work/continue': null}));
     });
 
-    it('ignores a continue file last touched before the session launched', async () => {
-      continueFiles({'/continue': 0});
-      baselineShell(readySession(), endedResponse);
+    it('ignores a continue file left from before the launch, and says so once', async () => {
+      continueFiles({'/continue': 5});
+      baselineShell(readySession(), readySession(), readySession(), endedResponse);
 
       await run();
 
-      expect(core.info).not.toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
+      expect(core.info).not.toHaveBeenCalledWith(RESUMED);
       expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
-      expect(core.info).toHaveBeenCalledWith(IGNORED);
+      // A warning: the user may have created it on purpose, and needs to see why
+      // it no longer resumes anything.
+      expect(core.warning.mock.calls.filter(c => c[0] === IGNORED)).toHaveLength(1);
     });
 
-    it('resumes once a left-over continue file is touched again, saying it was ignored only once', async () => {
+    it('resumes once a left-over continue file is touched again', async () => {
       // `touch` refreshes the mtime of a file that is already there.
-      continueFiles({'/continue': () => (sessionInfoCalls() >= 3 ? Date.now() : 0)});
-      baselineShell(readySession());
+      continueFiles({'/continue': () => (sessionInfoCalls() >= 3 ? 6 : 5)});
+      baselineShell(readySession(), ...readyThenEnded(4));
 
       await run();
 
       expect(sessionInfoCalls()).toBe(3);
-      expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
-      expect(ignoredLines()).toBe(1);
+      expect(core.info).toHaveBeenCalledWith(RESUMED);
     });
 
-    it("in detached mode's post step, ignores a continue file from before the launch", async () => {
-      postState({sessionLaunchedAt: String(LAUNCHED_AT)});
-      continueFiles({'/continue': LAUNCHED_AT - 60_000});
+    it('goes by whether the file changed, not by the clock', async () => {
+      // A leftover dated in the future (a clock since corrected, touch -d) is
+      // still a leftover; a touch dated in the past (an NFS server's clock
+      // behind the runner's, cp -p) is still a touch.
+      const future = Date.now() + 86_400_000;
+      continueFiles({'/continue': () => (sessionInfoCalls() >= 2 ? 1_000 : future)});
+      baselineShell(readySession(), ...readyThenEnded(4));
+
+      await run();
+
+      expect(sessionInfoCalls()).toBe(2);
+      expect(core.info).toHaveBeenCalledWith(RESUMED);
+    });
+
+    it('treats $GITHUB_WORKSPACE/continue the same way', async () => {
+      continueFiles({'/continue': 5, '/work/continue': () => (sessionInfoCalls() >= 2 ? 8 : 7)});
+      baselineShell(readySession(), ...readyThenEnded(4));
+
+      await run();
+
+      expect(core.warning).toHaveBeenCalledWith(ignored('/continue and /work/continue'));
+      expect(sessionInfoCalls()).toBe(2);
+      expect(core.info).toHaveBeenCalledWith(RESUMED);
+    });
+
+    it('keeps waiting when a continue file cannot be read', async () => {
+      // An fs error (EIO, ELOOP, ESTALE on NFS) says nothing about the session,
+      // so - like a failed lookup - it must not end the wait, or fail the step
+      // and have teardown stop a session a guest may be using.
+      mockFs.statSync.mockImplementation(() => {
+        throw Object.assign(new Error("EIO: i/o error, stat '/continue'"), {code: 'EIO'});
+      });
+      baselineShell(readySession(), readySession(), endedResponse);
+
+      await run();
+
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+    });
+
+    it("in detached mode's post step, ignores a continue file unchanged since main's launch", async () => {
+      postState({continueFilesAtLaunch: JSON.stringify({'/continue': 5, '/work/continue': null})});
+      continueFiles({'/continue': 5});
       baselineShell(endedResponse);
 
       await run();
 
-      expect(core.info).not.toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
+      expect(core.info).not.toHaveBeenCalledWith(RESUMED);
       expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
-      expect(core.info).toHaveBeenCalledWith(IGNORED);
+      expect(core.warning).toHaveBeenCalledWith(IGNORED);
     });
 
-    it("in detached mode's post step, honors a continue file touched during the job, after the launch", async () => {
+    it("in detached mode's post step, honors a continue file that appeared during the job", async () => {
       // Measured from the launch, not from the post step: a guest who touched
       // it mid-job, or a later step, has already said not to wait.
-      postState({sessionLaunchedAt: String(LAUNCHED_AT)});
-      continueFiles({'/continue': LAUNCHED_AT + 60_000});
-      baselineShell(readySession());
+      postState({continueFilesAtLaunch: JSON.stringify({'/continue': 5, '/work/continue': null})});
+      continueFiles({'/continue': 5, '/work/continue': 9});
+      baselineShell(...readyThenEnded(1));
 
       await run();
 
-      expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
-      expect(ignoredLines()).toBe(0);
+      expect(core.info).toHaveBeenCalledWith(RESUMED);
+    });
+
+    it("in detached mode's post step, counts any continue file when main's snapshot cannot be read", async () => {
+      postState({continueFilesAtLaunch: 'not json'});
+      continueFiles({'/continue': 5});
+      baselineShell(...readyThenEnded(1));
+
+      await run();
+
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(core.info).toHaveBeenCalledWith(RESUMED);
     });
   });
 

@@ -364,7 +364,7 @@ export async function run() {
 
     await installDependencies();
     await assertSupportedUptermVersion();
-    const launchedAt = markSessionLaunch();
+    const continueFilesAtLaunch = snapshotContinueFiles();
     const session = await startUptermSession(allowedUsers);
 
     if (core.getInput('detached') === 'true') {
@@ -372,7 +372,7 @@ export async function run() {
       return;
     }
 
-    await waitForSession(`SSH: ${session.sshCommand}`, launchedAt);
+    await waitForSession(`SSH: ${session.sshCommand}`, continueFilesAtLaunch);
   } catch (error: unknown) {
     if (error instanceof Error) {
       core.setFailed(error.message);
@@ -770,47 +770,78 @@ function logSessionEnded(session: SessionInfo): void {
   if (session.signal) core.info(`Signal: ${session.signal}`);
 }
 
+/** Each continue file's mtime when the session launched; null if it was not there. */
+type ContinueFilesSnapshot = Record<string, number | null>;
+
+function continueFilePaths(): string[] {
+  const root = process.platform === 'win32' ? CONTINUE_FILE_PATHS.win32 : CONTINUE_FILE_PATHS.unix;
+  // A Set: with GITHUB_WORKSPACE unset, both are /continue.
+  return [...new Set([root, path.join(process.env.GITHUB_WORKSPACE ?? '/', 'continue')])];
+}
+
 /**
- * Note the moment this run's session is launched: a continue file counts only
- * if touched at or after it (checkContinueFiles()). Saved for detached mode's
- * post step, which measures from the launch too - a file touched during the
- * job's remaining steps has already said not to wait.
- *
- * Whole seconds: some filesystems (HFS+, ext3) keep mtime only to the second,
- * so a file touched later in the launch's own second would otherwise read as
- * older than it.
+ * A continue file's mtime, or null if it is not there. An fs error (EIO,
+ * ELOOP, ESTALE on NFS) reads as not there, as it did for existsSync: like a
+ * failed session lookup, it says nothing about the session, and throwing would
+ * end the wait - and have teardown stop a session a guest may be using.
  */
-function markSessionLaunch(): number {
-  const launchedAt = Math.floor(Date.now() / 1000) * 1000;
-  core.saveState('sessionLaunchedAt', String(launchedAt));
-  return launchedAt;
+function continueFileMtime(p: string): number | null {
+  try {
+    return fs.statSync(p, {throwIfNoEntry: false})?.mtimeMs ?? null;
+  } catch (error) {
+    core.debug(`Could not stat ${p}, treating it as absent: ${error}`);
+    return null;
+  }
+}
+
+/**
+ * Record the continue files as they are just before the launch, for
+ * checkContinueFiles(). Saved for detached mode's post step, which compares
+ * against the launch too - a file touched during the job's remaining steps has
+ * already said not to wait.
+ */
+function snapshotContinueFiles(): ContinueFilesSnapshot {
+  const snapshot: ContinueFilesSnapshot = Object.fromEntries(continueFilePaths().map(p => [p, continueFileMtime(p)]));
+  core.saveState('continueFilesAtLaunch', JSON.stringify(snapshot));
+  return snapshot;
+}
+
+/** Main's snapshot, in the post step. Missing or unreadable: none, so every continue file counts, as before. */
+function savedContinueFilesSnapshot(): ContinueFilesSnapshot {
+  try {
+    const saved = JSON.parse(core.getState('continueFilesAtLaunch') || '{}');
+    return saved && typeof saved === 'object' ? saved : {};
+  } catch {
+    return {};
+  }
 }
 
 interface ContinueFiles {
   touched: boolean;
-  // Continue files that exist but were last touched before the launch.
+  // Continue files that are there but unchanged since the launch.
   stale: string[];
 }
 
 /**
- * Whether a continue file was touched at or after `since`, the launch.
+ * Whether a continue file was created or touched since the launch.
  *
  * Existing is not enough (issue #10): a continue file outlives the session it
  * resumed - into a later action-upterm step in the same job, and on a
  * self-hosted runner into later jobs, where a `sudo touch /continue` is not one
  * the action could delete - and would end a new session's wait before anyone
- * could join. `touch` refreshes the mtime of a file already there, so touching
- * a stale one again counts.
+ * could join. `touch` gives a file already there a new mtime, so touching a
+ * stale one again counts.
+ *
+ * Compared with the file's own mtime at launch, not with the clock: an mtime
+ * can come from another clock (an NFS server's), or be set to anything (cp -p,
+ * touch -d), and what matters is only that it changed.
  */
-function checkContinueFiles(since: number): ContinueFiles {
-  const root = process.platform === 'win32' ? CONTINUE_FILE_PATHS.win32 : CONTINUE_FILE_PATHS.unix;
-  // A Set: with GITHUB_WORKSPACE unset, both are /continue.
-  const paths = new Set([root, path.join(process.env.GITHUB_WORKSPACE ?? '/', 'continue')]);
+function checkContinueFiles(atLaunch: ContinueFilesSnapshot): ContinueFiles {
   const stale: string[] = [];
-  for (const p of paths) {
-    const stat = fs.statSync(p, {throwIfNoEntry: false});
-    if (!stat) continue;
-    if (stat.mtimeMs >= since) return {touched: true, stale: []};
+  for (const p of continueFilePaths()) {
+    const mtime = continueFileMtime(p);
+    if (mtime === null) continue;
+    if (mtime !== atLaunch[p]) return {touched: true, stale: []};
     stale.push(p);
   }
   return {touched: false, stale};
@@ -899,23 +930,23 @@ type WaitEnd = 'continue' | 'ended';
  *
  * A failed lookup ('unknown') ends nothing: it says nothing about who is there.
  *
- * Only a continue file touched since `launchedAt` ends the wait; an older one
- * is said to be ignored, once.
+ * Only a continue file created or touched since the launch (`atLaunch`) ends
+ * the wait; one left from before is warned about, once.
  */
-async function waitForSession(message: string, launchedAt: number): Promise<WaitEnd> {
+async function waitForSession(message: string, atLaunch: ContinueFilesSnapshot): Promise<WaitEnd> {
   let joined = false;
   let staleReported = false;
 
   /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
   while (true) {
-    const continueFiles = checkContinueFiles(launchedAt);
+    const continueFiles = checkContinueFiles(atLaunch);
     if (continueFiles.touched) {
       core.info("Exiting debugging session because '/continue' file was created");
       return 'continue';
     }
     if (continueFiles.stale.length && !staleReported) {
       staleReported = true;
-      core.info(`Ignoring ${continueFiles.stale.join(' and ')}: last touched before this session started. Touch it again to resume the workflow.`);
+      core.warning(`Ignoring ${continueFiles.stale.join(' and ')}: it was there before this session started. Touch it again to resume the workflow.`);
     }
 
     const poll = await pollSession();
@@ -1021,8 +1052,7 @@ async function runPost(): Promise<void> {
 
     core.debug('Waiting for session to end');
 
-    // 0 if main saved no launch time: every continue file counts, as before.
-    if (await armJoinTimeout()) await waitForSession(message, Number(core.getState('sessionLaunchedAt')) || 0);
+    if (await armJoinTimeout()) await waitForSession(message, savedContinueFilesSnapshot());
   } finally {
     await finalizeSession();
   }
