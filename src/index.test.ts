@@ -985,6 +985,10 @@ describe('upterm GitHub integration', () => {
     const ignored = (paths: string) => `Ignoring ${paths}: it was there before this session started. Touch it again to resume the workflow.`;
     const IGNORED = ignored('/continue');
     const originalWorkspace = process.env.GITHUB_WORKSPACE;
+    // Built the way the action builds it: path.join uses the real host's
+    // separators whatever process.platform is mocked to, so on a Windows runner
+    // this is \work\continue.
+    const WORKSPACE_CONTINUE = path.join('/work', 'continue');
     // The session up for `polls` lookups, then ended: a wait that fails to
     // resume ends on its own instead of spinning for ever on the mocked sleep.
     const readyThenEnded = (polls: number) => [...Array(polls).fill(readySession()), endedResponse];
@@ -1006,7 +1010,7 @@ describe('upterm GitHub integration', () => {
 
       await run();
 
-      expect(core.saveState).toHaveBeenCalledWith('continueFilesAtLaunch', JSON.stringify({'/continue': 5, '/work/continue': null}));
+      expect(core.saveState).toHaveBeenCalledWith('continueFilesAtLaunch', JSON.stringify({'/continue': 5, [WORKSPACE_CONTINUE]: null}));
     });
 
     it('ignores a continue file left from before the launch, and says so once', async () => {
@@ -1048,12 +1052,12 @@ describe('upterm GitHub integration', () => {
     });
 
     it('treats $GITHUB_WORKSPACE/continue the same way', async () => {
-      continueFiles({'/continue': 5, '/work/continue': () => (sessionInfoCalls() >= 2 ? 8 : 7)});
+      continueFiles({'/continue': 5, [WORKSPACE_CONTINUE]: () => (sessionInfoCalls() >= 2 ? 8 : 7)});
       baselineShell(readySession(), ...readyThenEnded(4));
 
       await run();
 
-      expect(core.warning).toHaveBeenCalledWith(ignored('/continue and /work/continue'));
+      expect(core.warning).toHaveBeenCalledWith(ignored(`/continue and ${WORKSPACE_CONTINUE}`));
       expect(sessionInfoCalls()).toBe(2);
       expect(core.info).toHaveBeenCalledWith(RESUMED);
     });
@@ -1074,7 +1078,7 @@ describe('upterm GitHub integration', () => {
     });
 
     it("in detached mode's post step, ignores a continue file unchanged since main's launch", async () => {
-      postState({continueFilesAtLaunch: JSON.stringify({'/continue': 5, '/work/continue': null})});
+      postState({continueFilesAtLaunch: JSON.stringify({'/continue': 5, [WORKSPACE_CONTINUE]: null})});
       continueFiles({'/continue': 5});
       baselineShell(endedResponse);
 
@@ -1088,8 +1092,8 @@ describe('upterm GitHub integration', () => {
     it("in detached mode's post step, honors a continue file that appeared during the job", async () => {
       // Measured from the launch, not from the post step: a guest who touched
       // it mid-job, or a later step, has already said not to wait.
-      postState({continueFilesAtLaunch: JSON.stringify({'/continue': 5, '/work/continue': null})});
-      continueFiles({'/continue': 5, '/work/continue': 9});
+      postState({continueFilesAtLaunch: JSON.stringify({'/continue': 5, [WORKSPACE_CONTINUE]: null})});
+      continueFiles({'/continue': 5, [WORKSPACE_CONTINUE]: 9});
       baselineShell(...readyThenEnded(1));
 
       await run();
