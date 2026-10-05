@@ -35,7 +35,7 @@ action-upterm's own footprint is four `upterm` invocations, all run through `exe
 
 `waitForSession()` (src/index.ts) is the one loop used by both attached mode and detached mode's post step. It only observes: upterm alone ends a session nobody joined, at its own deadline, so a guest can never be kicked between a read and a stop. Each pass, every 5 seconds:
 
-1. Checks for the continue file (`/continue` or `$GITHUB_WORKSPACE/continue`) - if present, the wait ends immediately with no session lookup.
+1. Checks for the continue file (`/continue` or `$GITHUB_WORKSPACE/continue`) - if one was created or touched since the session's launch (it is there, and its mtime differs from the one in `continueFilesAtLaunch`), the wait ends immediately with no session lookup. One unchanged since the launch is left over from an earlier session or job: the loop warns once that it is ignoring it, and touching it again counts (issue #10). The comparison is against the file's own mtime at launch, never the clock, since an mtime can come from another clock (an NFS server's) or be set to anything (`cp -p`, `touch -d`). An fs error reading a continue file reads as no file, as `existsSync` did: like a failed lookup, it ends nothing.
 2. Polls `upterm session info`. Exit 4 or a terminal status (`disconnected`, `ending`, `ended`) ends the wait; an end by upterm's join timeout (reason `join_timeout`) is logged as "Timed out waiting for client to connect". `reconnecting` is deliberately not terminal: upterm is redialling a dropped tunnel on its own, so the wait keeps polling, and its per-poll `Session <name> (reconnecting: <reason>)` log line names why the tunnel is down (`tunnelReason`). A failed lookup is warned about and ends nothing.
 3. Logs one status line (`waitStatusLine()`, src/session.ts): the seconds left before `joinDeadline`, clamped at 0 (teardown after the deadline fires can show a past deadline for ~16 s), or "Waiting for session to end". Join state upterm read from its record rather than from the daemon (`joinStateSource` other than `daemon`) may be stale - a record's deadline may no longer be counting, and a record without one does not prove there is no window - so it is marked unconfirmed.
 4. **The join latch**: once `firstGuestJoinedAt` appears (`hasGuestJoined()`), the loop logs "A guest joined at T; automatic join timeout disabled" once, and from then on always "Waiting for session to end", whatever later responses say: upterm disables the timeout for good at the first join, so a stale response must not bring the countdown back. `guestCount` is never used for this decision, for two binding reasons: it counts forwarding-only presence, which is not a qualifying join, and it is a current count rather than an event - it misses a guest who joined and left again between two polls, exactly the case `firstGuestJoinedAt` exists to catch.
@@ -213,7 +213,7 @@ On Windows these are exported in MSYS-form (`/c/...`), never `C:/...`. Not becau
    - A failed lookup ("unknown") never ends the wait
 
 4. **Termination** - the wait ends when:
-   - The continue file is created
+   - The continue file is touched after the session launched
    - The session reaches a terminal status (`disconnected`, `ending`, `ended`; not `reconnecting`, since upterm is redialling on its own) - including upterm ending it at its join deadline
    - upterm reports no session by that name (exit 4)
 
@@ -245,6 +245,7 @@ The main and post invocations are separate Node processes; `core.saveState()` /
 | `isPost` | Set before any fallible setup so a failure always routes to the post (cleanup) path instead of re-entering main. |
 | `sessionName` | The `gha-<8 hex>` name minted once in main, so post addresses the same session. |
 | `sessionStarted` | Saved immediately *before* `upterm host --detach` is attempted, so a launch that fails part-way is still torn down; guards the post step's `stopSession()` call so a failed download or rejected upterm version - neither of which reaches session creation - doesn't try to stop a session this run never created. |
+| `continueFilesAtLaunch` | Each continue file's mtime (or `null` if absent) just before `upterm host --detach`, as JSON. The wait honors only a continue file that differs from it; detached mode's post step compares against it too, so a file created or touched while the job's remaining steps ran still counts. Missing or unreadable in post: every continue file counts, as before. |
 | `uptermBaseDir` | Path to the per-run `upterm-action-XXXXXX` directory, so post restores rather than mints new directories. |
 | `uptermRuntimeDir` | Path to the per-run `upterm-rt-XXXXXX` directory (`XDG_RUNTIME_DIR`), wherever its root was chosen - post restores and removes it from here. |
 | `message` | The SSH connection message, saved only in detached mode; its absence tells post there is nothing to wait on. |
@@ -253,7 +254,7 @@ There is no separate session-manager state, and no `socketPath` key - sessions a
 
 ### Concurrency
 
-Each run mints its own session name (`gha-<8 hex>`) and its own private, `mkdtemp`'d runtime/state/config directories, so two `action-upterm` steps in the same job each address only their own session by name rather than sharing a fixed name or a stop call that would affect both. The one surface that is still process-wide is the continue file: `/continue` and `$GITHUB_WORKSPACE/continue` are shared paths, so creating either one resumes *every* `action-upterm` invocation in that job currently watching for it, not just one.
+Each run mints its own session name (`gha-<8 hex>`) and its own private, `mkdtemp`'d runtime/state/config directories, so two `action-upterm` steps in the same job each address only their own session by name rather than sharing a fixed name or a stop call that would affect both. The one surface that is still process-wide is the continue file: `/continue` and `$GITHUB_WORKSPACE/continue` are shared paths, so creating either one resumes *every* `action-upterm` invocation in that job currently watching for it, not just one. It is never deleted - `sudo touch /continue` makes one the action could not remove - so each wait counts only a file created or touched after its own session's launch: a file left by an earlier step, or on a self-hosted runner by an earlier job, does not end a later session's wait.
 
 ## File Structure
 
