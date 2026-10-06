@@ -1676,6 +1676,64 @@ describe('upterm GitHub integration', () => {
         expect(sessionStops()).toBe(0);
       });
 
+      it("logs upterm's error once per change of reason or error, and again for a new outage after the tunnel is back", async () => {
+        const down = (tunnelReason: string, tunnelError: string) => readySession({status: 'reconnecting', tunnelLostAt: '2026-09-26T09:59:50Z', tunnelReason, tunnelError});
+        const reset = 'read tcp 10.1.0.4:41522->66.241.124.67:22: read: connection reset by peer';
+        const dns = 'dial tcp: lookup uptermd.upterm.dev: no such host';
+        const consul = 'error creating session: could not initialize session: failed to create session: consul down';
+        postState();
+        postShell('', readySession(), down('network', reset), down('network', reset), down('network', dns), down('relay_error', consul), down('relay_error', consul), readySession(), down('relay_error', consul), endedResponse);
+
+        await runCapturingProgress();
+
+        const lines = core.info.mock.calls.map(c => String(c[0])).filter(l => l.startsWith('Session ') || l.startsWith("Upterm's tunnel"));
+        expect(lines).toEqual([
+          'Session gha-3f9a1c05 (ready)',
+          `Upterm's tunnel is down (network): ${reset}`,
+          'Session gha-3f9a1c05 (reconnecting: network)',
+          'Session gha-3f9a1c05 (reconnecting: network)',
+          `Upterm's tunnel is down (network): ${dns}`,
+          'Session gha-3f9a1c05 (reconnecting: network)',
+          `Upterm's tunnel is down (relay_error): ${consul}`,
+          'Session gha-3f9a1c05 (reconnecting: relay_error)',
+          'Session gha-3f9a1c05 (reconnecting: relay_error)',
+          'Session gha-3f9a1c05 (ready)',
+          `Upterm's tunnel is down (relay_error): ${consul}`,
+          'Session gha-3f9a1c05 (reconnecting: relay_error)'
+        ]);
+        // Each outage line is a log line, not an annotation.
+        expect(core.warning).not.toHaveBeenCalled();
+      });
+
+      it("adds upterm's error to the disconnected warning", async () => {
+        postState();
+        postShell('', readySession(), JSON.stringify({name: 'gha-3f9a1c05', status: 'disconnected', tunnelReason: 'reconnect_unsupported', tunnelError: 'EOF'}));
+
+        await run();
+
+        expect(core.warning).toHaveBeenCalledWith('upterm lost its connection to the server; this session can no longer be reached (EOF)');
+      });
+
+      it('logs a new outage whose recovery fell between two polls', async () => {
+        const down = (tunnelLostAt: string) => readySession({status: 'reconnecting', tunnelLostAt, tunnelReason: 'network', tunnelError: 'EOF'});
+        postState();
+        postShell('', down('2026-09-26T09:59:50Z'), down('2026-09-26T09:59:50Z'), down('2026-09-26T09:59:58Z'), endedResponse);
+
+        await runCapturingProgress();
+
+        const lines = core.info.mock.calls.map(c => String(c[0])).filter(l => l.startsWith("Upterm's tunnel"));
+        expect(lines).toEqual(["Upterm's tunnel is down (network): EOF", "Upterm's tunnel is down (network): EOF"]);
+      });
+
+      it('keeps the disconnected warning as it was when upterm gives no error', async () => {
+        postState();
+        postShell('', readySession(), JSON.stringify({name: 'gha-3f9a1c05', status: 'disconnected'}));
+
+        await run();
+
+        expect(core.warning).toHaveBeenCalledWith('upterm lost its connection to the server; this session can no longer be reached');
+      });
+
       it('reports a join timeout without a duration when the record has none', async () => {
         postState();
         postShell('', JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', reason: 'join_timeout'}));

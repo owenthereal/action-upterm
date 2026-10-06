@@ -22,7 +22,7 @@ See ARCHITECTURE.md for the full picture (the four `upterm` calls, the wait loop
 ### Core Files
 - `src/main.ts` - Entry point that calls the main `run()` function
 - `src/index.ts` - Main application logic: installs upterm, starts the session, runs the wait loop, and tears down in post
-- `src/session.ts` - Session types and helpers: parses `upterm session info -o json`, `isNoSuchSession()` (upterm's exit 4), `hasGuestJoined()`, `waitStatusLine()`, `statusLabel()`, the upterm version gate
+- `src/session.ts` - Session types and helpers: parses `upterm session info -o json`, `isNoSuchSession()` (upterm's exit 4), `hasGuestJoined()`, `waitStatusLine()`, `statusLabel()`, `tunnelDownLine()`, the upterm version gate
 - `src/helpers.ts` - Contains `execShellCommand()` (runs every shell command through bash, `C:\msys64\usr\bin\bash.exe -lc` on Windows) and `shellEscape()`; a non-zero exit rejects with `ShellCommandError`, which carries `exitCode`
 - `action.yml` / `detached/action.yml` - GitHub Action metadata and input definitions (kept in sync by CI; the latter's `main`/`post` point at `../lib/index.js` and `detached` defaults to `"true"`)
 
