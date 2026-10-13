@@ -1,4 +1,4 @@
-import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion, waitStatusLine, statusLabel, tunnelDownLine, outcomePending} from './session';
+import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion, waitStatusLine, statusLabel, tunnelDownLine, outcomePending, connectLines} from './session';
 import {execShellCommand, ShellCommandError} from './helpers';
 
 jest.mock('./helpers', () => ({
@@ -61,6 +61,12 @@ describe('parseSessionInfo', () => {
     // may gate on. Reading this 0 as a real count would shut down a session
     // someone is actively attached to.
     expect(info.guestCount).toBe(0);
+  });
+
+  it('keeps sshCommand as the only marker of live detail: a join command alone is not one', () => {
+    const info = parseSessionInfo(JSON.stringify({name: 'gha-3f9a1c05', status: 'ready', joinCommand: 'upterm join ssh://token@uptermd.upterm.dev', guestCount: 0}));
+    expect(info.joinCommand).toBe('upterm join ssh://token@uptermd.upterm.dev');
+    expect(info.hasLiveDetail).toBe(false);
   });
 
   it('parses an ended session that crashed', () => {
@@ -166,6 +172,19 @@ describe('outcomePending', () => {
     expect(outcomePending(info({status: 'ended', reason: 'unknown'}))).toBe(false);
     expect(outcomePending(info({status: 'disconnected', reason: 'unknown'}))).toBe(false);
     expect(outcomePending(info({status: 'ready', reason: 'unknown'}))).toBe(false);
+  });
+});
+
+describe('connectLines', () => {
+  const info = (fields: Record<string, unknown>) => parseSessionInfo(JSON.stringify({name: 'gha-1', status: 'ready', sshCommand: 'ssh token@uptermd.upterm.dev', ...fields}));
+
+  it("puts upterm join above the ssh line, as upterm's own view does", () => {
+    expect(connectLines(info({joinCommand: 'upterm join ssh://token@uptermd.upterm.dev'}))).toBe('Join: upterm join ssh://token@uptermd.upterm.dev\nSSH: ssh token@uptermd.upterm.dev');
+  });
+
+  it('shows the ssh line alone when upterm offers no join command: before v0.38.0, or a ws/wss relay behind a path', () => {
+    expect(connectLines(info({}))).toBe('SSH: ssh token@uptermd.upterm.dev');
+    expect(connectLines(info({joinCommand: ''}))).toBe('SSH: ssh token@uptermd.upterm.dev');
   });
 });
 

@@ -6,6 +6,7 @@ import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
 import {execShellCommand, shellEscape, sleep} from './helpers';
 import {
+  connectLines,
   generateSessionName,
   getSession,
   hasGuestJoined,
@@ -377,7 +378,7 @@ export async function run() {
       return;
     }
 
-    await waitForSession(`SSH: ${session.sshCommand}`, continueFilesAtLaunch);
+    await waitForSession(connectLines(session), continueFilesAtLaunch);
   } catch (error: unknown) {
     if (error instanceof Error) {
       core.setFailed(error.message);
@@ -737,13 +738,25 @@ async function outputSshCommand(session: SessionInfo): Promise<string | null> {
     return null;
   }
 
+  // Join first, as upterm's own view does. Absent before upterm v0.38.0, and
+  // for a relay URL with a path: the ssh line alone, as before.
+  const joinCommand = session.joinCommand;
+  if (joinCommand) {
+    core.setOutput('join-command', joinCommand);
+    core.info(`Join command available as output: ${joinCommand}`);
+  }
   core.setOutput('ssh-command', sshCommand);
   core.info(`SSH command available as output: ${sshCommand}`);
   // The job summary is a convenience. write() throws when GITHUB_STEP_SUMMARY
   // is unset (older GHES, some runner setups), and that must not fail a
   // session that is already up.
   try {
-    await core.summary.addHeading('Upterm SSH Connection').addCodeBlock(sshCommand, 'bash').addRaw(`\n\nConnect with: <code>${sshCommand}</code>`).write();
+    const summary = core.summary.addHeading('Upterm SSH Connection');
+    if (joinCommand) summary.addRaw('Join:', true).addCodeBlock(joinCommand, 'bash').addRaw('SSH:', true);
+    await summary
+      .addCodeBlock(sshCommand, 'bash')
+      .addRaw(`\n\nConnect with: ${joinCommand ? `<code>${joinCommand}</code> or ` : ''}<code>${sshCommand}</code>`)
+      .write();
   } catch (error) {
     core.debug(`Could not write the job summary: ${error}`);
   }
@@ -1011,7 +1024,7 @@ async function runDetachedMode(session: SessionInfo): Promise<void> {
   //
   // Emit the notice once; use plain text for the post-action loop
   // to avoid creating duplicate annotations in the GitHub Actions UI.
-  const message = `SSH: ${session.sshCommand}`;
+  const message = connectLines(session);
   core.notice(message);
 
   // Save state for the POST action
