@@ -66,6 +66,9 @@ function readySession(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({...READY_SESSION, ...overrides});
 }
 
+// What upterm v0.38.0+ publishes beside sshCommand for READY_SESSION's relay.
+const JOIN_COMMAND = 'upterm join ssh://user@session123.upterm.dev';
+
 // "ready" straight from upterm's record: the admin query failed, so there is no
 // sshCommand and nothing to connect to yet.
 const noDetail = JSON.stringify({name: 'gha-3f9a1c05', status: 'ready', sessionId: 's1'});
@@ -73,6 +76,15 @@ const endedResponse = JSON.stringify({name: 'gha-3f9a1c05', status: 'ended', rea
 
 function sessionInfoCalls(): number {
   return mockedExecShellCommand.mock.calls.filter(c => c[0].includes('session info')).length;
+}
+
+/** The job summary as the action built it: every builder call, in order, as [method, ...args]. */
+function summaryCalls(): unknown[][] {
+  const builder = core.summary as unknown as Record<string, jest.Mock>;
+  return ['addHeading', 'addRaw', 'addCodeBlock']
+    .flatMap(method => builder[method].mock.calls.map((args, i) => ({order: builder[method].mock.invocationCallOrder[i], call: [method, ...args]})))
+    .sort((a, b) => a.order - b.order)
+    .map(({call}) => call);
 }
 
 // Everything the action imports is re-acquired here. resetModules() hands the
@@ -790,6 +802,17 @@ describe('upterm GitHub integration', () => {
       expect(core.info).toHaveBeenCalledWith('Detached mode: workflow will continue while upterm session is active');
     });
 
+    it("puts upterm join above the ssh line in the notice and in the post step's wait message", async () => {
+      when(core.getInput).calledWith('detached').mockReturnValue('true');
+      baselineShell(readySession({joinCommand: JOIN_COMMAND}));
+
+      await run();
+
+      const lines = `Join: ${JOIN_COMMAND}\nSSH: ssh user@session123.upterm.dev`;
+      expect(core.notice).toHaveBeenCalledWith(lines);
+      expect(core.saveState).toHaveBeenCalledWith('message', lines);
+    });
+
     it('should enter normal monitoring loop when detached is false', async () => {
       when(core.getInput).calledWith('detached').mockReturnValue('false');
 
@@ -1172,6 +1195,41 @@ describe('upterm GitHub integration', () => {
       expect(firstInfo).toBeGreaterThan(launchIndex);
     });
 
+    it("publishes upterm's join command beside the ssh command, Join first, when upterm offers one", async () => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) return 'Upterm version 0.38.0\n';
+        if (cmd.includes('upterm host')) return readySession({joinCommand: JOIN_COMMAND});
+        if (cmd.includes('session info')) return endedResponse;
+        return '';
+      });
+      await run();
+      expect(core.setOutput).toHaveBeenCalledWith('join-command', JOIN_COMMAND);
+      expect(core.setOutput).toHaveBeenCalledWith('ssh-command', 'ssh user@session123.upterm.dev');
+      expect(core.info.mock.calls.map(c => String(c[0])).filter(l => l.includes('available as output'))).toEqual([`Join command available as output: ${JOIN_COMMAND}`, 'SSH command available as output: ssh user@session123.upterm.dev']);
+      expect(summaryCalls()).toEqual([
+        ['addHeading', 'Upterm SSH Connection'],
+        ['addRaw', 'Join:', true],
+        ['addCodeBlock', JOIN_COMMAND, 'bash'],
+        ['addRaw', 'SSH:', true],
+        ['addCodeBlock', 'ssh user@session123.upterm.dev', 'bash'],
+        ['addRaw', `\n\nConnect with: <code>${JOIN_COMMAND}</code> or <code>ssh user@session123.upterm.dev</code>`]
+      ]);
+    });
+
+    it('publishes the ssh command alone, with no join-command output, when upterm offers no join command', async () => {
+      // upterm before v0.38.0, or a ws/wss relay behind a path.
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      await run();
+      expect(core.setOutput).not.toHaveBeenCalledWith('join-command', expect.anything());
+      expect(core.info.mock.calls.map(c => String(c[0])).filter(l => l.includes('available as output'))).toEqual(['SSH command available as output: ssh user@session123.upterm.dev']);
+      expect(summaryCalls()).toEqual([
+        ['addHeading', 'Upterm SSH Connection'],
+        ['addCodeBlock', 'ssh user@session123.upterm.dev', 'bash'],
+        ['addRaw', '\n\nConnect with: <code>ssh user@session123.upterm.dev</code>']
+      ]);
+    });
+
     it('accepts a launch that answers reconnecting with an ssh command and no tunnel fields, and publishes the command', async () => {
       // upterm's printStarted reports the record's status as the daemon last
       // published it: a tunnel lost just before readiness leaves "reconnecting"
@@ -1225,13 +1283,14 @@ describe('upterm GitHub integration', () => {
       Object.defineProperty(process, 'platform', {value: 'linux'});
       mockedExecShellCommand.mockImplementation(async (cmd: string) => {
         if (cmd.includes('upterm version')) return 'Upterm version 0.32.0\n';
-        if (cmd.includes('upterm host')) return JSON.stringify({name: 'gha-x', status: 'disconnected', sshCommand: 'ssh x@y'});
-        if (cmd.includes('session info')) return JSON.stringify({name: 'gha-x', status: 'disconnected', sshCommand: 'ssh x@y'});
+        if (cmd.includes('upterm host')) return JSON.stringify({name: 'gha-x', status: 'disconnected', sshCommand: 'ssh x@y', joinCommand: 'upterm join ssh://x@y'});
+        if (cmd.includes('session info')) return JSON.stringify({name: 'gha-x', status: 'disconnected', sshCommand: 'ssh x@y', joinCommand: 'upterm join ssh://x@y'});
         return '';
       });
       await run();
       expect(core.setFailed).toHaveBeenCalled();
       expect(core.setOutput).not.toHaveBeenCalledWith('ssh-command', expect.anything());
+      expect(core.setOutput).not.toHaveBeenCalledWith('join-command', expect.anything());
     });
   });
 
@@ -1663,6 +1722,14 @@ describe('upterm GitHub integration', () => {
         expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
         // One countdown poll, then the first ending answer and six more.
         expect(sessionInfoCalls()).toBe(8);
+      });
+
+      it("shows upterm join above the ssh line on each wait line, as upterm's own view does", async () => {
+        baselineShell(counting({joinCommand: JOIN_COMMAND}), counting({joinCommand: JOIN_COMMAND}), endedByTimeout);
+
+        const lines = await runCapturingProgress();
+
+        expect(lines).toEqual([`Waiting for client to connect (at most 42 more second(s))\nJoin: ${JOIN_COMMAND}\nSSH: ssh user@session123.upterm.dev`]);
       });
 
       it('never stops the session itself, however long past the deadline; upterm ends it', async () => {

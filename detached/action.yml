@@ -23,7 +23,7 @@ inputs:
     required: true
     default: "ssh://uptermd.upterm.dev:22"
   known-hosts:
-    description: "known_hosts entry for the upterm server, pinning its host key. Required when upterm-server is not the default. The default server's key is bundled with the action. A relay that presents a host certificate needs an '@cert-authority <host> <type> <key>' line."
+    description: "known_hosts entry for the upterm server, pinning its host key. Required when upterm-server is not the default. The default server's key is bundled with the action. A relay that presents a host certificate is verified by an '@cert-authority <host> <type> <key>' line; from upterm v0.38.0, a plain line holding the relay's own key also works."
     required: false
     default: ""
   wait-timeout-minutes:
@@ -40,3 +40,5 @@ inputs:
 outputs:
   ssh-command:
     description: "The SSH command to connect to the upterm session (e.g., 'ssh session:token@uptermd.upterm.dev')"
+  join-command:
+    description: "The upterm join command to connect to the upterm session (e.g., 'upterm join ssh://session:token@uptermd.upterm.dev'). Empty with upterm before v0.38.0, or a ws/wss server behind a path"

@@ -203,8 +203,8 @@ On Windows these are exported in MSYS-form (`/c/...`), never `C:/...`. Not becau
    - Run `upterm host --detach ...` (see [Command Execution Flow](#command-execution-flow)); it returns only once the session is up, with its JSON session info on stdout - no separate readiness polling
 
 2. **SSH Command Output** (`outputSshCommand()`)
-   - Sets the `ssh-command` output and logs the SSH command
-   - Writes to the job summary - best effort: if the write fails (e.g. `GITHUB_STEP_SUMMARY` is unset), the error is logged at debug level and the action carries on
+   - Sets the `ssh-command` output and logs the SSH command; when upterm reports a join command (`joinCommand`, v0.38.0+), sets the `join-command` output and logs it first, as upterm's own view does
+   - Writes to the job summary, the join command above the SSH command when there is one - best effort: if the write fails (e.g. `GITHUB_STEP_SUMMARY` is unset), the error is logged at debug level and the action carries on
 
 3. **Monitoring** (`waitForSession()`)
    - Polls session status every 5 seconds

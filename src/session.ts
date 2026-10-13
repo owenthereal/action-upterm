@@ -29,6 +29,8 @@ export interface SessionInfo {
   logPath?: string;
   pid?: number;
   sshCommand?: string;
+  /** `upterm join` for guests who have upterm, published beside sshCommand; absent before v0.38.0, and for a relay URL with a path (v0.38.0+). */
+  joinCommand?: string;
   clientCount?: number;
   guestCount?: number;
   connectedClients?: string[];
@@ -128,6 +130,16 @@ export function tunnelDownLine(session: SessionInfo): string | null {
  */
 export function outcomePending(session: SessionInfo): boolean {
   return session.status === 'ending' && (!session.reason || session.reason === 'unknown');
+}
+
+/**
+ * How to connect, as the wait loop and detached mode's notice print it: Join
+ * first, as upterm's own view does, then the ssh line for guests without
+ * upterm. The ssh line alone when upterm offers no join command.
+ */
+export function connectLines(session: SessionInfo): string {
+  const ssh = `SSH: ${session.sshCommand}`;
+  return session.joinCommand ? `Join: ${session.joinCommand}\n${ssh}` : ssh;
 }
 
 /**

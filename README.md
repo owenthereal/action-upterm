@@ -87,7 +87,7 @@ jobs:
 
 The action always verifies the upterm server's host key before connecting — it never falls back to trusting whatever answers. For the default server (`ssh://uptermd.upterm.dev:22`), the key ships with the action, so no configuration is needed. For any other `upterm-server`, the `known-hosts` input is **required**; the action fails fast at startup without it.
 
-Provide the server's `known_hosts` line(s) as the `known-hosts` input. A relay that presents an SSH host certificate (as uptermd does) needs an `@cert-authority <host> <type> <key>` line rather than a plain `ssh-keyscan` key line — the key is the certificate's signing authority, not the certificate itself.
+Provide the server's `known_hosts` line(s) as the `known-hosts` input. A relay that presents an SSH host certificate (as uptermd does) is verified by an `@cert-authority <host> <type> <key>` line, whose key is the certificate's signing authority, not the certificate itself. From upterm v0.38.0, a plain key line holding the relay's own key verifies it too, as OpenSSH does: uptermd signs its certificate with its own key, so the line `ssh-keyscan` records for it works, once you have checked its fingerprint. upterm 0.37.0 and earlier, which `upterm-version` can pin, accept a certificate only through an `@cert-authority` line.
 
 A bare host pattern (`@cert-authority host ...`) matches port 22 only; any other port needs the bracketed form, `@cert-authority [host]:port ...` — `wss://` is `:443`, `ws://` is `:80`. A server reachable over more than one protocol needs one line per port, which is why the bundled default ships two: one for `ssh://uptermd.upterm.dev:22`, one for `[uptermd.upterm.dev]:443`.
 

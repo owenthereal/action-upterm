@@ -2,11 +2,13 @@
  * The public upterm relay's certificate authority, copied verbatim from
  * upterm's etc/known_hosts/uptermd.upterm.dev.
  *
- * uptermd presents an SSH *host certificate*, which x/crypto's knownhosts only
- * authorizes from an @cert-authority line — an `ssh-keyscan` plain key line
- * never matches it. Both entries are needed because a known_hosts pattern
- * matches the port exactly: a bare host is port 22, and wss:// is keyed as
- * [host]:443.
+ * uptermd presents an SSH *host certificate*, signed with its own key.
+ * x/crypto's knownhosts only authorizes one from an @cert-authority line, and
+ * upterm 0.37.0 and earlier accept it no other way: an `ssh-keyscan` plain key
+ * line never matches it there. upterm v0.38.0 also checks the certificate's own
+ * key against plain lines, as OpenSSH does. Both entries are needed because a
+ * known_hosts pattern matches the port exactly: a bare host is port 22, and
+ * wss:// is keyed as [host]:443.
  *
  * Rotating the relay key means updating this constant and cutting a release;
  * pinned runners cannot pick it up any other way.
