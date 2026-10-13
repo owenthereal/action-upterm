@@ -12,6 +12,7 @@ import {
   isNoSuchSession,
   isTerminal,
   isUptermVersionSupported,
+  outcomePending,
   parseUptermVersion,
   parseSessionInfo,
   SessionInfo,
@@ -29,6 +30,9 @@ const SESSION_STATUS_POLL_INTERVAL = 5000;
 // Consecutive failed lookups between warnings, ~1 minute at the 5s poll
 // interval. The first failure always warns.
 const UNKNOWN_POLL_WARN_INTERVAL = 12;
+// Further polls for upterm's final write once it says ending without a reason,
+// ~30s at the 5s poll interval; then the wait reports what it has.
+const ENDING_OUTCOME_POLLS = 6;
 const SUPPORTED_UPTERM_ARCHITECTURES = ['amd64', 'arm64'] as const;
 
 // Continue file paths - users can touch either location to exit the session
@@ -942,6 +946,7 @@ async function waitForSession(message: string, atLaunch: ContinueFilesSnapshot):
   let joined = false;
   let staleReported = false;
   let lastOutage: string | null = null;
+  let endingPolls = 0;
 
   /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
   while (true) {
@@ -962,6 +967,14 @@ async function waitForSession(message: string, atLaunch: ContinueFilesSnapshot):
     }
     if (poll.kind === 'session') {
       if (isTerminal(poll.session.status)) {
+        // upterm v0.38.0+ says ending as teardown begins and records why only
+        // in its final write: reported now, a join timeout would read as a quit.
+        if (outcomePending(poll.session) && endingPolls < ENDING_OUTCOME_POLLS) {
+          endingPolls++;
+          core.info(`Session ${poll.session.name} (${statusLabel(poll.session)})`);
+          await sleep(SESSION_STATUS_POLL_INTERVAL);
+          continue;
+        }
         logSessionEnded(poll.session);
         return 'ended';
       }

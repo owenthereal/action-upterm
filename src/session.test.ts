@@ -1,4 +1,4 @@
-import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion, waitStatusLine, statusLabel, tunnelDownLine} from './session';
+import {getSession, isTerminal, parseSessionInfo, generateSessionName, parseUptermVersion, isUptermVersionSupported, hasGuestJoined, formatVersion, waitStatusLine, statusLabel, tunnelDownLine, outcomePending} from './session';
 import {execShellCommand, ShellCommandError} from './helpers';
 
 jest.mock('./helpers', () => ({
@@ -149,6 +149,23 @@ describe('tunnelDownLine', () => {
     // An ended session keeps the last outage it was in; the tunnel is not being redialled.
     expect(tunnelDownLine(info({status: 'ended', tunnelReason: 'network', tunnelError: 'EOF'}))).toBeNull();
     expect(tunnelDownLine(info({status: 'ready'}))).toBeNull();
+  });
+});
+
+describe('outcomePending', () => {
+  const info = (fields: Record<string, unknown>) => parseSessionInfo(JSON.stringify({name: 'gha-1', ...fields}));
+
+  it('is true for an ending session whose reason upterm has not recorded yet: v0.38.0+ says ending as teardown begins', () => {
+    expect(outcomePending(info({status: 'ending', reason: 'unknown'}))).toBe(true);
+    expect(outcomePending(info({status: 'ending'}))).toBe(true);
+  });
+
+  it('is false once the reason is recorded, and for any other status', () => {
+    expect(outcomePending(info({status: 'ending', reason: 'join_timeout'}))).toBe(false);
+    // An ended session's record is final: "unknown" there is a crash, not a write still to come.
+    expect(outcomePending(info({status: 'ended', reason: 'unknown'}))).toBe(false);
+    expect(outcomePending(info({status: 'disconnected', reason: 'unknown'}))).toBe(false);
+    expect(outcomePending(info({status: 'ready', reason: 'unknown'}))).toBe(false);
   });
 });
 

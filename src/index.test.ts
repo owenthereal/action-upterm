@@ -659,9 +659,10 @@ describe('upterm GitHub integration', () => {
       // `ending` is the brief transitional state while the host still holds the
       // name. The sequence continues to `ended` so that, were `ending` not
       // terminal, the loop would still stop - and the lookup count shows which
-      // response actually ended it.
+      // response actually ended it. It carries its reason: an `ending` without
+      // one is upterm's early write, which the wait gives time to be replaced.
       fsWithoutExitFiles();
-      baselineShell(readySession(), JSON.stringify({name: 'gha-3f9a1c05', status: 'ending', sessionId: 's1'}), endedResponse);
+      baselineShell(readySession(), JSON.stringify({name: 'gha-3f9a1c05', status: 'ending', sessionId: 's1', reason: 'exited', exitCode: 0}), endedResponse);
 
       await run();
 
@@ -1629,6 +1630,41 @@ describe('upterm GitHub integration', () => {
     });
 
     describe('the wait', () => {
+      // upterm v0.38.0+ says ending as soon as teardown begins, and records why
+      // only in its final write: what e2e saw at the deadline.
+      const endingUnrecorded = JSON.stringify({name: 'gha-3f9a1c05', status: 'ending', reason: 'unknown', joinTimeout: '1m', joinDeadline: IN_42S, joinStateSource: 'record'});
+
+      it("waits for upterm's final write when it says ending before recording why, and reports the join timeout", async () => {
+        baselineShell(counting(), counting(), endingUnrecorded, endingUnrecorded, endedByTimeout);
+
+        const lines = await runCapturingProgress();
+
+        expect(core.warning).toHaveBeenCalledWith('Timed out waiting for client to connect (join timeout 1m)');
+        expect(core.info).not.toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+        expect(core.info).toHaveBeenCalledWith('Session gha-3f9a1c05 (ending)');
+        // An ending session is waiting for nobody: no countdown or connect lines for it.
+        expect(lines).toEqual([`Waiting for client to connect (at most 42 more second(s))\nSSH: ssh user@session123.upterm.dev`]);
+      });
+
+      it('reports as soon as an ending answer carries its reason, without waiting for ended', async () => {
+        baselineShell(counting(), counting(), endingUnrecorded, JSON.stringify({name: 'gha-3f9a1c05', status: 'ending', reason: 'exited', exitCode: 3}), endedResponse);
+
+        await run();
+
+        expect(core.info).toHaveBeenCalledWith('Exit code: 3');
+        expect(sessionInfoCalls()).toBe(3);
+      });
+
+      it('gives a session stuck ending six more polls, then reports what it has', async () => {
+        baselineShell(counting(), counting(), endingUnrecorded);
+
+        await run();
+
+        expect(core.info).toHaveBeenCalledWith("Exiting debugging session: 'upterm' quit");
+        // One countdown poll, then the first ending answer and six more.
+        expect(sessionInfoCalls()).toBe(8);
+      });
+
       it('never stops the session itself, however long past the deadline; upterm ends it', async () => {
         when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('1');
         let polls = 0;

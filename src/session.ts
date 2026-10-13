@@ -120,6 +120,17 @@ export function tunnelDownLine(session: SessionInfo): string | null {
 }
 
 /**
+ * Whether upterm has yet to record why an ending session ended. From v0.38.0
+ * (upterm #633) the record says ending as soon as teardown begins, and the
+ * reason, exit code and signal arrive only with the final write, once the
+ * tunnel has closed. An ended session's record is final: "unknown" there
+ * means a crash, not a write still to come.
+ */
+export function outcomePending(session: SessionInfo): boolean {
+  return session.status === 'ending' && (!session.reason || session.reason === 'unknown');
+}
+
+/**
  * Parse `upterm session info -o json` output.
  *
  * execShellCommand resolves with EVERYTHING written to stdout, so the JSON can
