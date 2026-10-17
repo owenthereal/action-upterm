@@ -2,6 +2,9 @@
 
 This GitHub Action enables direct interaction with the host system running your GitHub Actions via SSH, utilizing [upterm](https://upterm.dev/). This setup facilitates real-time GitHub Actions debugging and allows seamless workflow continuation.
 
+Thanks to the provided [typings](action-types.yml), it is possible to use this action in a type-safe way using
+https://github.com/typesafegithub/github-workflows-kt which allows writing workflow files using a type-safe Kotlin DSL.
+
 ## Features
 
 - **Interactive Debugging**: Gain SSH access to the GitHub Actions runner to diagnose and resolve real-time issues.
