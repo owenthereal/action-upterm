@@ -323,7 +323,39 @@ export function getUptermDownloadUrl(platform: 'linux' | 'darwin' | 'win32', nod
   return url;
 }
 
+/** Only fixed CLI flags can be enabled by these boolean inputs. */
+function guestCapabilityFlags(): string[] {
+  return ['accept-exec', 'allow-loopback-tcp-forwarding'].flatMap(input => {
+    const value = core.getInput(input);
+    if (value && value !== 'true' && value !== 'false') {
+      throw new Error(`${input} must be a boolean (true or false)`);
+    }
+    return value === 'true' ? [`--${input}`] : [];
+  });
+}
+
+/** Opt-ins require explicit support from the installed binary, not a guessed release floor. */
+async function assertGuestCapabilitiesSupported(flags: string[]): Promise<void> {
+  if (flags.length === 0) return;
+
+  let help: string;
+  try {
+    help = await execShellCommand('upterm host --help', {quiet: true});
+  } catch (error) {
+    throw new Error(`Failed to check installed upterm guest capabilities with upterm host --help: ${error}`);
+  }
+
+  for (const flag of flags) {
+    // Match a long-option definition at the start of a help line. Prose,
+    // longer names and assignments do not establish support for this flag.
+    if (!new RegExp(`^[\\t ]*${flag}(?=[\\t ]|$)`, 'm').test(help)) {
+      throw new Error(`The installed upterm does not support ${flag}. Install a release that lists ${flag} in upterm host --help, or disable the ${flag.slice(2)} input.`);
+    }
+  }
+}
+
 function validateInputs(): void {
+  guestCapabilityFlags();
   const waitTimeout = core.getInput('wait-timeout-minutes');
   if (waitTimeout) {
     const parsedTimeout = parseInt(waitTimeout, 10);
@@ -370,6 +402,7 @@ export async function run() {
 
     await installDependencies();
     await assertSupportedUptermVersion();
+    await assertGuestCapabilitiesSupported(guestCapabilityFlags());
     const continueFilesAtLaunch = snapshotContinueFiles();
     const session = await startUptermSession(allowedUsers);
 
@@ -589,8 +622,11 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   const knownHostsArg = `${xdg.config}/known_hosts`;
 
   const auth = allowedUsers.map(user => ` --authorized-user ${shellEscape(`github:${user}`)}`).join('');
+  const guestFlags = guestCapabilityFlags()
+    .map(flag => ` ${flag}`)
+    .join('');
   // getSessionName() is gha- + 8 hex characters: shell-safe by construction.
-  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${launchJoinTimeoutFlag()}${hostedCommand()}`;
+  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${launchJoinTimeoutFlag()}${guestFlags}${hostedCommand()}`;
 
   core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
   // Evidence for the post step that there may be a session to stop. Saved

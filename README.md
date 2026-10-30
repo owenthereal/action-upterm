@@ -58,6 +58,46 @@ On a re-run, `limit-access-to-actor` also authorizes whoever re-ran the job. Bot
 
 If your registered public SSH key differs from your default private SSH key, specify the path manually: `ssh -i <path-to-private-key> <upterm-connection-string>`.
 
+## Debug a Failing Job with VS Code
+
+VS Code Remote-SSH needs guest command execution and loopback TCP forwarding. Enable both grants explicitly and restrict access to your GitHub identity:
+
+```yaml
+name: CI
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - run: npm test
+    - name: Debug failure with VS Code
+      if: ${{ failure() }}
+      uses: owenthereal/action-upterm@v2
+      with:
+        limit-access-to-actor: true
+        accept-exec: true
+        allow-loopback-tcp-forwarding: true
+        wait-timeout-minutes: 5
+```
+
+Copy the host and user from the step's printed SSH command into a local `~/.ssh/config` entry:
+
+```sshconfig
+Host gha-debug
+  HostName RELAY_HOST_FROM_SSH_COMMAND
+  User SESSION_USER_FROM_SSH_COMMAND
+  IdentityFile ~/.ssh/YOUR_GITHUB_KEY
+  IdentitiesOnly yes
+  StrictHostKeyChecking yes
+```
+
+Use the port from the SSH command if it differs from 22. Verify and pin the relay's host key in your local `~/.ssh/known_hosts` before connecting; the action also verifies the relay on the runner as described [below](#pin-the-upterm-servers-host-key). In VS Code, choose **Remote-SSH: Connect to Host…** and select `gha-debug`. Update the entry when a new job creates a new session.
+
+Both inputs default to `false`, including with `owenthereal/action-upterm/detached`. `accept-exec` preapproves guest-selected commands, including code sent over stdin, with the runner account's permissions. `allow-loopback-tcp-forwarding` preapproves forwarding to literal `127.0.0.0/8` or `::1` addresses, excluding `localhost`, other hostnames, mapped IPv6 and zoned addresses. An exec-authorized guest can also open sockets as the runner account. The existing `--accept` grant remains SFTP-only; it grants neither of these capabilities.
+
+An enabled input requires a successful `upterm host --help` listing its exact flag. The action fails before session creation if the installed binary lacks support or the help check fails; choose a supporting release with `upterm-version`, or leave the input disabled. Workflows with both inputs disabled retain the existing v0.32.0 minimum and perform no capability help check.
+
 ## Use Custom Upterm Server
 
 To host your own Upterm server, follow the instructions for [deployment across various cloud providers](https://github.com/owenthereal/upterm?tab=readme-ov-file#hammer_and_wrench-deployment).

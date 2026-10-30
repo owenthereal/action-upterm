@@ -18,6 +18,14 @@ inputs:
     description: "If only the public SSH keys of the listed GitHub users should be authorized"
     required: false
     default: ""
+  accept-exec:
+    description: "Preapprove guest-selected command execution. Requires an upterm binary with --accept-exec support."
+    required: false
+    default: "false"
+  allow-loopback-tcp-forwarding:
+    description: "Preapprove guest TCP forwarding to literal loopback addresses. Requires an upterm binary with --allow-loopback-tcp-forwarding support."
+    required: false
+    default: "false"
   upterm-server:
     description: "upterm server address (required), supported protocols are ssh, ws, or wss."
     required: true
