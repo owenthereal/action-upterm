@@ -272,6 +272,145 @@ describe('upterm GitHub integration', () => {
     });
   });
 
+  describe('explicit guest capability grants', () => {
+    let shell: typeof import('./helpers').execShellCommand;
+    const help = 'Flags:\n      --accept-exec                      Allow guest execution\n      --allow-loopback-tcp-forwarding     Allow loopback forwarding\n';
+    const launches = () => mockedExecShellCommand.mock.calls.map(c => c[0]).filter(cmd => cmd.startsWith('upterm host --detach '));
+    const helpCalls = () => mockedExecShellCommand.mock.calls.filter(c => c[0] === 'upterm host --help');
+
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      shell = async (cmd: string) => {
+        if (cmd === 'upterm version') return 'Upterm version 0.32.0\n';
+        if (cmd === 'upterm host --help') return help;
+        if (cmd.startsWith('upterm host --detach ')) return readySession();
+        if (cmd.includes('session info')) return endedResponse;
+        return '';
+      };
+      mockedExecShellCommand.mockImplementation(shell);
+    });
+
+    it.each(['', 'false'])('keeps defaults unchanged for absent/false inputs (%s), even on v0.32.0', async value => {
+      when(core.getInput).calledWith('accept-exec').mockReturnValue(value);
+      when(core.getInput).calledWith('allow-loopback-tcp-forwarding').mockReturnValue(value);
+      await run();
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(helpCalls()).toHaveLength(0);
+      expect(launches()).toHaveLength(1);
+      expect(launches()[0]).toContain('--accept --output json');
+      expect(launches()[0]).not.toContain('--accept-exec');
+      expect(launches()[0]).not.toContain('--allow-loopback-tcp-forwarding');
+    });
+
+    describe.each(['false', 'true'])('detached=%s', detached => {
+      it.each([
+        ['true', 'false', '--accept-exec'],
+        ['false', 'true', '--allow-loopback-tcp-forwarding'],
+        ['true', 'true', '--accept-exec --allow-loopback-tcp-forwarding']
+      ])('passes only enabled fixed flags (exec=%s, loopback=%s)', async (exec, loopback, flags) => {
+        when(core.getInput).calledWith('detached').mockReturnValue(detached);
+        when(core.getInput).calledWith('accept-exec').mockReturnValue(exec);
+        when(core.getInput).calledWith('allow-loopback-tcp-forwarding').mockReturnValue(loopback);
+        when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('alice');
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(helpCalls()).toHaveLength(1);
+        expect(launches()).toHaveLength(1);
+        expect(launches()[0]).toContain(flags);
+        expect(launches()[0]).toContain("--authorized-user 'github:alice'");
+        expect(launches()[0]).toContain('--known-hosts ');
+        expect(launches()[0].includes('--accept-exec')).toBe(exec === 'true');
+        expect(launches()[0].includes('--allow-loopback-tcp-forwarding')).toBe(loopback === 'true');
+        const commands = mockedExecShellCommand.mock.calls.map(c => c[0]);
+        expect(commands.indexOf('upterm host --help')).toBeLessThan(commands.indexOf(launches()[0]));
+        expect(core.setOutput).toHaveBeenCalledWith('ssh-command', READY_SESSION.sshCommand);
+        expect(core.saveState.mock.calls.filter(([key]) => key === 'message')).toHaveLength(Number(detached === 'true'));
+      });
+
+      it('places both grants before the Windows hosted-command separator', async () => {
+        Object.defineProperty(process, 'platform', {value: 'win32'});
+        Object.defineProperty(process, 'arch', {value: 'x64'});
+        when(core.getInput).calledWith('detached').mockReturnValue(detached);
+        when(core.getInput).calledWith('accept-exec').mockReturnValue('true');
+        when(core.getInput).calledWith('allow-loopback-tcp-forwarding').mockReturnValue('true');
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        const launch = launches()[0];
+        expect(launch).toContain('--accept-exec --allow-loopback-tcp-forwarding');
+        expect(launch).toMatch(/ -- bash -l$/);
+        expect(launch.indexOf('--allow-loopback-tcp-forwarding')).toBeLessThan(launch.indexOf(' -- '));
+      });
+    });
+
+    describe.each(['accept-exec', 'allow-loopback-tcp-forwarding'])('%s validation and support', input => {
+      it.each(['yes', '1', 'false; echo unsafe', '--accept-exec'])('rejects invalid boolean %s before downloading', async value => {
+        when(core.getInput).calledWith(input).mockReturnValue(value);
+        await run();
+        expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining(`${input} must be a boolean`));
+        expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+        expect(launches()).toHaveLength(0);
+      });
+
+      it.each([
+        'Flags:\n      --accept    Accept SFTP operations\n',
+        `Use --${input} for this feature.\n`,
+        `      --${input}-extra    Another option\n`,
+        `      --other    Mention --${input} in prose\n`,
+        `      --${input}=false    Not a flag definition\n`
+      ])('rejects missing or misleading flag definitions before session creation (%s)', async output => {
+        when(core.getInput).calledWith(input).mockReturnValue('true');
+        mockedExecShellCommand.mockImplementation(async (cmd, options) => (cmd === 'upterm host --help' ? output : shell(cmd, options)));
+        await run();
+        expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining(`does not support --${input}`));
+        expect(launches()).toHaveLength(0);
+        expect(core.saveState).not.toHaveBeenCalledWith('sessionStarted', 'true');
+      });
+
+      it('fails clearly when host help fails, even if stderr lists the option', async () => {
+        when(core.getInput).calledWith(input).mockReturnValue('true');
+        mockedExecShellCommand.mockImplementation(async (cmd, options) => {
+          if (cmd === 'upterm host --help') throw new Error(`exit 1\n      --${input}    Unusable help`);
+          return shell(cmd, options);
+        });
+        await run();
+        expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Failed to check installed upterm guest capabilities'));
+        expect(launches()).toHaveLength(0);
+        expect(core.saveState).not.toHaveBeenCalledWith('sessionStarted', 'true');
+      });
+    });
+
+    it.each(['accept-exec', 'allow-loopback-tcp-forwarding'])('does not require support for an unrequested grant (%s only)', async input => {
+      when(core.getInput).calledWith(input).mockReturnValue('true');
+      mockedExecShellCommand.mockImplementation(async (cmd, options) => (cmd === 'upterm host --help' ? `Flags:\n      --${input}    Supported option\n` : shell(cmd, options)));
+      await run();
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(launches()).toHaveLength(1);
+      expect(launches()[0]).toContain(`--${input}`);
+    });
+
+    it('requires every requested flag, not just the first one', async () => {
+      when(core.getInput).calledWith('accept-exec').mockReturnValue('true');
+      when(core.getInput).calledWith('allow-loopback-tcp-forwarding').mockReturnValue('true');
+      mockedExecShellCommand.mockImplementation(async (cmd, options) => (cmd === 'upterm host --help' ? 'Flags:\n      --accept-exec    Allow exec\n' : shell(cmd, options)));
+      await run();
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('does not support --allow-loopback-tcp-forwarding'));
+      expect(launches()).toHaveLength(0);
+    });
+
+    it('accepts additive capability JSON without inferring grants or checking help', async () => {
+      mockedExecShellCommand.mockImplementation(async (cmd, options) => {
+        if (cmd.startsWith('upterm host --detach ')) return readySession({loginCommand: 'herdr', guestShell: 'login', execution: 'approval', tcpForwarding: 'loopback-approval', approvalMethod: 'terminal'});
+        return shell(cmd, options);
+      });
+      await run();
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(helpCalls()).toHaveLength(0);
+      expect(launches()[0]).not.toContain('--accept-exec');
+      expect(launches()[0]).not.toContain('--allow-loopback-tcp-forwarding');
+      expect(core.setOutput).toHaveBeenCalledWith('ssh-command', READY_SESSION.sshCommand);
+    });
+  });
+
   describe('upterm version gate', () => {
     it('fails with an actionable message when the pinned upterm is too old', async () => {
       when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.31.0');
