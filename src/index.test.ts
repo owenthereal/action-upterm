@@ -279,15 +279,18 @@ describe('upterm GitHub integration', () => {
       'What guests can do:',
       '      --allow-exec                      Let guests run commands (ssh SESSION CMD, VS Code, herdr --remote) without approval. Each runs as you, and its stdin can carry further code.',
       "      --allow-forwarding loopback|any   Let guests forward ports (ssh -L) without approval: loopback, to this machine's literal 127.0.0.0/8 and ::1 addresses; any, to anything this machine can reach.",
+      "      --full-access                     Let authorized guests do what an SSH login to your account can, without asking: run commands (ssh SESSION CMD, VS Code, herdr --remote), transfer files (scp, sftp), and forward ports to this machine's loopback addresses (ssh -L 8080:127.0.0.1:8080). Requires --authorized-user or --authorized-keys.",
       ''
     ].join('\n');
     // Each input, the value that turns it on, the flag `upterm host --help`
     // must list for it, the argument the launch passes, and the flag's
-    // earlier, unreleased name.
+    // earlier, unreleased name, if it had one.
     const grants = [
       {input: 'allow-exec', on: 'true', flag: '--allow-exec', arg: '--allow-exec', earlier: '--accept-exec'},
-      {input: 'allow-forwarding', on: 'loopback', flag: '--allow-forwarding', arg: '--allow-forwarding=loopback', earlier: '--allow-loopback-tcp-forwarding'}
+      {input: 'allow-forwarding', on: 'loopback', flag: '--allow-forwarding', arg: '--allow-forwarding=loopback', earlier: '--allow-loopback-tcp-forwarding'},
+      {input: 'full-access', on: 'true', flag: '--full-access', arg: '--full-access', earlier: ''}
     ];
+    const refusedWithoutAllowlist = 'full-access needs limit-access-to-actor or limit-access-to-users: without an allowlist, anyone with the session ID would get a shell on the runner';
     const launches = () => mockedExecShellCommand.mock.calls.map(c => c[0]).filter(cmd => cmd.startsWith('upterm host --detach '));
     const helpCalls = () => mockedExecShellCommand.mock.calls.filter(c => c[0] === 'upterm host --help');
 
@@ -310,7 +313,7 @@ describe('upterm GitHub integration', () => {
       expect(helpCalls()).toHaveLength(0);
       expect(launches()).toHaveLength(1);
       expect(launches()[0]).toContain('--accept --output json');
-      expect(launches()[0]).not.toContain('--allow-');
+      expect(launches()[0]).not.toMatch(/--allow-|--full-access/);
     });
 
     it('turns nothing on for the earlier names, accept-exec and allow-loopback-tcp-forwarding', async () => {
@@ -326,13 +329,16 @@ describe('upterm GitHub integration', () => {
 
     describe.each(['false', 'true'])('detached=%s', detached => {
       it.each([
-        ['true', '', '--allow-exec'],
-        ['false', 'loopback', '--allow-forwarding=loopback'],
-        ['true', 'loopback', '--allow-exec --allow-forwarding=loopback']
-      ])('passes each enabled grant as its fixed argument (allow-exec=%s, allow-forwarding=%s)', async (exec, forwarding, args) => {
+        ['true', '', 'false', '--allow-exec'],
+        ['false', 'loopback', 'false', '--allow-forwarding=loopback'],
+        ['true', 'loopback', 'false', '--allow-exec --allow-forwarding=loopback'],
+        ['false', '', 'true', '--full-access'],
+        ['true', 'loopback', 'true', '--allow-exec --allow-forwarding=loopback --full-access']
+      ])('passes each enabled grant as its fixed argument (allow-exec=%s, allow-forwarding=%s, full-access=%s)', async (exec, forwarding, fullAccess, args) => {
         when(core.getInput).calledWith('detached').mockReturnValue(detached);
         when(core.getInput).calledWith('allow-exec').mockReturnValue(exec);
         when(core.getInput).calledWith('allow-forwarding').mockReturnValue(forwarding);
+        when(core.getInput).calledWith('full-access').mockReturnValue(fullAccess);
         when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('alice');
         await run();
         expect(core.setFailed).not.toHaveBeenCalled();
@@ -351,18 +357,82 @@ describe('upterm GitHub integration', () => {
         when(core.getInput).calledWith('detached').mockReturnValue(detached);
         when(core.getInput).calledWith('allow-exec').mockReturnValue('true');
         when(core.getInput).calledWith('allow-forwarding').mockReturnValue('loopback');
+        when(core.getInput).calledWith('full-access').mockReturnValue('true');
+        when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('alice');
         await run();
         expect(core.setFailed).not.toHaveBeenCalled();
-        expect(launches()[0]).toMatch(/ --allow-exec --allow-forwarding=loopback -- bash -l$/);
+        expect(launches()[0]).toMatch(/ --allow-exec --allow-forwarding=loopback --full-access -- bash -l$/);
       });
     });
 
-    it.each(['yes', '1', 'loopback', 'false; echo unsafe', '--allow-exec'])('rejects allow-exec %s before downloading', async value => {
-      when(core.getInput).calledWith('allow-exec').mockReturnValue(value);
-      await run();
-      expect(core.setFailed).toHaveBeenCalledWith('allow-exec must be a boolean (true or false)');
-      expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
-      expect(launches()).toHaveLength(0);
+    describe.each(['allow-exec', 'full-access'])('%s', input => {
+      it.each(['yes', '1', 'loopback', 'false; echo unsafe', `--${input}`])('rejects %s before downloading', async value => {
+        when(core.getInput).calledWith(input).mockReturnValue(value);
+        when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('alice');
+        await run();
+        expect(core.setFailed).toHaveBeenCalledWith(`${input} must be a boolean (true or false)`);
+        expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+        expect(launches()).toHaveLength(0);
+      });
+    });
+
+    describe('full-access and the allowlist', () => {
+      const originalTriggeringActor = process.env.GITHUB_TRIGGERING_ACTOR;
+
+      // A runner sets GITHUB_TRIGGERING_ACTOR, which limit-access-to-actor
+      // also authorizes.
+      beforeEach(() => {
+        delete process.env.GITHUB_TRIGGERING_ACTOR;
+      });
+
+      afterEach(() => {
+        if (originalTriggeringActor === undefined) delete process.env.GITHUB_TRIGGERING_ACTOR;
+        else process.env.GITHUB_TRIGGERING_ACTOR = originalTriggeringActor;
+      });
+
+      it.each(['', ' , '])('refuses full-access with no allowlist (limit-access-to-users %j), before downloading', async users => {
+        when(core.getInput).calledWith('full-access').mockReturnValue('true');
+        when(core.getInput).calledWith('limit-access-to-users').mockReturnValue(users);
+        await run();
+        expect(core.setFailed).toHaveBeenCalledWith(refusedWithoutAllowlist);
+        expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+        expect(helpCalls()).toHaveLength(0);
+        expect(launches()).toHaveLength(0);
+      });
+
+      it.each([
+        ['limit-access-to-actor', 'true', "--authorized-user 'github:test-actor'"],
+        ['limit-access-to-users', 'alice', "--authorized-user 'github:alice'"]
+      ])('starts full-access with %s', async (input, value, auth) => {
+        when(core.getInput).calledWith('full-access').mockReturnValue('true');
+        when(core.getInput).calledWith(input).mockReturnValue(value);
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(launches()).toHaveLength(1);
+        expect(launches()[0]).toMatch(new RegExp(` ${auth} --full-access$`));
+      });
+
+      it('needs no allowlist for full-access off, whatever else is on', async () => {
+        when(core.getInput).calledWith('full-access').mockReturnValue('false');
+        when(core.getInput).calledWith('allow-exec').mockReturnValue('true');
+        when(core.getInput).calledWith('allow-forwarding').mockReturnValue('loopback');
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(launches()).toHaveLength(1);
+        expect(launches()[0]).not.toContain('--authorized-user');
+        expect(launches()[0]).toMatch(/ --allow-exec --allow-forwarding=loopback$/);
+      });
+
+      it('starts nothing when limit-access-to-actor leaves only bots, rather than full access for anyone', async () => {
+        require('@actions/github').context.actor = 'dependabot[bot]';
+        when(core.getInput).calledWith('full-access').mockReturnValue('true');
+        when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('true');
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('No upterm session started'));
+        expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+        expect(launches()).toHaveLength(0);
+      });
     });
 
     it.each(['true', 'any', 'Loopback', 'yes', 'loopback; echo unsafe', '--allow-forwarding=loopback', '127.0.0.1'])('rejects allow-forwarding %s before downloading', async value => {
@@ -376,9 +446,14 @@ describe('upterm GitHub integration', () => {
     describe.each(grants)('$input support', ({input, on, flag, arg, earlier}) => {
       const unsupported = `The installed upterm does not support ${flag}. Install a release that lists ${flag} in upterm host --help, or disable the ${input} input.`;
 
+      // An allowlist, which full-access needs.
+      beforeEach(() => {
+        when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('alice');
+      });
+
       it.each([
         'Flags:\n      --accept    Start the session without asking, plus --allow-sftp.\n',
-        `      ${earlier}    The flag's earlier name\n`,
+        ...(earlier ? [`      ${earlier}    The flag's earlier name\n`] : []),
         `Use ${flag} for this feature.\n`,
         `      ${flag}-extra    Another option\n`,
         `      --other    Mention ${flag} in prose\n`,

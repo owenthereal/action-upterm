@@ -26,6 +26,10 @@ inputs:
     description: "loopback lets guests forward ports (ssh -L, LocalForward) to the runner's literal loopback addresses, 127.0.0.0/8 and ::1, without approval; empty or false allows none. Requires an upterm whose 'upterm host --help' lists --allow-forwarding"
     required: false
     default: ""
+  full-access:
+    description: "If authorized guests may do what an SSH login to the runner's account can, without approval: run commands (ssh SESSION CMD, VS Code Remote-SSH), transfer files (scp, sftp) and forward ports to the runner's loopback addresses (ssh -L 3000:127.0.0.1:3000). Requires limit-access-to-actor or limit-access-to-users, and an upterm whose 'upterm host --help' lists --full-access"
+    required: false
+    default: "false"
   upterm-server:
     description: "upterm server address (required), supported protocols are ssh, ws, or wss."
     required: true

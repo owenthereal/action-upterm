@@ -352,6 +352,7 @@ function guestGrants(): GuestGrant[] {
   const forwarding = core.getInput('allow-forwarding');
   if (forwarding === 'loopback') grants.push({input: 'allow-forwarding', flag: '--allow-forwarding', arg: '--allow-forwarding=loopback'});
   else if (forwarding && forwarding !== 'false') throw new Error('allow-forwarding must be loopback, false or empty');
+  if (booleanInput('full-access')) grants.push({input: 'full-access', flag: '--full-access', arg: '--full-access'});
   return grants;
 }
 
@@ -376,7 +377,11 @@ async function assertGuestGrantsSupported(grants: GuestGrant[]): Promise<void> {
 }
 
 function validateInputs(): void {
-  guestGrants();
+  // upterm refuses it too, but at launch, after the download, and naming
+  // its own flags rather than these inputs.
+  if (guestGrants().some(({input}) => input === 'full-access') && !allowlistRequested()) {
+    throw new Error('full-access needs limit-access-to-actor or limit-access-to-users: without an allowlist, anyone with the session ID would get a shell on the runner');
+  }
   const waitTimeout = core.getInput('wait-timeout-minutes');
   if (waitTimeout) {
     const parsedTimeout = parseInt(waitTimeout, 10);
@@ -564,10 +569,7 @@ async function assertSupportedUptermVersion(): Promise<void> {
  * so a mistake there still fails loudly in upterm.
  */
 function getAllowedUsers(): string[] {
-  const allowedUsers = core
-    .getInput('limit-access-to-users')
-    .split(/[\s\n,]+/)
-    .filter(Boolean);
+  const allowedUsers = listedUsers();
 
   if (core.getInput('limit-access-to-actor') === 'true') {
     for (const actor of new Set([github.context.actor, process.env.GITHUB_TRIGGERING_ACTOR])) {
@@ -582,6 +584,22 @@ function getAllowedUsers(): string[] {
   }
 
   return [...new Set(allowedUsers)];
+}
+
+/** limit-access-to-users, split at commas and whitespace. */
+function listedUsers(): string[] {
+  return core
+    .getInput('limit-access-to-users')
+    .split(/[\s\n,]+/)
+    .filter(Boolean);
+}
+
+/**
+ * Whether the inputs ask for an allowlist. limit-access-to-actor counts even
+ * when it would leave only bots: run() then starts no session at all.
+ */
+function allowlistRequested(): boolean {
+  return core.getInput('limit-access-to-actor') === 'true' || listedUsers().length > 0;
 }
 
 /**
