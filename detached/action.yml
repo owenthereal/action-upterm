@@ -18,14 +18,14 @@ inputs:
     description: "If only the public SSH keys of the listed GitHub users should be authorized"
     required: false
     default: ""
-  accept-exec:
-    description: "Preapprove guest-selected command execution. Requires an upterm binary with --accept-exec support."
+  allow-exec:
+    description: "If guests may run commands (ssh SESSION CMD, VS Code Remote-SSH) as the runner's user without approval. Requires an upterm whose 'upterm host --help' lists --allow-exec"
     required: false
     default: "false"
-  allow-loopback-tcp-forwarding:
-    description: "Preapprove guest TCP forwarding to literal loopback addresses. Requires an upterm binary with --allow-loopback-tcp-forwarding support."
+  allow-forwarding:
+    description: "loopback lets guests forward ports (ssh -L, LocalForward) to the runner's literal loopback addresses, 127.0.0.0/8 and ::1, without approval; empty or false allows none. Requires an upterm whose 'upterm host --help' lists --allow-forwarding"
     required: false
-    default: "false"
+    default: ""
   upterm-server:
     description: "upterm server address (required), supported protocols are ssh, ws, or wss."
     required: true

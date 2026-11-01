@@ -323,20 +323,41 @@ export function getUptermDownloadUrl(platform: 'linux' | 'darwin' | 'win32', nod
   return url;
 }
 
-/** Only fixed CLI flags can be enabled by these boolean inputs. */
-function guestCapabilityFlags(): string[] {
-  return ['accept-exec', 'allow-loopback-tcp-forwarding'].flatMap(input => {
-    const value = core.getInput(input);
-    if (value && value !== 'true' && value !== 'false') {
-      throw new Error(`${input} must be a boolean (true or false)`);
-    }
-    return value === 'true' ? [`--${input}`] : [];
-  });
+/** A guest grant an input turned on. */
+interface GuestGrant {
+  input: string;
+  /** The flag `upterm host --help` must list. */
+  flag: string;
+  /** What the launch passes for it. */
+  arg: string;
+}
+
+function booleanInput(input: string): boolean {
+  const value = core.getInput(input);
+  if (value && value !== 'true' && value !== 'false') {
+    throw new Error(`${input} must be a boolean (true or false)`);
+  }
+  return value === 'true';
+}
+
+/**
+ * The guest grants the inputs turn on, in launch order. Each is a fixed
+ * upterm argument: an input's value never reaches the command line.
+ */
+function guestGrants(): GuestGrant[] {
+  const grants: GuestGrant[] = [];
+  if (booleanInput('allow-exec')) grants.push({input: 'allow-exec', flag: '--allow-exec', arg: '--allow-exec'});
+  // Only loopback: forwarding anywhere the runner can reach is upterm's
+  // --allow-forwarding=any, which no input offers.
+  const forwarding = core.getInput('allow-forwarding');
+  if (forwarding === 'loopback') grants.push({input: 'allow-forwarding', flag: '--allow-forwarding', arg: '--allow-forwarding=loopback'});
+  else if (forwarding && forwarding !== 'false') throw new Error('allow-forwarding must be loopback, false or empty');
+  return grants;
 }
 
 /** Opt-ins require explicit support from the installed binary, not a guessed release floor. */
-async function assertGuestCapabilitiesSupported(flags: string[]): Promise<void> {
-  if (flags.length === 0) return;
+async function assertGuestGrantsSupported(grants: GuestGrant[]): Promise<void> {
+  if (grants.length === 0) return;
 
   let help: string;
   try {
@@ -345,17 +366,17 @@ async function assertGuestCapabilitiesSupported(flags: string[]): Promise<void> 
     throw new Error(`Failed to check installed upterm guest capabilities with upterm host --help: ${error}`);
   }
 
-  for (const flag of flags) {
+  for (const {input, flag} of grants) {
     // Match a long-option definition at the start of a help line. Prose,
     // longer names and assignments do not establish support for this flag.
     if (!new RegExp(`^[\\t ]*${flag}(?=[\\t ]|$)`, 'm').test(help)) {
-      throw new Error(`The installed upterm does not support ${flag}. Install a release that lists ${flag} in upterm host --help, or disable the ${flag.slice(2)} input.`);
+      throw new Error(`The installed upterm does not support ${flag}. Install a release that lists ${flag} in upterm host --help, or disable the ${input} input.`);
     }
   }
 }
 
 function validateInputs(): void {
-  guestCapabilityFlags();
+  guestGrants();
   const waitTimeout = core.getInput('wait-timeout-minutes');
   if (waitTimeout) {
     const parsedTimeout = parseInt(waitTimeout, 10);
@@ -402,7 +423,7 @@ export async function run() {
 
     await installDependencies();
     await assertSupportedUptermVersion();
-    await assertGuestCapabilitiesSupported(guestCapabilityFlags());
+    await assertGuestGrantsSupported(guestGrants());
     const continueFilesAtLaunch = snapshotContinueFiles();
     const session = await startUptermSession(allowedUsers);
 
@@ -622,11 +643,11 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   const knownHostsArg = `${xdg.config}/known_hosts`;
 
   const auth = allowedUsers.map(user => ` --authorized-user ${shellEscape(`github:${user}`)}`).join('');
-  const guestFlags = guestCapabilityFlags()
-    .map(flag => ` ${flag}`)
+  const grants = guestGrants()
+    .map(({arg}) => ` ${arg}`)
     .join('');
   // getSessionName() is gha- + 8 hex characters: shell-safe by construction.
-  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${launchJoinTimeoutFlag()}${guestFlags}${hostedCommand()}`;
+  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${launchJoinTimeoutFlag()}${grants}${hostedCommand()}`;
 
   core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
   // Evidence for the post step that there may be a session to stop. Saved
