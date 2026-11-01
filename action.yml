@@ -54,3 +54,5 @@ outputs:
     description: "The SSH command to connect to the upterm session (e.g., 'ssh session:token@uptermd.upterm.dev')"
   join-command:
     description: "The upterm join command to connect to the upterm session (e.g., 'upterm join ssh://session:token@uptermd.upterm.dev'). Empty with upterm before v0.38.0, or a ws/wss server behind a path"
+  ssh-config:
+    description: "A Host block for ~/.ssh/config that reaches the upterm session, as upterm prints it, with a commented LocalForward line to start from. Empty with an upterm that doesn't publish one"

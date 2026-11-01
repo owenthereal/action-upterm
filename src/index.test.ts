@@ -1469,6 +1469,108 @@ describe('upterm GitHub integration', () => {
       ]);
     });
 
+    describe('ssh config', () => {
+      // What upterm publishes for a session on the public relay, whose key
+      // the action's bundled pin trusts: its Host block, with no newline
+      // after the last line, and the relay's known_hosts line.
+      const SSH_CONFIG = 'Host gha-3f9a1c05\n  HostName uptermd.upterm.dev\n  User d3k5fia7m4us73ehblug';
+      const KNOWN_HOSTS = 'uptermd.upterm.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiecex8Dq718eSe1CCLgLvDmI7AagvCtax7brPFWkh4';
+      const HINT = '  # Reach a service on the runner (use 127.0.0.1, not localhost): LocalForward 127.0.0.1:3000 127.0.0.1:3000';
+      const BLOCK = `${SSH_CONFIG}\n${HINT}`;
+      const CONFIG_LOG = `SSH config available as output, for ~/.ssh/config or a file it includes:\n${BLOCK}`;
+      const KEY_LOG = `The relay's key, for ~/.ssh/known_hosts, once per device:\n${KNOWN_HOSTS}`;
+      const TODAYS_SUMMARY = [
+        ['addHeading', 'Upterm SSH Connection'],
+        ['addCodeBlock', 'ssh user@session123.upterm.dev', 'bash'],
+        ['addRaw', '\n\nConnect with: <code>ssh user@session123.upterm.dev</code>']
+      ];
+      const CONFIG_SUMMARY = [
+        ['addRaw', '\n\nSSH config, for <code>~/.ssh/config</code> or a file it includes:', true],
+        ['addCodeBlock', BLOCK, 'sshconfig']
+      ];
+      const KEY_SUMMARY = [
+        ['addRaw', "The relay's key, for <code>~/.ssh/known_hosts</code>, once per device:", true],
+        ['addCodeBlock', KNOWN_HOSTS]
+      ];
+
+      function launchAnswers(fields: Record<string, unknown>): void {
+        mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+          if (cmd.includes('upterm version')) return 'Upterm version 0.38.0\n';
+          if (cmd.includes('upterm host')) return readySession(fields);
+          if (cmd.includes('session info')) return endedResponse;
+          return '';
+        });
+      }
+
+      beforeEach(() => {
+        Object.defineProperty(process, 'platform', {value: 'linux'});
+      });
+
+      it.each(['false', 'true'])("publishes upterm's block with a commented LocalForward, as the ssh-config output, in the log and in the summary, with the relay's key (detached=%s)", async detached => {
+        when(core.getInput).calledWith('detached').mockReturnValue(detached);
+        launchAnswers({joinCommand: JOIN_COMMAND, sshConfig: SSH_CONFIG, knownHosts: KNOWN_HOSTS});
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(core.setOutput).toHaveBeenCalledWith('ssh-config', BLOCK);
+        expect(core.info.mock.calls.map(c => String(c[0])).filter(l => l.includes('available as output') || l.includes('known_hosts'))).toEqual([
+          `Join command available as output: ${JOIN_COMMAND}`,
+          'SSH command available as output: ssh user@session123.upterm.dev',
+          CONFIG_LOG,
+          KEY_LOG
+        ]);
+        expect(summaryCalls()).toEqual([
+          ['addHeading', 'Upterm SSH Connection'],
+          ['addRaw', 'Join:', true],
+          ['addCodeBlock', JOIN_COMMAND, 'bash'],
+          ['addRaw', 'SSH:', true],
+          ['addCodeBlock', 'ssh user@session123.upterm.dev', 'bash'],
+          ['addRaw', `\n\nConnect with: <code>${JOIN_COMMAND}</code> or <code>ssh user@session123.upterm.dev</code>`],
+          ...CONFIG_SUMMARY,
+          ...KEY_SUMMARY
+        ]);
+      });
+
+      it("prints the block alone when upterm doesn't say which relay key it trusted", async () => {
+        launchAnswers({sshConfig: SSH_CONFIG});
+        await run();
+        expect(core.setOutput).toHaveBeenCalledWith('ssh-config', BLOCK);
+        expect(core.info).toHaveBeenCalledWith(CONFIG_LOG);
+        expect(core.info).not.toHaveBeenCalledWith(expect.stringContaining('known_hosts,'));
+        expect(summaryCalls()).toEqual([...TODAYS_SUMMARY, ...CONFIG_SUMMARY]);
+      });
+
+      it.each([
+        ['no sshConfig', {knownHosts: KNOWN_HOSTS}],
+        ['an empty sshConfig', {sshConfig: '', knownHosts: KNOWN_HOSTS}]
+      ])("keeps today's summary, and sets no ssh-config output, for an upterm with %s", async (_, fields) => {
+        launchAnswers(fields);
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(core.setOutput).not.toHaveBeenCalledWith('ssh-config', expect.anything());
+        expect(core.info.mock.calls.map(c => String(c[0])).filter(l => l.includes('available as output') || l.includes('known_hosts'))).toEqual(['SSH command available as output: ssh user@session123.upterm.dev']);
+        expect(summaryCalls()).toEqual(TODAYS_SUMMARY);
+      });
+
+      it('shows the block in the summary as upterm printed it, escaped for HTML, and outputs it as is', async () => {
+        // A wss relay behind a path with a query: unescaped, "&notify" would
+        // render as "¬ify".
+        const wss = "Host gha-3f9a1c05\n  HostName relay.example.com\n  User d3k5fia7m4us73ehblug\n  Port 443\n  ProxyCommand upterm proxy 'wss://d3k5fia7m4us73ehblug@relay.example.com/upterm?team=a&notify=1'";
+        launchAnswers({sshConfig: wss});
+        await run();
+        expect(core.setOutput).toHaveBeenCalledWith('ssh-config', `${wss}\n${HINT}`);
+        expect(summaryCalls()).toContainEqual(['addCodeBlock', `${wss.replace('&notify', '&amp;notify')}\n${HINT}`, 'sshconfig']);
+      });
+
+      it('sets the ssh-config output even when the job summary cannot be written', async () => {
+        (core.summary.write as jest.Mock).mockRejectedValueOnce(new Error('Unable to find environment variable for $GITHUB_STEP_SUMMARY'));
+        launchAnswers({sshConfig: SSH_CONFIG, knownHosts: KNOWN_HOSTS});
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(core.setOutput).toHaveBeenCalledWith('ssh-config', BLOCK);
+        expect(core.info).toHaveBeenCalledWith(CONFIG_LOG);
+      });
+    });
+
     it('accepts a launch that answers reconnecting with an ssh command and no tunnel fields, and publishes the command', async () => {
       // upterm's printStarted reports the record's status as the daemon last
       // published it: a tunnel lost just before readiness leaves "reconnecting"

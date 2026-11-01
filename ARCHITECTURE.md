@@ -204,7 +204,8 @@ On Windows these are exported in MSYS-form (`/c/...`), never `C:/...`. Not becau
 
 2. **SSH Command Output** (`outputSshCommand()`)
    - Sets the `ssh-command` output and logs the SSH command; when upterm reports a join command (`joinCommand`, v0.38.0+), sets the `join-command` output and logs it first, as upterm's own view does
-   - Writes to the job summary, the join command above the SSH command when there is one - best effort: if the write fails (e.g. `GITHUB_STEP_SUMMARY` is unset), the error is logged at debug level and the action carries on
+   - When upterm reports a Host block for `~/.ssh/config` (`sshConfig`), sets the `ssh-config` output to it with a commented `LocalForward` line added, and logs it, then the relay's `known_hosts` text (`knownHosts`) when upterm reports that too. It is logged because the runner reads a step's summary only once the step ends, and an attached session's step runs until the session does
+   - Writes to the job summary, the join command above the SSH command when there is one, then the ssh config and the relay's key, escaped for HTML - best effort: if the write fails (e.g. `GITHUB_STEP_SUMMARY` is unset), the error is logged at debug level and the action carries on
 
 3. **Monitoring** (`waitForSession()`)
    - Polls session status every 5 seconds
