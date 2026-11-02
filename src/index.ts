@@ -323,7 +323,65 @@ export function getUptermDownloadUrl(platform: 'linux' | 'darwin' | 'win32', nod
   return url;
 }
 
+/** A guest grant an input turned on. */
+interface GuestGrant {
+  input: string;
+  /** The flag `upterm host --help` must list. */
+  flag: string;
+  /** What the launch passes for it. */
+  arg: string;
+}
+
+function booleanInput(input: string): boolean {
+  const value = core.getInput(input);
+  if (value && value !== 'true' && value !== 'false') {
+    throw new Error(`${input} must be a boolean (true or false)`);
+  }
+  return value === 'true';
+}
+
+/**
+ * The guest grants the inputs turn on, in launch order. Each is a fixed
+ * upterm argument: an input's value never reaches the command line.
+ */
+function guestGrants(): GuestGrant[] {
+  const grants: GuestGrant[] = [];
+  if (booleanInput('allow-exec')) grants.push({input: 'allow-exec', flag: '--allow-exec', arg: '--allow-exec'});
+  // Only loopback: forwarding anywhere the runner can reach is upterm's
+  // --allow-forwarding=any, which no input offers.
+  const forwarding = core.getInput('allow-forwarding');
+  if (forwarding === 'loopback') grants.push({input: 'allow-forwarding', flag: '--allow-forwarding', arg: '--allow-forwarding=loopback'});
+  else if (forwarding && forwarding !== 'false') throw new Error('allow-forwarding must be loopback, false or empty');
+  if (booleanInput('full-access')) grants.push({input: 'full-access', flag: '--full-access', arg: '--full-access'});
+  return grants;
+}
+
+/** Opt-ins require explicit support from the installed binary, not a guessed release floor. */
+async function assertGuestGrantsSupported(grants: GuestGrant[]): Promise<void> {
+  if (grants.length === 0) return;
+
+  let help: string;
+  try {
+    help = await execShellCommand('upterm host --help', {quiet: true});
+  } catch (error) {
+    throw new Error(`Failed to check installed upterm guest capabilities with upterm host --help: ${error}`);
+  }
+
+  for (const {input, flag} of grants) {
+    // Match a long-option definition at the start of a help line. Prose,
+    // longer names and assignments do not establish support for this flag.
+    if (!new RegExp(`^[\\t ]*${flag}(?=[\\t ]|$)`, 'm').test(help)) {
+      throw new Error(`The installed upterm does not support ${flag}. Install a release that lists ${flag} in upterm host --help, or disable the ${input} input.`);
+    }
+  }
+}
+
 function validateInputs(): void {
+  // upterm refuses it too, but at launch, after the download, and naming
+  // its own flags rather than these inputs.
+  if (guestGrants().some(({input}) => input === 'full-access') && !allowlistRequested()) {
+    throw new Error('full-access needs limit-access-to-actor or limit-access-to-users: without an allowlist, anyone with the session ID would get a shell on the runner');
+  }
   const waitTimeout = core.getInput('wait-timeout-minutes');
   if (waitTimeout) {
     const parsedTimeout = parseInt(waitTimeout, 10);
@@ -370,6 +428,7 @@ export async function run() {
 
     await installDependencies();
     await assertSupportedUptermVersion();
+    await assertGuestGrantsSupported(guestGrants());
     const continueFilesAtLaunch = snapshotContinueFiles();
     const session = await startUptermSession(allowedUsers);
 
@@ -510,10 +569,7 @@ async function assertSupportedUptermVersion(): Promise<void> {
  * so a mistake there still fails loudly in upterm.
  */
 function getAllowedUsers(): string[] {
-  const allowedUsers = core
-    .getInput('limit-access-to-users')
-    .split(/[\s\n,]+/)
-    .filter(Boolean);
+  const allowedUsers = listedUsers();
 
   if (core.getInput('limit-access-to-actor') === 'true') {
     for (const actor of new Set([github.context.actor, process.env.GITHUB_TRIGGERING_ACTOR])) {
@@ -528,6 +584,22 @@ function getAllowedUsers(): string[] {
   }
 
   return [...new Set(allowedUsers)];
+}
+
+/** limit-access-to-users, split at commas and whitespace. */
+function listedUsers(): string[] {
+  return core
+    .getInput('limit-access-to-users')
+    .split(/[\s\n,]+/)
+    .filter(Boolean);
+}
+
+/**
+ * Whether the inputs ask for an allowlist. limit-access-to-actor counts even
+ * when it would leave only bots: run() then starts no session at all.
+ */
+function allowlistRequested(): boolean {
+  return core.getInput('limit-access-to-actor') === 'true' || listedUsers().length > 0;
 }
 
 /**
@@ -589,8 +661,11 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   const knownHostsArg = `${xdg.config}/known_hosts`;
 
   const auth = allowedUsers.map(user => ` --authorized-user ${shellEscape(`github:${user}`)}`).join('');
+  const grants = guestGrants()
+    .map(({arg}) => ` ${arg}`)
+    .join('');
   // getSessionName() is gha- + 8 hex characters: shell-safe by construction.
-  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${launchJoinTimeoutFlag()}${hostedCommand()}`;
+  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${launchJoinTimeoutFlag()}${grants}${hostedCommand()}`;
 
   core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
   // Evidence for the post step that there may be a session to stop. Saved
@@ -731,6 +806,20 @@ async function pollSession(): Promise<PollResult> {
   }
 }
 
+// A line inside the Host block to make a LocalForward of. upterm forwards only
+// to literal loopback addresses: it refuses localhost.
+const LOCAL_FORWARD_HINT = '  # Reach a service on the runner (use 127.0.0.1, not localhost): LocalForward 127.0.0.1:3000 127.0.0.1:3000';
+
+/** upterm's Host block for ~/.ssh/config, with a commented LocalForward to start from; null when upterm publishes none. */
+function sshConfigBlock(session: SessionInfo): string | null {
+  return session.sshConfig ? `${session.sshConfig}\n${LOCAL_FORWARD_HINT}` : null;
+}
+
+/** text as HTML: core.summary.addCodeBlock puts its code inside a <pre> as is. */
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 async function outputSshCommand(session: SessionInfo): Promise<string | null> {
   const sshCommand = session.sshCommand;
   if (!sshCommand) {
@@ -747,16 +836,26 @@ async function outputSshCommand(session: SessionInfo): Promise<string | null> {
   }
   core.setOutput('ssh-command', sshCommand);
   core.info(`SSH command available as output: ${sshCommand}`);
+  // Logged as well as summarized: the runner reads a step's summary only once
+  // the step ends, and an attached session's step runs until the session does.
+  const sshConfig = sshConfigBlock(session);
+  if (sshConfig) {
+    core.setOutput('ssh-config', sshConfig);
+    core.info(`SSH config available as output, for ~/.ssh/config or a file it includes:\n${sshConfig}`);
+    if (session.knownHosts) core.info(`The relay's key, for ~/.ssh/known_hosts, once per device:\n${session.knownHosts}`);
+  }
   // The job summary is a convenience. write() throws when GITHUB_STEP_SUMMARY
   // is unset (older GHES, some runner setups), and that must not fail a
   // session that is already up.
   try {
     const summary = core.summary.addHeading('Upterm SSH Connection');
     if (joinCommand) summary.addRaw('Join:', true).addCodeBlock(joinCommand, 'bash').addRaw('SSH:', true);
-    await summary
-      .addCodeBlock(sshCommand, 'bash')
-      .addRaw(`\n\nConnect with: ${joinCommand ? `<code>${joinCommand}</code> or ` : ''}<code>${sshCommand}</code>`)
-      .write();
+    summary.addCodeBlock(sshCommand, 'bash').addRaw(`\n\nConnect with: ${joinCommand ? `<code>${joinCommand}</code> or ` : ''}<code>${sshCommand}</code>`);
+    if (sshConfig) {
+      summary.addRaw('\n\nSSH config, for <code>~/.ssh/config</code> or a file it includes:', true).addCodeBlock(escapeHtml(sshConfig), 'sshconfig');
+      if (session.knownHosts) summary.addRaw("The relay's key, for <code>~/.ssh/known_hosts</code>, once per device:", true).addCodeBlock(escapeHtml(session.knownHosts));
+    }
+    await summary.write();
   } catch (error) {
     core.debug(`Could not write the job summary: ${error}`);
   }

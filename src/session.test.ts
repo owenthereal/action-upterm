@@ -51,6 +51,15 @@ describe('parseSessionInfo', () => {
     expect(info.guestCount).toBe(0);
   });
 
+  it('accepts additive capability metadata without treating it as live detail or a join', () => {
+    const metadata = {loginCommand: 'herdr', guestShell: 'login', execution: 'approval', tcpForwarding: 'loopback-approval', approvalMethod: 'terminal'};
+    const info = parseSessionInfo(JSON.stringify({name: 'gha-3f9a1c05', status: 'ready', ...metadata}));
+    expect(info).toMatchObject(metadata);
+    expect(info.hasLiveDetail).toBe(false);
+    expect(hasGuestJoined(info)).toBe(false);
+    expect(parseSessionInfo(READY_WITH_DETAIL)).not.toHaveProperty('execution');
+  });
+
   it('marks a ready session without an ssh command as lacking live detail', () => {
     const info = parseSessionInfo(READY_WITHOUT_DETAIL);
     expect(info.status).toBe('ready');

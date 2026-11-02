@@ -272,6 +272,245 @@ describe('upterm GitHub integration', () => {
     });
   });
 
+  describe('guest grants', () => {
+    let shell: typeof import('./helpers').execShellCommand;
+    // The grants' lines in `upterm host --help`, as pflag prints them.
+    const help = [
+      'What guests can do:',
+      '      --allow-exec                      Let guests run commands (ssh SESSION CMD, VS Code, herdr --remote) without approval. Each runs as you, and its stdin can carry further code.',
+      "      --allow-forwarding loopback|any   Let guests forward ports (ssh -L) without approval: loopback, to this machine's literal 127.0.0.0/8 and ::1 addresses; any, to anything this machine can reach.",
+      "      --full-access                     Let authorized guests do what an SSH login to your account can, without asking: run commands (ssh SESSION CMD, VS Code, herdr --remote), transfer files (scp, sftp), and forward ports to this machine's loopback addresses (ssh -L 8080:127.0.0.1:8080). Requires --authorized-user or --authorized-keys.",
+      ''
+    ].join('\n');
+    // Each input, the value that turns it on, the flag `upterm host --help`
+    // must list for it, the argument the launch passes, and the flag's
+    // earlier, unreleased name, if it had one.
+    const grants = [
+      {input: 'allow-exec', on: 'true', flag: '--allow-exec', arg: '--allow-exec', earlier: '--accept-exec'},
+      {input: 'allow-forwarding', on: 'loopback', flag: '--allow-forwarding', arg: '--allow-forwarding=loopback', earlier: '--allow-loopback-tcp-forwarding'},
+      {input: 'full-access', on: 'true', flag: '--full-access', arg: '--full-access', earlier: ''}
+    ];
+    const refusedWithoutAllowlist = 'full-access needs limit-access-to-actor or limit-access-to-users: without an allowlist, anyone with the session ID would get a shell on the runner';
+    const launches = () => mockedExecShellCommand.mock.calls.map(c => c[0]).filter(cmd => cmd.startsWith('upterm host --detach '));
+    const helpCalls = () => mockedExecShellCommand.mock.calls.filter(c => c[0] === 'upterm host --help');
+
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      shell = async (cmd: string) => {
+        if (cmd === 'upterm version') return 'Upterm version 0.32.0\n';
+        if (cmd === 'upterm host --help') return help;
+        if (cmd.startsWith('upterm host --detach ')) return readySession();
+        if (cmd.includes('session info')) return endedResponse;
+        return '';
+      };
+      mockedExecShellCommand.mockImplementation(shell);
+    });
+
+    it.each(['', 'false'])('passes no grant and checks no help for empty or false inputs (%s), even on v0.32.0', async value => {
+      for (const {input} of grants) when(core.getInput).calledWith(input).mockReturnValue(value);
+      await run();
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(helpCalls()).toHaveLength(0);
+      expect(launches()).toHaveLength(1);
+      expect(launches()[0]).toContain('--accept --output json');
+      expect(launches()[0]).not.toMatch(/--allow-|--full-access/);
+    });
+
+    it('turns nothing on for the earlier names, accept-exec and allow-loopback-tcp-forwarding', async () => {
+      when(core.getInput).calledWith('accept-exec').mockReturnValue('true');
+      when(core.getInput).calledWith('allow-loopback-tcp-forwarding').mockReturnValue('true');
+      await run();
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(helpCalls()).toHaveLength(0);
+      expect(launches()).toHaveLength(1);
+      expect(launches()[0]).not.toContain('--accept-exec');
+      expect(launches()[0]).not.toContain('--allow-');
+    });
+
+    describe.each(['false', 'true'])('detached=%s', detached => {
+      it.each([
+        ['true', '', 'false', '--allow-exec'],
+        ['false', 'loopback', 'false', '--allow-forwarding=loopback'],
+        ['true', 'loopback', 'false', '--allow-exec --allow-forwarding=loopback'],
+        ['false', '', 'true', '--full-access'],
+        ['true', 'loopback', 'true', '--allow-exec --allow-forwarding=loopback --full-access']
+      ])('passes each enabled grant as its fixed argument (allow-exec=%s, allow-forwarding=%s, full-access=%s)', async (exec, forwarding, fullAccess, args) => {
+        when(core.getInput).calledWith('detached').mockReturnValue(detached);
+        when(core.getInput).calledWith('allow-exec').mockReturnValue(exec);
+        when(core.getInput).calledWith('allow-forwarding').mockReturnValue(forwarding);
+        when(core.getInput).calledWith('full-access').mockReturnValue(fullAccess);
+        when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('alice');
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(helpCalls()).toHaveLength(1);
+        expect(launches()).toHaveLength(1);
+        expect(launches()[0]).toMatch(new RegExp(` --authorized-user 'github:alice' ${args}$`));
+        const commands = mockedExecShellCommand.mock.calls.map(c => c[0]);
+        expect(commands.indexOf('upterm host --help')).toBeLessThan(commands.indexOf(launches()[0]));
+        expect(core.setOutput).toHaveBeenCalledWith('ssh-command', READY_SESSION.sshCommand);
+        expect(core.saveState.mock.calls.filter(([key]) => key === 'message')).toHaveLength(Number(detached === 'true'));
+      });
+
+      it('places the grants before the Windows hosted-command separator', async () => {
+        Object.defineProperty(process, 'platform', {value: 'win32'});
+        Object.defineProperty(process, 'arch', {value: 'x64'});
+        when(core.getInput).calledWith('detached').mockReturnValue(detached);
+        when(core.getInput).calledWith('allow-exec').mockReturnValue('true');
+        when(core.getInput).calledWith('allow-forwarding').mockReturnValue('loopback');
+        when(core.getInput).calledWith('full-access').mockReturnValue('true');
+        when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('alice');
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(launches()[0]).toMatch(/ --allow-exec --allow-forwarding=loopback --full-access -- bash -l$/);
+      });
+    });
+
+    describe.each(['allow-exec', 'full-access'])('%s', input => {
+      it.each(['yes', '1', 'loopback', 'false; echo unsafe', `--${input}`])('rejects %s before downloading', async value => {
+        when(core.getInput).calledWith(input).mockReturnValue(value);
+        when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('alice');
+        await run();
+        expect(core.setFailed).toHaveBeenCalledWith(`${input} must be a boolean (true or false)`);
+        expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+        expect(launches()).toHaveLength(0);
+      });
+    });
+
+    describe('full-access and the allowlist', () => {
+      const originalTriggeringActor = process.env.GITHUB_TRIGGERING_ACTOR;
+
+      // A runner sets GITHUB_TRIGGERING_ACTOR, which limit-access-to-actor
+      // also authorizes.
+      beforeEach(() => {
+        delete process.env.GITHUB_TRIGGERING_ACTOR;
+      });
+
+      afterEach(() => {
+        if (originalTriggeringActor === undefined) delete process.env.GITHUB_TRIGGERING_ACTOR;
+        else process.env.GITHUB_TRIGGERING_ACTOR = originalTriggeringActor;
+      });
+
+      it.each(['', ' , '])('refuses full-access with no allowlist (limit-access-to-users %j), before downloading', async users => {
+        when(core.getInput).calledWith('full-access').mockReturnValue('true');
+        when(core.getInput).calledWith('limit-access-to-users').mockReturnValue(users);
+        await run();
+        expect(core.setFailed).toHaveBeenCalledWith(refusedWithoutAllowlist);
+        expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+        expect(helpCalls()).toHaveLength(0);
+        expect(launches()).toHaveLength(0);
+      });
+
+      it.each([
+        ['limit-access-to-actor', 'true', "--authorized-user 'github:test-actor'"],
+        ['limit-access-to-users', 'alice', "--authorized-user 'github:alice'"]
+      ])('starts full-access with %s', async (input, value, auth) => {
+        when(core.getInput).calledWith('full-access').mockReturnValue('true');
+        when(core.getInput).calledWith(input).mockReturnValue(value);
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(launches()).toHaveLength(1);
+        expect(launches()[0]).toMatch(new RegExp(` ${auth} --full-access$`));
+      });
+
+      it('needs no allowlist for full-access off, whatever else is on', async () => {
+        when(core.getInput).calledWith('full-access').mockReturnValue('false');
+        when(core.getInput).calledWith('allow-exec').mockReturnValue('true');
+        when(core.getInput).calledWith('allow-forwarding').mockReturnValue('loopback');
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(launches()).toHaveLength(1);
+        expect(launches()[0]).not.toContain('--authorized-user');
+        expect(launches()[0]).toMatch(/ --allow-exec --allow-forwarding=loopback$/);
+      });
+
+      it('starts nothing when limit-access-to-actor leaves only bots, rather than full access for anyone', async () => {
+        require('@actions/github').context.actor = 'dependabot[bot]';
+        when(core.getInput).calledWith('full-access').mockReturnValue('true');
+        when(core.getInput).calledWith('limit-access-to-actor').mockReturnValue('true');
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('No upterm session started'));
+        expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+        expect(launches()).toHaveLength(0);
+      });
+    });
+
+    it.each(['true', 'any', 'Loopback', 'yes', 'loopback; echo unsafe', '--allow-forwarding=loopback', '127.0.0.1'])('rejects allow-forwarding %s before downloading', async value => {
+      when(core.getInput).calledWith('allow-forwarding').mockReturnValue(value);
+      await run();
+      expect(core.setFailed).toHaveBeenCalledWith('allow-forwarding must be loopback, false or empty');
+      expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+      expect(launches()).toHaveLength(0);
+    });
+
+    describe.each(grants)('$input support', ({input, on, flag, arg, earlier}) => {
+      const unsupported = `The installed upterm does not support ${flag}. Install a release that lists ${flag} in upterm host --help, or disable the ${input} input.`;
+
+      // An allowlist, which full-access needs.
+      beforeEach(() => {
+        when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('alice');
+      });
+
+      it.each([
+        'Flags:\n      --accept    Start the session without asking, plus --allow-sftp.\n',
+        ...(earlier ? [`      ${earlier}    The flag's earlier name\n`] : []),
+        `Use ${flag} for this feature.\n`,
+        `      ${flag}-extra    Another option\n`,
+        `      --other    Mention ${flag} in prose\n`,
+        `      ${flag}=false    Not a flag definition\n`
+      ])('refuses a help without a definition of the flag, before session creation (%s)', async output => {
+        when(core.getInput).calledWith(input).mockReturnValue(on);
+        mockedExecShellCommand.mockImplementation(async (cmd, options) => (cmd === 'upterm host --help' ? output : shell(cmd, options)));
+        await run();
+        expect(core.setFailed).toHaveBeenCalledWith(unsupported);
+        expect(launches()).toHaveLength(0);
+        expect(core.saveState).not.toHaveBeenCalledWith('sessionStarted', 'true');
+      });
+
+      it('fails clearly when host help fails, even if stderr lists the flag', async () => {
+        when(core.getInput).calledWith(input).mockReturnValue(on);
+        mockedExecShellCommand.mockImplementation(async (cmd, options) => {
+          if (cmd === 'upterm host --help') throw new Error(`exit 1\n      ${flag}    Unusable help`);
+          return shell(cmd, options);
+        });
+        await run();
+        expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Failed to check installed upterm guest capabilities'));
+        expect(launches()).toHaveLength(0);
+        expect(core.saveState).not.toHaveBeenCalledWith('sessionStarted', 'true');
+      });
+
+      it('needs only its own flag listed when it is the only grant enabled', async () => {
+        when(core.getInput).calledWith(input).mockReturnValue(on);
+        mockedExecShellCommand.mockImplementation(async (cmd, options) => (cmd === 'upterm host --help' ? `Flags:\n      ${flag}    Supported option\n` : shell(cmd, options)));
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(launches()).toHaveLength(1);
+        expect(launches()[0]).toMatch(new RegExp(` ${arg}$`));
+      });
+    });
+
+    it('requires every requested flag, not just the first one', async () => {
+      when(core.getInput).calledWith('allow-exec').mockReturnValue('true');
+      when(core.getInput).calledWith('allow-forwarding').mockReturnValue('loopback');
+      mockedExecShellCommand.mockImplementation(async (cmd, options) => (cmd === 'upterm host --help' ? 'Flags:\n      --allow-exec    Allow exec\n' : shell(cmd, options)));
+      await run();
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('does not support --allow-forwarding.'));
+      expect(launches()).toHaveLength(0);
+    });
+
+    it('accepts additive capability JSON without inferring grants or checking help', async () => {
+      mockedExecShellCommand.mockImplementation(async (cmd, options) => {
+        if (cmd.startsWith('upterm host --detach ')) return readySession({loginCommand: 'herdr', guestShell: 'login', execution: 'approval', tcpForwarding: 'loopback-approval', approvalMethod: 'terminal'});
+        return shell(cmd, options);
+      });
+      await run();
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(helpCalls()).toHaveLength(0);
+      expect(launches()[0]).not.toContain('--allow-');
+      expect(core.setOutput).toHaveBeenCalledWith('ssh-command', READY_SESSION.sshCommand);
+    });
+  });
+
   describe('upterm version gate', () => {
     it('fails with an actionable message when the pinned upterm is too old', async () => {
       when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.31.0');
@@ -1228,6 +1467,108 @@ describe('upterm GitHub integration', () => {
         ['addCodeBlock', 'ssh user@session123.upterm.dev', 'bash'],
         ['addRaw', '\n\nConnect with: <code>ssh user@session123.upterm.dev</code>']
       ]);
+    });
+
+    describe('ssh config', () => {
+      // What upterm publishes for a session on the public relay, whose key
+      // the action's bundled pin trusts: its Host block, with no newline
+      // after the last line, and the relay's known_hosts line.
+      const SSH_CONFIG = 'Host gha-3f9a1c05\n  HostName uptermd.upterm.dev\n  User d3k5fia7m4us73ehblug';
+      const KNOWN_HOSTS = 'uptermd.upterm.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiecex8Dq718eSe1CCLgLvDmI7AagvCtax7brPFWkh4';
+      const HINT = '  # Reach a service on the runner (use 127.0.0.1, not localhost): LocalForward 127.0.0.1:3000 127.0.0.1:3000';
+      const BLOCK = `${SSH_CONFIG}\n${HINT}`;
+      const CONFIG_LOG = `SSH config available as output, for ~/.ssh/config or a file it includes:\n${BLOCK}`;
+      const KEY_LOG = `The relay's key, for ~/.ssh/known_hosts, once per device:\n${KNOWN_HOSTS}`;
+      const TODAYS_SUMMARY = [
+        ['addHeading', 'Upterm SSH Connection'],
+        ['addCodeBlock', 'ssh user@session123.upterm.dev', 'bash'],
+        ['addRaw', '\n\nConnect with: <code>ssh user@session123.upterm.dev</code>']
+      ];
+      const CONFIG_SUMMARY = [
+        ['addRaw', '\n\nSSH config, for <code>~/.ssh/config</code> or a file it includes:', true],
+        ['addCodeBlock', BLOCK, 'sshconfig']
+      ];
+      const KEY_SUMMARY = [
+        ['addRaw', "The relay's key, for <code>~/.ssh/known_hosts</code>, once per device:", true],
+        ['addCodeBlock', KNOWN_HOSTS]
+      ];
+
+      function launchAnswers(fields: Record<string, unknown>): void {
+        mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+          if (cmd.includes('upterm version')) return 'Upterm version 0.38.0\n';
+          if (cmd.includes('upterm host')) return readySession(fields);
+          if (cmd.includes('session info')) return endedResponse;
+          return '';
+        });
+      }
+
+      beforeEach(() => {
+        Object.defineProperty(process, 'platform', {value: 'linux'});
+      });
+
+      it.each(['false', 'true'])("publishes upterm's block with a commented LocalForward, as the ssh-config output, in the log and in the summary, with the relay's key (detached=%s)", async detached => {
+        when(core.getInput).calledWith('detached').mockReturnValue(detached);
+        launchAnswers({joinCommand: JOIN_COMMAND, sshConfig: SSH_CONFIG, knownHosts: KNOWN_HOSTS});
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(core.setOutput).toHaveBeenCalledWith('ssh-config', BLOCK);
+        expect(core.info.mock.calls.map(c => String(c[0])).filter(l => l.includes('available as output') || l.includes('known_hosts'))).toEqual([
+          `Join command available as output: ${JOIN_COMMAND}`,
+          'SSH command available as output: ssh user@session123.upterm.dev',
+          CONFIG_LOG,
+          KEY_LOG
+        ]);
+        expect(summaryCalls()).toEqual([
+          ['addHeading', 'Upterm SSH Connection'],
+          ['addRaw', 'Join:', true],
+          ['addCodeBlock', JOIN_COMMAND, 'bash'],
+          ['addRaw', 'SSH:', true],
+          ['addCodeBlock', 'ssh user@session123.upterm.dev', 'bash'],
+          ['addRaw', `\n\nConnect with: <code>${JOIN_COMMAND}</code> or <code>ssh user@session123.upterm.dev</code>`],
+          ...CONFIG_SUMMARY,
+          ...KEY_SUMMARY
+        ]);
+      });
+
+      it("prints the block alone when upterm doesn't say which relay key it trusted", async () => {
+        launchAnswers({sshConfig: SSH_CONFIG});
+        await run();
+        expect(core.setOutput).toHaveBeenCalledWith('ssh-config', BLOCK);
+        expect(core.info).toHaveBeenCalledWith(CONFIG_LOG);
+        expect(core.info).not.toHaveBeenCalledWith(expect.stringContaining('known_hosts,'));
+        expect(summaryCalls()).toEqual([...TODAYS_SUMMARY, ...CONFIG_SUMMARY]);
+      });
+
+      it.each([
+        ['no sshConfig', {knownHosts: KNOWN_HOSTS}],
+        ['an empty sshConfig', {sshConfig: '', knownHosts: KNOWN_HOSTS}]
+      ])("keeps today's summary, and sets no ssh-config output, for an upterm with %s", async (_, fields) => {
+        launchAnswers(fields);
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(core.setOutput).not.toHaveBeenCalledWith('ssh-config', expect.anything());
+        expect(core.info.mock.calls.map(c => String(c[0])).filter(l => l.includes('available as output') || l.includes('known_hosts'))).toEqual(['SSH command available as output: ssh user@session123.upterm.dev']);
+        expect(summaryCalls()).toEqual(TODAYS_SUMMARY);
+      });
+
+      it('shows the block in the summary as upterm printed it, escaped for HTML, and outputs it as is', async () => {
+        // A wss relay behind a path with a query: unescaped, "&notify" would
+        // render as "¬ify".
+        const wss = "Host gha-3f9a1c05\n  HostName relay.example.com\n  User d3k5fia7m4us73ehblug\n  Port 443\n  ProxyCommand upterm proxy 'wss://d3k5fia7m4us73ehblug@relay.example.com/upterm?team=a&notify=1'";
+        launchAnswers({sshConfig: wss});
+        await run();
+        expect(core.setOutput).toHaveBeenCalledWith('ssh-config', `${wss}\n${HINT}`);
+        expect(summaryCalls()).toContainEqual(['addCodeBlock', `${wss.replace('&notify', '&amp;notify')}\n${HINT}`, 'sshconfig']);
+      });
+
+      it('sets the ssh-config output even when the job summary cannot be written', async () => {
+        (core.summary.write as jest.Mock).mockRejectedValueOnce(new Error('Unable to find environment variable for $GITHUB_STEP_SUMMARY'));
+        launchAnswers({sshConfig: SSH_CONFIG, knownHosts: KNOWN_HOSTS});
+        await run();
+        expect(core.setFailed).not.toHaveBeenCalled();
+        expect(core.setOutput).toHaveBeenCalledWith('ssh-config', BLOCK);
+        expect(core.info).toHaveBeenCalledWith(CONFIG_LOG);
+      });
     });
 
     it('accepts a launch that answers reconnecting with an ssh command and no tunnel fields, and publishes the command', async () => {

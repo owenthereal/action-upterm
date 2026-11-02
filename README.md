@@ -58,6 +58,75 @@ On a re-run, `limit-access-to-actor` also authorizes whoever re-ran the job. Bot
 
 If your registered public SSH key differs from your default private SSH key, specify the path manually: `ssh -i <path-to-private-key> <upterm-connection-string>`.
 
+## Debug a Failing Job with VS Code
+
+VS Code's Remote-SSH starts its server on the runner with a command, and talks to it through a forward to a port on the runner's loopback address, so the session has to allow both. `full-access: true` allows them, and file transfers, without approval, for the users the session admits, so pair it with `limit-access-to-actor`:
+
+```yaml
+name: CI
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - run: npm test
+    - name: Debug failure with VS Code
+      if: ${{ failure() }}
+      uses: owenthereal/action-upterm@v2
+      with:
+        limit-access-to-actor: true
+        full-access: true
+        wait-timeout-minutes: 15
+```
+
+On your laptop:
+
+1. **Pin the relay's key, once per device.** Add this line to `~/.ssh/known_hosts`. It is the line `upterm session ssh-config` prints for the public relay, and the step prints its relay's line too:
+
+   ```text
+   uptermd.upterm.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiecex8Dq718eSe1CCLgLvDmI7AagvCtax7brPFWkh4
+   ```
+
+2. **Include a file for the jobs' config, once.** Add this line to `~/.ssh/config`, before any `Host` line (after one, it would apply to that host only):
+
+   ```sshconfig
+   Include ~/.ssh/upterm-gha.conf
+   ```
+
+3. **Paste the step's block, for each new job.** The step logs an SSH config block as it starts the session, and puts it in the job summary and the `ssh-config` output. Replace the contents of `~/.ssh/upterm-gha.conf` with it. It looks like this:
+
+   ```sshconfig
+   Host gha-3f9a1c05
+     HostName uptermd.upterm.dev
+     User d3k5fia7m4us73ehblug
+     # Reach a service on the runner (use 127.0.0.1, not localhost): LocalForward 127.0.0.1:3000 127.0.0.1:3000
+   ```
+
+   The `Host` is the session's name and the `User` its SSH user. Both change with every job, so each new job only overwrites this file. If the key on your GitHub account isn't one ssh offers by default, add `IdentityFile ~/.ssh/YOUR_GITHUB_KEY` to the block.
+
+4. **Connect.** In VS Code, run **Remote-SSH: Connect to Host…** with the block's `Host`, `gha-3f9a1c05` here. `ssh`, `scp` and `sftp` take the same name.
+
+5. **Reach a port on the runner.** Replace the commented line with a `LocalForward` from a laptop port `L` to the runner's port `R`, both on literal loopback addresses, and connect again:
+
+   ```sshconfig
+     LocalForward 127.0.0.1:L 127.0.0.1:R
+   ```
+
+   For a dev server on the runner's port 3000, `LocalForward 127.0.0.1:3000 127.0.0.1:3000`, then open `http://127.0.0.1:3000` on the laptop. upterm forwards only to literal `127.0.0.0/8` and `::1` addresses: `localhost` and other hostnames are refused. In testing, VS Code's own `remote.SSH.defaultForwardedPorts` setting didn't forward through upterm: its log said "Created tunnel does not match requirements of requested tunnel. Host or port mismatch."
+
+The guest inputs all default to off, with `owenthereal/action-upterm/detached` too:
+
+| Input | Lets guests, without approval | upterm flag |
+| --- | --- | --- |
+| `allow-exec: true` | run commands (`ssh SESSION CMD`, VS Code) as the runner's user; a command's stdin can carry further code | `--allow-exec` |
+| `allow-forwarding: loopback` | forward ports to the runner's literal `127.0.0.0/8` and `::1` addresses, not to `localhost`, other hostnames, mapped IPv6 or zoned addresses | `--allow-forwarding=loopback` |
+| `full-access: true` | do both, and transfer files: what an SSH login to the runner's account can | `--full-access` |
+
+`full-access` needs `limit-access-to-actor` or `limit-access-to-users`: without an allowlist, anyone with the session ID would get a shell on the runner, so the step fails before it downloads anything. `allow-exec` and `allow-forwarding` don't need one, but without one they extend to anyone with the session ID. A guest who can run commands can also open sockets as the runner's user. The action always starts upterm with `--accept`, which on its own lets guests transfer files (scp, sftp) without approval.
+
+Each enabled input needs an upterm whose `upterm host --help` lists its flag. The action checks before it starts the session, and fails if the installed upterm doesn't list it, or if the check itself fails: choose a release that lists it with `upterm-version`, or leave the input off. With every guest input off, the action runs no such check.
+
 ## Use Custom Upterm Server
 
 To host your own Upterm server, follow the instructions for [deployment across various cloud providers](https://github.com/owenthereal/upterm?tab=readme-ov-file#hammer_and_wrench-deployment).

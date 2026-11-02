@@ -31,6 +31,19 @@ export interface SessionInfo {
   sshCommand?: string;
   /** `upterm join` for guests who have upterm, published beside sshCommand; absent before v0.38.0, and for a relay URL with a path (v0.38.0+). */
   joinCommand?: string;
+  /**
+   * The Host block for ~/.ssh/config that reaches the session, under its
+   * name, as `upterm session ssh-config` prints it: HostName, User, Port when
+   * it isn't 22, and a ProxyCommand for a ws or wss relay. No newline follows
+   * its last line. Absent from an upterm that doesn't publish one.
+   */
+  sshConfig?: string;
+  /**
+   * The known_hosts text for the relay key the session's host trusted: its
+   * line, after a comment saying so when the host accepted the key on first
+   * use. Absent when upterm doesn't say.
+   */
+  knownHosts?: string;
   clientCount?: number;
   guestCount?: number;
   connectedClients?: string[];

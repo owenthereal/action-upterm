@@ -18,6 +18,18 @@ inputs:
     description: "If only the public SSH keys of the listed GitHub users should be authorized"
     required: false
     default: ""
+  allow-exec:
+    description: "If guests may run commands (ssh SESSION CMD, VS Code Remote-SSH) as the runner's user without approval. Requires an upterm whose 'upterm host --help' lists --allow-exec"
+    required: false
+    default: "false"
+  allow-forwarding:
+    description: "loopback lets guests forward ports (ssh -L, LocalForward) to the runner's literal loopback addresses, 127.0.0.0/8 and ::1, without approval; empty or false allows none. Requires an upterm whose 'upterm host --help' lists --allow-forwarding"
+    required: false
+    default: ""
+  full-access:
+    description: "If authorized guests may do what an SSH login to the runner's account can, without approval: run commands (ssh SESSION CMD, VS Code Remote-SSH), transfer files (scp, sftp) and forward ports to the runner's loopback addresses (ssh -L 3000:127.0.0.1:3000). Requires limit-access-to-actor or limit-access-to-users, and an upterm whose 'upterm host --help' lists --full-access"
+    required: false
+    default: "false"
   upterm-server:
     description: "upterm server address (required), supported protocols are ssh, ws, or wss."
     required: true
@@ -42,3 +54,5 @@ outputs:
     description: "The SSH command to connect to the upterm session (e.g., 'ssh session:token@uptermd.upterm.dev')"
   join-command:
     description: "The upterm join command to connect to the upterm session (e.g., 'upterm join ssh://session:token@uptermd.upterm.dev'). Empty with upterm before v0.38.0, or a ws/wss server behind a path"
+  ssh-config:
+    description: "A Host block for ~/.ssh/config that reaches the upterm session, as upterm prints it, with a commented LocalForward line to start from. Empty with an upterm that doesn't publish one"
