@@ -1,0 +1,29 @@
+# See https://github.com/typesafegithub/github-actions-typing/
+inputs:
+  limit-access-to-actor:
+    type: boolean
+
+  limit-access-to-users:
+    type: list
+    separator: ','
+    list-item:
+      type: string
+
+  upterm-server:
+    type: string
+
+  known-hosts:
+    type: string
+
+  wait-timeout-minutes:
+    type: integer
+
+  upterm-version:
+    type: string
+
+  detached:
+    type: boolean
+
+outputs:
+  ssh-command:
+    type: string
