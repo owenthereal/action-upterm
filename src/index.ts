@@ -447,12 +447,36 @@ export async function run() {
   }
 }
 
+/** tool-cache's HTTPError, naming the URL that answered with it. */
+class DownloadHttpError extends Error {
+  readonly httpStatusCode: number | undefined;
+  constructor(url: string, cause: tc.HTTPError) {
+    super(`${cause.message} from ${url}`);
+    this.httpStatusCode = cause.httpStatusCode;
+  }
+}
+
+/**
+ * tc.downloadTool, with the URL in an HTTP failure: tool-cache's own error
+ * names only the status, and it logs the URL at debug level alone.
+ */
+async function downloadUptermArchive(url: string): Promise<string> {
+  try {
+    return await tc.downloadTool(url);
+  } catch (error) {
+    if (error instanceof tc.HTTPError) {
+      throw new DownloadHttpError(url, error);
+    }
+    throw error;
+  }
+}
+
 async function installDependencies(): Promise<void> {
   core.debug('Installing dependencies');
   const platformHandlers = {
     linux: async () => {
       const archiveUrl = getUptermDownloadUrl('linux', process.arch);
-      const archive = await tc.downloadTool(archiveUrl);
+      const archive = await downloadUptermArchive(archiveUrl);
       const extractDir = await tc.extractTar(archive);
       const uptermPath = path.join(extractDir, 'upterm');
 
@@ -464,7 +488,7 @@ async function installDependencies(): Promise<void> {
     },
     win32: async () => {
       const archiveUrl = getUptermDownloadUrl('win32', process.arch);
-      const archive = await tc.downloadTool(archiveUrl);
+      const archive = await downloadUptermArchive(archiveUrl);
       const extractDir = await tc.extractTar(archive);
       const uptermExePath = path.join(extractDir, 'upterm.exe');
 
@@ -487,7 +511,7 @@ async function installDependencies(): Promise<void> {
     },
     darwin: async () => {
       const archiveUrl = getUptermDownloadUrl('darwin', process.arch);
-      const archive = await tc.downloadTool(archiveUrl);
+      const archive = await downloadUptermArchive(archiveUrl);
       const extractDir = await tc.extractTar(archive);
       const uptermPath = path.join(extractDir, 'upterm');
 
@@ -517,7 +541,13 @@ async function installDependencies(): Promise<void> {
       darwin: 'Ensure this runner can reach GitHub releases (github.com) to download and extract the upterm tarball',
       win32: "Ensure this runner can reach GitHub releases (github.com) to download upterm.exe, and that it can be copied into MSYS2's /usr/bin"
     };
-    const guidance = platformGuidance[process.platform] || '';
+    let guidance = platformGuidance[process.platform] || '';
+    // A 5xx (which tool-cache has already retried) is GitHub, or a proxy in
+    // front of it, failing to answer: the reachability tip would send the
+    // user after the runner's network, or the link, instead.
+    if (error instanceof DownloadHttpError && (error.httpStatusCode ?? 0) >= 500) {
+      guidance = `HTTP ${error.httpStatusCode} is a server error: GitHub, or a proxy between this runner and GitHub, failed to serve the download. Check https://www.githubstatus.com, then re-run the job.`;
+    }
     throw new Error(`Failed to install dependencies on ${process.platform}: ${error}\n\n` + (guidance ? `Tip: ${guidance}` : ''));
   }
 }
