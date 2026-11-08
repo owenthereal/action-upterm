@@ -3,9 +3,19 @@ import path from 'path';
 import {DEFAULT_UPTERM_SERVER} from './knownHosts';
 
 jest.mock('@actions/core');
+// HTTPError mirrors tool-cache's own class: the action tells an HTTP answer
+// from a network failure with instanceof. The real module can't be loaded here
+// (@actions/io reads fs.constants at import, and fs is mocked below).
 jest.mock('@actions/tool-cache', () => ({
   downloadTool: jest.fn(),
-  extractTar: jest.fn()
+  extractTar: jest.fn(),
+  HTTPError: class HTTPError extends Error {
+    readonly httpStatusCode: number | undefined;
+    constructor(httpStatusCode: number | undefined) {
+      super(`Unexpected HTTP response: ${httpStatusCode}`);
+      this.httpStatusCode = httpStatusCode;
+    }
+  }
 }));
 
 jest.mock('fs', () => ({
@@ -830,6 +840,59 @@ describe('upterm GitHub integration', () => {
     await run();
 
     expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Failed to install dependencies on win32: Error: Installation failed'));
+  });
+
+  describe('download failures', () => {
+    // tool-cache retries a 5xx itself, then rejects with an HTTPError naming
+    // only the status; it logs the URL at debug level alone. A runner that got
+    // an HTTP answer reached GitHub, so a 5xx is GitHub's (or a proxy's) error.
+    function failedMessage(): string {
+      expect(core.setFailed).toHaveBeenCalledTimes(1);
+      return core.setFailed.mock.calls[0][0] as string;
+    }
+
+    it.each([
+      {platform: 'linux', arch: 'x64', status: 504, url: 'https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz'},
+      {platform: 'darwin', arch: 'arm64', status: 502, url: 'https://github.com/owenthereal/upterm/releases/latest/download/upterm_darwin_arm64.tar.gz'},
+      {platform: 'win32', arch: 'x64', status: 500, url: 'https://github.com/owenthereal/upterm/releases/latest/download/upterm_windows_amd64.tar.gz'}
+    ])('on $platform, an HTTP $status names the URL and points at GitHub status, not the runner network', async ({platform, arch, status, url}) => {
+      Object.defineProperty(process, 'platform', {value: platform});
+      Object.defineProperty(process, 'arch', {value: arch});
+      mockedToolCache.downloadTool.mockRejectedValue(new mockedToolCache.HTTPError(status));
+
+      await run();
+
+      const message = failedMessage();
+      expect(message).toContain(url);
+      expect(message).toContain('https://www.githubstatus.com');
+      expect(message).not.toContain('Ensure this runner can reach GitHub releases');
+    });
+
+    it('names the URL of a 404, so a wrong upterm-version shows, without blaming GitHub status', async () => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      Object.defineProperty(process, 'arch', {value: 'x64'});
+      when(core.getInput).calledWith('upterm-version').mockReturnValue('v9.9.9');
+      mockedToolCache.downloadTool.mockRejectedValue(new mockedToolCache.HTTPError(404));
+
+      await run();
+
+      const message = failedMessage();
+      expect(message).toContain('https://github.com/owenthereal/upterm/releases/download/v9.9.9/upterm_linux_amd64.tar.gz');
+      expect(message).not.toContain('githubstatus');
+    });
+
+    it('keeps the reachability tip when the runner got no HTTP answer at all', async () => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      Object.defineProperty(process, 'arch', {value: 'x64'});
+      mockedToolCache.downloadTool.mockRejectedValue(new Error('getaddrinfo ENOTFOUND github.com'));
+
+      await run();
+
+      const message = failedMessage();
+      expect(message).toContain('getaddrinfo ENOTFOUND github.com');
+      expect(message).toContain('Ensure this runner can reach GitHub releases');
+      expect(message).not.toContain('githubstatus');
+    });
   });
 
   it('keeps polling when the session lookup keeps failing instead of ending the session', async () => {
